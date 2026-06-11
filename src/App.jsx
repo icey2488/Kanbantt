@@ -24,6 +24,7 @@ import {
   ArrowDown,
   Settings,
 } from 'lucide-react';
+import { initAuth, signIn, signOut } from './lib/auth.js';
 
 /* ============================================================
    THEMES
@@ -531,6 +532,10 @@ const MOCK_EVENTS = generateMockEvents();
    STORAGE
    ============================================================ */
 const K_TASKS = 'kanbantt:tasks:v5';
+// Retired: auth.js owns session state via in-memory tokens + silent refresh, so
+// the session is never persisted to localStorage. Kept only to purge the stale
+// key from existing installs (see the one-time safeDelete on mount). No readers,
+// no writers.
 const K_SESSION = 'kanbantt:session:v1';
 const K_THEME = 'kanbantt:theme:v1';
 const K_TAGS = 'kanbantt:tags:v2';
@@ -2752,8 +2757,9 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      const s = await safeGet(K_SESSION, null);
-      if (s) setUser(s);
+      // K_SESSION is retired — auth.js owns session state via in-memory tokens
+      // and silent refresh. Purge the stale key one time for existing installs.
+      await safeDelete(K_SESSION);
       const t = await safeGet(K_TASKS, SEED_TASKS);
       setTasks(t);
       const tg = await safeGet(K_TAGS, DEFAULT_TAGS);
@@ -2766,19 +2772,37 @@ export default function App() {
     })();
   }, []);
 
+  useEffect(() => {
+    initAuth(import.meta.env.VITE_GOOGLE_CLIENT_ID, {
+      onChange: ({ user, signedIn }) => {
+        if (signedIn && user) {
+          setUser({
+            name: user.name,
+            email: user.email,
+            initials: user.name.split(' ').map((p) => p[0]).slice(0, 2).join('').toUpperCase(),
+          });
+        } else {
+          setUser(null);
+        }
+      },
+    }).catch((e) => console.error('initAuth failed:', e));
+  }, []);
+
   useEffect(() => { if (loaded) { safeSet(K_TASKS, tasks); setLastSync(Date.now()); } }, [tasks, loaded]);
   useEffect(() => { if (loaded) { safeSet(K_TAGS, tags); setLastSync(Date.now()); } }, [tags, loaded]);
   useEffect(() => { if (loaded) { safeSet(K_COLUMNS, columns); setLastSync(Date.now()); } }, [columns, loaded]);
   useEffect(() => { if (loaded) safeSet(K_THEME, theme); }, [theme, loaded]);
 
   const handleSignIn = async () => {
-    const mockUser = { name: 'Demo User', email: 'demo@icehunter.net', initials: 'EM' };
-    setUser(mockUser);
-    await safeSet(K_SESSION, mockUser);
+    try {
+      await signIn();
+    } catch (e) {
+      console.error('Sign-in failed:', e);
+    }
   };
   const handleSignOut = async () => {
+    await signOut();
     setUser(null);
-    await safeDelete(K_SESSION);
   };
 
   const openNew = () => {
