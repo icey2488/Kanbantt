@@ -1,0 +1,14 @@
+# Cloudflare Pages security headers.
+# Drop this file in /public/ so it's copied to the build output as /_headers.
+#
+# The CSP is the important part: Google Identity Services injects iframes and
+# loads its own scripts from accounts.google.com and apis.google.com. Without
+# these allowances the sign-in popup fails silently or with cryptic errors.
+
+/*
+  X-Frame-Options: SAMEORIGIN
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()
+  Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://accounts.google.com https://apis.google.com; connect-src 'self' https://*.googleapis.com https://accounts.google.com https://oauth2.googleapis.com; img-src 'self' data: https://*.googleusercontent.com https://*.google.com; style-src 'self' 'unsafe-inline' https://accounts.google.com https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; frame-src https://accounts.google.com; form-action 'self'; base-uri 'self'
