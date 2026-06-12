@@ -1,4 +1,4 @@
-import { useState, useEffect, useContext, createContext, useMemo, useRef } from 'react';
+import { useState, useEffect, useContext, createContext, useMemo, useRef, lazy, Suspense } from 'react';
 import {
   LayoutGrid,
   CalendarDays,
@@ -2736,6 +2736,10 @@ function SettingsModal({
   );
 }
 
+// Disposable MCP spike, reachable at ?spike=1. Lazy so it (and the MCP SDK it
+// pulls in) stays out of the normal app bundle. Remove with the spike/ dir.
+const McpSpike = lazy(() => import('../spike/McpSpike.jsx'));
+
 /* ============================================================
    APP
    ============================================================ */
@@ -2961,6 +2965,16 @@ export default function App() {
   }, [tasks, tags, filters]);
 
   const C = THEMES[theme];
+
+  // Spike escape hatch: ?spike=1 renders the throwaway MCP harness and nothing
+  // else (bypasses auth too). Placed after all hooks to respect their rules.
+  if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('spike') === '1') {
+    return (
+      <Suspense fallback={<div style={{ padding: 32, fontFamily: 'monospace', color: '#e4e9f2', background: '#070b14', minHeight: '100vh' }}>loading spike…</div>}>
+        <McpSpike />
+      </Suspense>
+    );
+  }
 
   if (!user) {
     return (
