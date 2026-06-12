@@ -572,3 +572,73 @@ test('migration is skipped for a fresh user with no legacy data', () => {
   assert.equal(res.reason, 'no_legacy_data');
   assert.equal(storage._has(STORAGE_KEY), false);
 });
+
+/* ================================================================== */
+/* reactivity bridge (subscribe / getSnapshot / board writers)        */
+/* ================================================================== */
+
+test('subscribe fires a listener on every successful mutation', () => {
+  const { store } = freshStore();
+  let calls = 0;
+  const unsub = store.subscribe(() => calls++);
+
+  store.create({ id: 'c1', title: 'A', column_id: 'todo' });
+  assert.equal(calls, 1);
+  store.update('c1', { title: 'B' }, { expected_version: 1 });
+  assert.equal(calls, 2);
+  store.move('c1', { column_id: 'done' }, { expected_version: 2 });
+  assert.equal(calls, 3);
+  store.setColumns([{ id: 'todo', label: 'To Do' }]);
+  assert.equal(calls, 4);
+  store.setTags([{ id: 't1', name: 'x', color: 'gray' }]);
+  assert.equal(calls, 5);
+  store.delete('c1', { expected_version: 3 });
+  assert.equal(calls, 6);
+
+  unsub();
+  store.create({ id: 'c2', title: 'C', column_id: 'todo' });
+  assert.equal(calls, 6, 'no notification after unsubscribe');
+});
+
+test('a thrown (conflicting) mutation does not notify', () => {
+  const { store } = freshStore();
+  store.create({ id: 'c1', title: 'A', column_id: 'todo' });
+  let calls = 0;
+  store.subscribe(() => calls++);
+  assert.throws(() => store.update('c1', { title: 'B' }, { expected_version: 999 }));
+  assert.equal(calls, 0, 'failed mutation must not fire listeners');
+});
+
+test('getSnapshot is referentially stable between mutations and fresh after one', () => {
+  const { store } = freshStore();
+  const s0 = store.getSnapshot();
+  assert.equal(store.getSnapshot(), s0, 'stable across reads with no mutation');
+
+  store.create({ id: 'c1', title: 'A', column_id: 'todo' });
+  const s1 = store.getSnapshot();
+  assert.notEqual(s1, s0, 'fresh reference after a mutation');
+  assert.equal(store.getSnapshot(), s1, 'stable again until next mutation');
+
+  store.update('c1', { title: 'B' }, { expected_version: 1 });
+  const s2 = store.getSnapshot();
+  assert.notEqual(s2, s1);
+
+  // Older snapshots are immutable — not retroactively mutated by later writes.
+  assert.equal(s1.cards[0].title, 'A');
+  assert.equal(s2.cards[0].title, 'B');
+});
+
+test('setColumns / setTags update the snapshot and persist', () => {
+  const { store, storage } = freshStore();
+  store.setColumns([{ id: 'a', label: 'Alpha' }, { id: 'b', label: 'Beta' }]);
+  store.setTags([{ id: 'tag-x', name: 'x', color: 'red' }]);
+
+  const snap = store.getSnapshot();
+  assert.deepEqual(snap.columns.map((c) => c.id), ['a', 'b']);
+  assert.deepEqual(snap.tags.map((t) => t.id), ['tag-x']);
+
+  // Persisted to storage under the v1 blob.
+  const onDisk = JSON.parse(storage._raw(STORAGE_KEY));
+  assert.deepEqual(onDisk.columns.map((c) => c.id), ['a', 'b']);
+  assert.deepEqual(onDisk.tags.map((t) => t.id), ['tag-x']);
+});

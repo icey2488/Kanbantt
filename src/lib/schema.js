@@ -72,35 +72,15 @@ export function migrate(stored) {
 }
 
 /* ------------------------------------------------------------------------ */
-/* One-time import from window.storage                                      */
+/* One-time import from window.storage — RETIRED                            */
 /* ------------------------------------------------------------------------ */
 
 /**
- * Read the mock's window.storage keys and assemble a v1 state object.
- * Run this once after a user signs in with Google for the first time so they
- * don't lose data from the pre-Drive prototype. Then call saveAppData(state).
- *
- * Returns null if no local data was found (fresh user).
+ * RETIRED. Legacy import now lives in card-store.js `runLegacyMigration`, which
+ * is the single source of truth for migrating the pre-Drive localStorage keys
+ * into the v1 blob. The export is kept only so any lingering importer fails
+ * loudly instead of silently running a stale, duplicate migration.
  */
-export async function importFromWindowStorage(storage = window.storage) {
-  if (!storage?.get) return null;
-  try {
-    const tasksWrap = await storage.get('kanbantt:tasks:v5');
-    const tagsWrap = await storage.get('kanbantt:tags:v2');
-    const colsWrap = await storage.get('kanbantt:columns:v1');
-    if (!tasksWrap && !tagsWrap && !colsWrap) return null;
-
-    const tasks = tasksWrap?.value ? JSON.parse(tasksWrap.value) : [];
-    const tags = tagsWrap?.value ? JSON.parse(tagsWrap.value) : DEFAULT_TAGS;
-    const columns = colsWrap?.value ? JSON.parse(colsWrap.value) : DEFAULT_COLUMNS;
-
-    return {
-      schemaVersion: CURRENT_SCHEMA,
-      tasks, tags, columns,
-      settings: {},
-    };
-  } catch (e) {
-    console.warn('importFromWindowStorage failed:', e);
-    return null;
-  }
+export async function importFromWindowStorage() {
+  throw new Error('Retired: legacy import now lives in card-store.js runLegacyMigration');
 }

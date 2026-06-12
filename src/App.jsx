@@ -1,4 +1,4 @@
-import { useState, useEffect, useContext, createContext, useMemo, useRef, lazy, Suspense } from 'react';
+import { useState, useEffect, useContext, createContext, useMemo, useRef, useSyncExternalStore, lazy, Suspense } from 'react';
 import {
   LayoutGrid,
   CalendarDays,
@@ -25,6 +25,8 @@ import {
   Settings,
 } from 'lucide-react';
 import { initAuth, signIn, signOut } from './lib/auth.js';
+import { store, bootError, subscribe, getSnapshot, readLegacyDump, STORAGE_KEY } from './lib/store-instance.js';
+import { orderBetween, compareCards } from './lib/card-store.js';
 
 /* ============================================================
    THEMES
@@ -530,16 +532,16 @@ const MOCK_EVENTS = generateMockEvents();
 
 /* ============================================================
    STORAGE
+   ------------------------------------------------------------
+   Board data (cards, tags, columns) lives entirely in card-store.js — the only
+   legal path. The legacy board keys (kanbantt:tasks/columns/tags) are owned and
+   migrated there; App never touches them. Only device-local keys remain here:
+   the theme, and a one-time purge of the retired session key.
    ============================================================ */
-const K_TASKS = 'kanbantt:tasks:v5';
 // Retired: auth.js owns session state via in-memory tokens + silent refresh, so
-// the session is never persisted to localStorage. Kept only to purge the stale
-// key from existing installs (see the one-time safeDelete on mount). No readers,
-// no writers.
+// the session is never persisted. Kept only to purge the stale key on mount.
 const K_SESSION = 'kanbantt:session:v1';
 const K_THEME = 'kanbantt:theme:v1';
-const K_TAGS = 'kanbantt:tags:v2';
-const K_COLUMNS = 'kanbantt:columns:v1';
 
 const safeGet = async (key, fallback) => {
   try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
@@ -551,6 +553,35 @@ const safeSet = async (key, value) => {
 const safeDelete = async (key) => {
   try { localStorage.removeItem(key); } catch {}
 };
+
+/* ============================================================
+   STORE ADAPTER — cards <-> the task shape the views already speak
+   ============================================================ */
+// Views read `task.status` (the column). Cards use `column_id`. Alias at the
+// boundary so no visual component has to change.
+const cardToTask = (card) => ({ ...card, status: card.column_id });
+
+// Content fields the edit modal can change. `status` is excluded — a column
+// change is a move(), not an update() (update never repositions).
+const EDITABLE_FIELDS = ['title', 'description', 'priority', 'tags', 'checklist', 'startDate', 'dueDate'];
+
+// Minimal, field-scoped patch: only the editable fields whose value actually
+// changed between the current card and the edited draft. Never a whole card.
+function diffPatch(current, draft) {
+  const patch = {};
+  for (const f of EDITABLE_FIELDS) {
+    if (JSON.stringify(current?.[f]) !== JSON.stringify(draft?.[f])) patch[f] = draft[f];
+  }
+  return patch;
+}
+
+// Live cards in a column, sorted by the canonical order, optionally excluding a
+// card (e.g. the one being dragged). Reads straight from the store snapshot.
+function liveColumnCards(snapshot, columnId, excludeId) {
+  return snapshot.cards
+    .filter((c) => c.column_id === columnId && !c.deleted_at && c.id !== excludeId)
+    .sort(compareCards);
+}
 
 /* ============================================================
    FONTS
@@ -2741,39 +2772,107 @@ function SettingsModal({
 const McpSpike = lazy(() => import('../spike/McpSpike.jsx'));
 
 /* ============================================================
+   BOOT ERROR STATE
+   ============================================================ */
+// Download the raw legacy keys so no data is stranded behind a boot failure.
+function downloadLegacyBackup() {
+  try {
+    const blob = new Blob([JSON.stringify(readLegacyDump(), null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `kanbantt-legacy-backup-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    console.error('legacy backup download failed', e);
+  }
+}
+
+// Shown when migration or store load fails. Never a board, never a reset — the
+// only action is to rescue the raw legacy data.
+function BootError({ code, message }) {
+  return (
+    <div style={{
+      minHeight: '100vh', background: '#070b14', color: '#e4e9f2', fontFamily: F.body,
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24,
+    }}>
+      <div style={{ maxWidth: 520, width: '100%' }}>
+        <div style={{
+          fontFamily: F.mono, fontSize: 11, letterSpacing: '0.18em',
+          textTransform: 'uppercase', color: '#fb7185', marginBottom: 14,
+        }}>Board failed to load</div>
+        <h1 style={{ fontFamily: F.display, fontStyle: 'italic', fontWeight: 400, fontSize: 34, margin: '0 0 16px' }}>
+          We couldn’t open your board
+        </h1>
+        <p style={{ fontSize: 14, lineHeight: 1.6, color: '#8b95a8', margin: '0 0 8px' }}>
+          Error code: <code style={{ fontFamily: F.mono, color: '#e4e9f2' }}>{code}</code>
+        </p>
+        {message && (
+          <p style={{ fontFamily: F.mono, fontSize: 12, color: '#5a6478', margin: '0 0 20px', wordBreak: 'break-word' }}>{message}</p>
+        )}
+        <p style={{ fontSize: 14, lineHeight: 1.6, color: '#8b95a8', margin: '0 0 20px' }}>
+          Your existing data has not been changed. Download a raw backup of your
+          legacy keys before doing anything else.
+        </p>
+        <button onClick={downloadLegacyBackup} style={{
+          background: '#7dd3fc', color: '#070b14', border: 'none', borderRadius: 8,
+          padding: '12px 18px', fontSize: 14, fontWeight: 600, fontFamily: F.body, cursor: 'pointer',
+        }}>
+          Download my data (JSON)
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
    APP
    ============================================================ */
 export default function App() {
   useFonts();
   const [theme, setTheme] = useState('dark');
   const [user, setUser] = useState(null);
-  const [tasks, setTasks] = useState([]);
-  const [tags, setTags] = useState(DEFAULT_TAGS);
-  const [columns, setColumns] = useState(DEFAULT_COLUMNS);
   const [view, setView] = useState('board');
   const [editing, setEditing] = useState(null);
   const [isNew, setIsNew] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [loaded, setLoaded] = useState(false);
   const [lastSync, setLastSync] = useState(null);
+  const [otherTabChanged, setOtherTabChanged] = useState(false);
+  const [notice, setNotice] = useState(null);
   const [filters, setFilters] = useState({ search: '', tags: [], overdueOnly: false });
   const [events] = useState(MOCK_EVENTS);
 
+  // Board data comes exclusively from the card store via useSyncExternalStore.
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot);
+  const columns = snapshot.columns;
+  const tags = snapshot.tags;
+  // Cards -> task shape the views speak; live only, sorted by canonical order.
+  const tasks = useMemo(
+    () => snapshot.cards.filter((c) => !c.deleted_at).slice().sort(compareCards).map(cardToTask),
+    [snapshot],
+  );
+
+  // Theme + the retired-session purge are the only device-local concerns left.
   useEffect(() => {
     (async () => {
-      // K_SESSION is retired — auth.js owns session state via in-memory tokens
-      // and silent refresh. Purge the stale key one time for existing installs.
       await safeDelete(K_SESSION);
-      const t = await safeGet(K_TASKS, SEED_TASKS);
-      setTasks(t);
-      const tg = await safeGet(K_TAGS, DEFAULT_TAGS);
-      setTags(tg);
-      const cols = await safeGet(K_COLUMNS, DEFAULT_COLUMNS);
-      setColumns(cols);
       const th = await safeGet(K_THEME, 'dark');
       if (th && THEMES[th]) setTheme(th);
-      setLoaded(true);
     })();
+  }, []);
+
+  // Surface a sync time whenever the store changes (drives the Settings readout).
+  useEffect(() => { if (snapshot.seq > 0) setLastSync(Date.now()); }, [snapshot]);
+
+  // Cross-tab tripwire: another tab wrote the blob. Non-blocking notice only —
+  // no rehydration logic (multi-tab sync is out of scope).
+  useEffect(() => {
+    const onStorage = (e) => { if (e.key === STORAGE_KEY) setOtherTabChanged(true); };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
   }, []);
 
   useEffect(() => {
@@ -2792,10 +2891,8 @@ export default function App() {
     }).catch((e) => console.error('initAuth failed:', e));
   }, []);
 
-  useEffect(() => { if (loaded) { safeSet(K_TASKS, tasks); setLastSync(Date.now()); } }, [tasks, loaded]);
-  useEffect(() => { if (loaded) { safeSet(K_TAGS, tags); setLastSync(Date.now()); } }, [tags, loaded]);
-  useEffect(() => { if (loaded) { safeSet(K_COLUMNS, columns); setLastSync(Date.now()); } }, [columns, loaded]);
-  useEffect(() => { if (loaded) safeSet(K_THEME, theme); }, [theme, loaded]);
+  // Theme is device-local; board data persists through the store, not here.
+  useEffect(() => { safeSet(K_THEME, theme); }, [theme]);
 
   const handleSignIn = async () => {
     try {
@@ -2823,125 +2920,170 @@ export default function App() {
     setEditing(task);
     setIsNew(false);
   };
+  /* ---- mutation plumbing ------------------------------------------------ */
+  const surface = (msg) => setNotice(msg);
+  const lastOrderOf = (columnId, excludeId) => {
+    const inCol = liveColumnCards(getSnapshot(), columnId, excludeId);
+    return inCol.length ? inCol[inCol.length - 1].order : null;
+  };
+
+  // Spec conflict protocol: try the op; on `conflict`, inspect meta.current —
+  // a tombstone drops the change with a notice, otherwise reapply ONCE onto the
+  // fresh version; a second conflict surfaces. Never recreate a card.
+  const withConflict = (attempt) => {
+    try { attempt(); return; }
+    catch (e) {
+      if (e?.code !== 'conflict') { console.error(e); surface('Something went wrong'); return; }
+      if (e.meta?.current?.deleted_at) { surface('That card was deleted'); return; }
+      try { attempt(); }
+      catch (e2) {
+        if (e2?.code === 'conflict') { surface('Edit conflicted — please try again'); return; }
+        console.error(e2); surface('Something went wrong');
+      }
+    }
+  };
+
   const saveTask = (task) => {
     if (!task.title.trim()) return;
-    if (isNew) setTasks([...tasks, { ...task, id: uid('t') }]);
-    else setTasks(tasks.map((t) => (t.id === task.id ? task : t)));
+    if (isNew) {
+      const { id, status, ...rest } = task; // drop the 'new' placeholder id + status alias
+      store.create({ ...rest, column_id: status });
+    } else {
+      withConflict(() => {
+        const cur = store.get(task.id);
+        if (!cur || cur.deleted_at) { surface('That card was deleted'); return; }
+        // Content via update (minimal patch); column change via move.
+        const patch = diffPatch(cur, task);
+        let version = cur.version;
+        if (Object.keys(patch).length) {
+          version = store.update(task.id, patch, { expected_version: version }).version;
+        }
+        if (task.status && task.status !== cur.column_id) {
+          const order = orderBetween(lastOrderOf(task.status, task.id), null);
+          store.move(task.id, { column_id: task.status, order }, { expected_version: version });
+        }
+      });
+    }
     setEditing(null);
   };
+
   const deleteTask = (id) => {
-    setTasks(tasks.filter((t) => t.id !== id));
+    withConflict(() => {
+      const cur = store.get(id);
+      if (!cur) return;
+      if (cur.deleted_at) { surface('That card was deleted'); return; }
+      store.delete(id, { expected_version: cur.version });
+    });
     setEditing(null);
   };
 
   const quickAdd = (colId, title) => {
     const t = new Date();
-    const newTask = {
-      id: uid('t'), title, description: '', status: colId,
+    store.create({
+      title, description: '', column_id: colId,
       startDate: iso(t), dueDate: iso(addDays(t, 3)),
       priority: 'med', tags: [], checklist: [],
-    };
-    setTasks([...tasks, newTask]);
-  };
-
-  const moveTask = (draggedId, target) => {
-    setTasks((prev) => {
-      const dragged = prev.find((t) => t.id === draggedId);
-      if (!dragged) return prev;
-      const without = prev.filter((t) => t.id !== draggedId);
-      if (target.type === 'card') {
-        const targetTask = prev.find((t) => t.id === target.id);
-        if (!targetTask) return prev;
-        const updated = { ...dragged, status: targetTask.status };
-        const idx = without.findIndex((t) => t.id === target.id);
-        without.splice(idx, 0, updated);
-        return without;
-      } else {
-        const updated = { ...dragged, status: target.id };
-        without.push(updated);
-        return without;
-      }
     });
   };
 
-  const createTag = (tag) => setTags([...tags, tag]);
+  // Drag-and-drop. Mint the order from the drop neighbors (with null-neighbor
+  // cases: empty column, drop-before-first, append-to-end) and move().
+  const moveTask = (draggedId, target) => {
+    withConflict(() => {
+      const dragged = store.get(draggedId);
+      if (!dragged || dragged.deleted_at) { surface('That card was deleted'); return; }
+      const snap = getSnapshot();
+      let columnId;
+      let order;
+      if (target.type === 'card') {
+        const targetCard = snap.cards.find((c) => c.id === target.id && !c.deleted_at);
+        if (!targetCard) return;
+        columnId = targetCard.column_id;
+        const colCards = liveColumnCards(snap, columnId, draggedId);
+        const tIdx = colCards.findIndex((c) => c.id === target.id);
+        const prev = tIdx > 0 ? colCards[tIdx - 1] : null; // insert before target
+        order = orderBetween(prev ? prev.order : null, targetCard.order);
+      } else {
+        columnId = target.id;
+        const colCards = liveColumnCards(snap, columnId, draggedId);
+        const last = colCards.length ? colCards[colCards.length - 1] : null;
+        order = orderBetween(last ? last.order : null, null); // append to end
+      }
+      store.move(draggedId, { column_id: columnId, order }, { expected_version: dragged.version });
+    });
+  };
+
+  /* ---- board config (columns + tags) via the store --------------------- */
+  const createTag = (tag) => store.setTags([...tags, tag]);
 
   const addColumn = (label) => {
     const trimmed = label.trim();
     if (!trimmed) return;
     const id = `col-${uid('').slice(2, 8)}`;
     const accentKey = COLUMN_ACCENTS[columns.length % COLUMN_ACCENTS.length];
-    setColumns([...columns, { id, label: trimmed, accentKey }]);
+    store.setColumns([...columns, { id, label: trimmed, accentKey }]);
   };
-  const renameColumn = (id, label) => {
-    setColumns(columns.map((c) => (c.id === id ? { ...c, label } : c)));
-  };
-  const recolorColumn = (id) => {
-    setColumns(columns.map((c) => {
+  const renameColumn = (id, label) =>
+    store.setColumns(columns.map((c) => (c.id === id ? { ...c, label } : c)));
+  const recolorColumn = (id) =>
+    store.setColumns(columns.map((c) => {
       if (c.id !== id) return c;
       const idx = COLUMN_ACCENTS.indexOf(c.accentKey);
-      const next = COLUMN_ACCENTS[(idx + 1) % COLUMN_ACCENTS.length];
-      return { ...c, accentKey: next };
+      return { ...c, accentKey: COLUMN_ACCENTS[(idx + 1) % COLUMN_ACCENTS.length] };
     }));
-  };
   const reorderColumn = (id, direction) => {
     const idx = columns.findIndex((c) => c.id === id);
     const target = idx + direction;
     if (idx < 0 || target < 0 || target >= columns.length) return;
     const next = [...columns];
     [next[idx], next[target]] = [next[target], next[idx]];
-    setColumns(next);
+    store.setColumns(next);
   };
   const deleteColumn = (id) => {
     if (columns.length <= 1) return;
     const remaining = columns.filter((c) => c.id !== id);
     const fallback = remaining[0].id;
-    setTasks(tasks.map((t) => (t.status === id ? { ...t, status: fallback } : t)));
-    setColumns(remaining);
+    // Move every live card out to the fallback column (each gets a new version);
+    // cascade-deleting cards is forbidden. Then drop the column.
+    for (const card of getSnapshot().cards.filter((c) => c.column_id === id && !c.deleted_at)) {
+      const order = orderBetween(lastOrderOf(fallback, card.id), null);
+      store.move(card.id, { column_id: fallback, order }, { expected_version: card.version });
+    }
+    store.setColumns(remaining);
   };
 
-  const renameTag = (id, name) => {
-    setTags(tags.map((t) => (t.id === id ? { ...t, name } : t)));
-  };
-  const recolorTag = (id) => {
-    setTags(tags.map((t) => {
+  const renameTag = (id, name) =>
+    store.setTags(tags.map((t) => (t.id === id ? { ...t, name } : t)));
+  const recolorTag = (id) =>
+    store.setTags(tags.map((t) => {
       if (t.id !== id) return t;
       const idx = TAG_COLOR_CYCLE.indexOf(t.color);
-      const next = TAG_COLOR_CYCLE[(idx + 1) % TAG_COLOR_CYCLE.length];
-      return { ...t, color: next };
+      return { ...t, color: TAG_COLOR_CYCLE[(idx + 1) % TAG_COLOR_CYCLE.length] };
     }));
-  };
   const deleteTag = (id) => {
-    setTasks(tasks.map((t) => ({
-      ...t,
-      tags: (t.tags || []).filter((tagId) => tagId !== id),
-    })));
-    setTags(tags.filter((t) => t.id !== id));
+    // Strip the tag from every card that references it (one update each)…
+    for (const card of getSnapshot().cards.filter((c) => !c.deleted_at && (c.tags || []).includes(id))) {
+      store.update(card.id, { tags: (card.tags || []).filter((t) => t !== id) }, { expected_version: card.version });
+    }
+    store.setTags(tags.filter((t) => t.id !== id)); // …then drop it from config.
   };
   const addTag = (name) => {
     const trimmed = name.trim();
     if (!trimmed) return;
     const id = `tag-${uid('').slice(2, 8)}`;
     const color = TAG_COLOR_CYCLE[tags.length % TAG_COLOR_CYCLE.length];
-    setTags([...tags, { id, name: trimmed, color }]);
+    store.setTags([...tags, { id, name: trimmed, color }]);
   };
 
   const classifyTask = (taskId, update) => {
-    setTasks((prev) =>
-      prev.map((t) => {
-        if (t.id !== taskId) return t;
-        const next = { ...t };
-        if ('effort' in update) {
-          if (update.effort === undefined) delete next.effort;
-          else next.effort = update.effort;
-        }
-        if ('impact' in update) {
-          if (update.impact === undefined) delete next.impact;
-          else next.impact = update.impact;
-        }
-        return next;
-      })
-    );
+    withConflict(() => {
+      const cur = store.get(taskId);
+      if (!cur || cur.deleted_at) { surface('That card was deleted'); return; }
+      const patch = {};
+      if ('effort' in update) patch.effort = update.effort; // undefined => unset
+      if ('impact' in update) patch.impact = update.impact;
+      store.update(taskId, patch, { expected_version: cur.version });
+    });
   };
 
   // Apply filters
@@ -2976,6 +3118,13 @@ export default function App() {
     );
   }
 
+  // Migration / schema_unsupported failure: a visible error state with one
+  // action (download legacy data). Never a blank or default board. Shown ahead
+  // of auth because the failure is about local data, not the Google session.
+  if (bootError) {
+    return <BootError code={bootError.code} message={bootError.message} />;
+  }
+
   if (!user) {
     return (
       <ThemeContext.Provider value={C}>
@@ -2991,6 +3140,37 @@ export default function App() {
         fontFamily: F.body, color: C.text,
         backgroundImage: `radial-gradient(circle at 20% 0%, ${C.surface}66 0%, transparent 50%)`,
       }}>
+        {(otherTabChanged || notice) && (
+          <div style={{
+            position: 'fixed', bottom: 20, left: '50%', transform: 'translateX(-50%)',
+            zIndex: 200, display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'center',
+          }}>
+            {notice && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px',
+                background: C.surfaceHi, border: `1px solid ${C.coral}55`, borderRadius: 8,
+                fontSize: 13, color: C.text, boxShadow: C.shadow,
+              }}>
+                {notice}
+                <button onClick={() => setNotice(null)} style={{
+                  background: 'transparent', border: 'none', color: C.textMuted, cursor: 'pointer', padding: 0, display: 'flex',
+                }}><X size={14} strokeWidth={1.75} /></button>
+              </div>
+            )}
+            {otherTabChanged && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px',
+                background: C.surfaceHi, border: `1px solid ${C.borderHi}`, borderRadius: 8,
+                fontSize: 13, color: C.textMuted, boxShadow: C.shadow,
+              }}>
+                Board changed in another tab — reload to sync.
+                <button onClick={() => setOtherTabChanged(false)} style={{
+                  background: 'transparent', border: 'none', color: C.textMuted, cursor: 'pointer', padding: 0, display: 'flex',
+                }}><X size={14} strokeWidth={1.75} /></button>
+              </div>
+            )}
+          </div>
+        )}
         <Header view={view} setView={setView} user={user}
           onSignOut={handleSignOut} onNewTask={openNew}
           onOpenSettings={() => setShowSettings(true)}

@@ -331,6 +331,12 @@ export function createStore({
   let blob = null;      // in-memory state; stays null until a successful load
   let loaded = false;
 
+  // Reactivity bridge (for useSyncExternalStore). `snapshotRef` is referentially
+  // stable between mutations; a fresh reference is minted only when a successful
+  // mutation notifies. Listeners fire after every successful write.
+  let snapshotRef = null;
+  const listeners = new Set();
+
   const iso = () => new Date(now()).toISOString();
 
   /* ---- load / persist -------------------------------------------------- */
@@ -340,6 +346,7 @@ export function createStore({
     if (raw == null) {
       blob = emptyBlob();
       loaded = true;
+      snapshotRef = buildSnapshot();
       return blob;
     }
     let parsed;
@@ -364,6 +371,7 @@ export function createStore({
     }
     blob = parsed;
     loaded = true;
+    snapshotRef = buildSnapshot();
     return blob;
   }
 
@@ -374,6 +382,31 @@ export function createStore({
 
   function persist() {
     storage.setItem(STORAGE_KEY, JSON.stringify(blob));
+  }
+
+  // A shallow-cloned, immutable view of the board. Entities get fresh refs so
+  // older snapshots never observe later in-place field mutations.
+  function buildSnapshot() {
+    return {
+      schema_version: blob.schema_version,
+      seq: blob.seq,
+      cards: blob.cards.map((c) => ({ ...c })),
+      tags: blob.tags.map((t) => ({ ...t })),
+      columns: blob.columns.map((c) => ({ ...c })),
+      settings: blob.settings,
+    };
+  }
+
+  function notify() {
+    for (const listener of listeners) listener();
+  }
+
+  // Persist, mint a fresh snapshot reference, then notify. Every successful
+  // mutation goes through here so subscribers and useSyncExternalStore stay live.
+  function commit() {
+    persist();
+    snapshotRef = buildSnapshot();
+    notify();
   }
 
   /* ---- internal lookups ------------------------------------------------ */
@@ -433,7 +466,7 @@ export function createStore({
     };
 
     blob.cards.push(card);
-    persist();
+    commit();
     return clone(card);
   }
 
@@ -453,7 +486,7 @@ export function createStore({
     card.updated_at = iso();
     card.updated_by = actor;
     card.seq = ++blob.seq;
-    persist();
+    commit();
     return clone(card);
   }
 
@@ -472,7 +505,7 @@ export function createStore({
     card.updated_at = iso();
     card.updated_by = actor;
     card.seq = ++blob.seq;
-    persist();
+    commit();
     return clone(card);
   }
 
@@ -489,7 +522,7 @@ export function createStore({
     card.updated_at = card.deleted_at;
     card.updated_by = actor;
     card.seq = ++blob.seq;
-    persist();
+    commit();
     return clone(card);
   }
 
@@ -531,6 +564,41 @@ export function createStore({
     return c ? clone(c) : null;
   }
 
+  /* ---- board config (columns + tags) ----------------------------------- */
+  // Board config is not card data: it has no version token and no delta cursor
+  // (the spec models column edits as an optional, locally-owned capability). The
+  // store simply owns the canonical arrays so there is one legal write path.
+
+  function setColumns(next) {
+    ensureLoaded();
+    if (!Array.isArray(next)) throw new StoreError('validation', 'columns must be an array');
+    blob.columns = next.map((c) => ({ ...c }));
+    commit();
+    return clone(blob.columns);
+  }
+
+  function setTags(next) {
+    ensureLoaded();
+    if (!Array.isArray(next)) throw new StoreError('validation', 'tags must be an array');
+    blob.tags = next.map((t) => ({ ...t }));
+    commit();
+    return clone(blob.tags);
+  }
+
+  /* ---- reactivity bridge ----------------------------------------------- */
+
+  /** Subscribe to mutations; returns an unsubscribe function. */
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  /** Referentially stable board snapshot (new ref only after a notify). */
+  function getSnapshot() {
+    ensureLoaded();
+    return snapshotRef;
+  }
+
   /** Direct (test/debug) view of the in-memory blob; null until loaded. */
   function snapshot() {
     return blob ? clone(blob) : null;
@@ -539,6 +607,8 @@ export function createStore({
 
   return {
     load, list, get, create, update, move, delete: remove,
+    setColumns, setTags,
+    subscribe, getSnapshot,
     orderBetween, snapshot, isLoaded,
   };
 }
