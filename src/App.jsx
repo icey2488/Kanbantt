@@ -128,6 +128,10 @@ const TAG_PALETTE = {
   purple: '#a855f7',
 };
 const TAG_COLOR_CYCLE = ['blue', 'green', 'red', 'purple', 'amber', 'cyan', 'pink', 'orange', 'slate'];
+// Palette rows for the Settings tag picker: { key, hex } over the opaque
+// TAG_PALETTE hues. Column accents build the same shape per-render from the
+// theme (their hex is C[accentKey], so it can't be precomputed here).
+const TAG_SWATCHES = Object.entries(TAG_PALETTE).map(([key, hex]) => ({ key, hex }));
 
 // Opaque per-hue chips for EVERY theme. Translucent tints (`${hue}22`) make the
 // text/background ratio undefined — it depends on whatever renders behind the
@@ -2062,16 +2066,24 @@ function RelativeTime({ ts }) {
    SETTINGS MODAL (columns + tags management)
    ============================================================ */
 
-// Tag-row color swatch that opens a palette of the TAG_PALETTE hues. The swatch
-// is a focusable button; clicking or Enter/Space opens the popover, each hue is
-// itself a focusable button (Enter/Space selects), Escape closes and restores
-// focus to the swatch. Selecting calls onPick(hue) — the parent routes that
-// through the same store.setTags path the rename flow uses. No free-form hex.
-function TagSwatchPicker({ color, onPick, C }) {
+// Shared color swatch + palette popover used by both the tag and column rows in
+// Settings. The trigger shows the current color; clicking or Enter/Space opens a
+// popover, each choice is itself a focusable button (Enter/Space selects), Escape
+// closes and restores focus to the trigger. Selecting calls onPick(key) — the
+// parent routes that through the store (setTags / setColumns). No free-form hex.
+//   swatches : [{ key, hex }]  — opaque hues to choose from
+//   value    : currently selected key
+//   shape    : 'round' (tag dots) | 'square' (column accents), matching the row
+//   cols     : palette grid column count
+// Every surface here is opaque: swatch/palette fills are solid hues and the
+// popover sits on C.surfaceHi (the dropped `panel` token used to leave it
+// transparent, which read as frosted over the modal).
+function SwatchPicker({ swatches, value, onPick, C, shape = 'round', cols = 5, label = 'Color' }) {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef(null);
   const popRef = useRef(null);
-  const hex = TAG_PALETTE[color] || TAG_PALETTE.slate;
+  const radius = shape === 'round' ? '50%' : 5;
+  const current = swatches.find((s) => s.key === value) || swatches[0];
 
   // Close when clicking outside the swatch + popover.
   useEffect(() => {
@@ -2094,35 +2106,35 @@ function TagSwatchPicker({ color, onPick, C }) {
   }, [open]);
 
   const closeAndRefocus = () => { setOpen(false); triggerRef.current?.focus(); };
-  const select = (name) => { onPick(name); closeAndRefocus(); };
+  const select = (key) => { onPick(key); closeAndRefocus(); };
 
   return (
     <div style={{ position: 'relative', flexShrink: 0, display: 'flex' }}>
       <button ref={triggerRef} onClick={() => setOpen((o) => !o)}
         title="Set color" aria-haspopup="true" aria-expanded={open} style={{
-          width: 18, height: 18, borderRadius: '50%', padding: 0, display: 'block',
-          background: hex, border: `1px solid ${C.border}`,
+          width: 18, height: 18, borderRadius: radius, padding: 0, display: 'block',
+          background: current.hex, border: `1px solid ${C.border}`,
           cursor: 'pointer', transition: 'all 120ms ease',
         }} />
       {open && (
-        <div ref={popRef} role="menu" aria-label="Tag color"
+        <div ref={popRef} role="menu" aria-label={label}
           onKeyDown={(e) => {
             if (e.key === 'Escape') { e.stopPropagation(); closeAndRefocus(); }
           }}
           style={{
             position: 'absolute', top: 26, left: 0, zIndex: 10,
-            display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6,
-            padding: 8, background: C.panel, border: `1px solid ${C.border}`,
+            display: 'grid', gridTemplateColumns: `repeat(${cols}, 1fr)`, gap: 6,
+            padding: 8, background: C.surfaceHi, border: `1px solid ${C.border}`,
             borderRadius: 8, boxShadow: '0 10px 30px rgba(0,0,0,0.35)',
           }}>
-          {Object.entries(TAG_PALETTE).map(([name, h]) => {
-            const isSel = name === color;
+          {swatches.map(({ key, hex }) => {
+            const isSel = key === value;
             return (
-              <button key={name} data-selected={isSel} onClick={() => select(name)}
-                title={name} aria-label={name} role="menuitemradio" aria-checked={isSel}
+              <button key={key} data-selected={isSel} onClick={() => select(key)}
+                title={key} aria-label={key} role="menuitemradio" aria-checked={isSel}
                 style={{
-                  width: 20, height: 20, borderRadius: '50%', padding: 0,
-                  background: h, cursor: 'pointer', outlineOffset: 2,
+                  width: 20, height: 20, borderRadius: radius, padding: 0,
+                  background: hex, cursor: 'pointer', outlineOffset: 2,
                   border: isSel ? `2px solid ${C.text}` : `1px solid ${C.border}`,
                 }} />
             );
@@ -2196,7 +2208,7 @@ function SettingsModal({
       zIndex: 100, padding: 24, backdropFilter: 'blur(4px)',
     }}>
       <div onClick={(e) => e.stopPropagation()} style={{
-        background: C.panel, border: `1px solid ${C.border}`,
+        background: C.surfaceHi, border: `1px solid ${C.border}`,
         borderRadius: 14, width: '100%', maxWidth: 580,
         maxHeight: '85vh', display: 'flex', flexDirection: 'column',
         boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
@@ -2276,11 +2288,10 @@ function SettingsModal({
                       padding: 8, background: C.surface,
                       border: `1px solid ${C.border}`, borderRadius: 8,
                     }}>
-                      <button onClick={() => onRecolorColumn(col.id)} title="Cycle accent" style={{
-                        width: 18, height: 18, borderRadius: 5,
-                        background: C[col.accentKey], border: `1px solid ${C.border}`,
-                        cursor: 'pointer', flexShrink: 0, transition: 'all 120ms ease',
-                      }} />
+                      <SwatchPicker shape="square" cols={3} label="Column color"
+                        swatches={COLUMN_ACCENTS.map((key) => ({ key, hex: C[key] }))}
+                        value={col.accentKey}
+                        onPick={(key) => onRecolorColumn(col.id, key)} C={C} />
                       <input value={col.label}
                         onChange={(e) => onRenameColumn(col.id, e.target.value)}
                         style={{ ...input, padding: '6px 10px' }} />
@@ -2336,7 +2347,8 @@ function SettingsModal({
                       padding: 8, background: C.surface,
                       border: `1px solid ${C.border}`, borderRadius: 8,
                     }}>
-                      <TagSwatchPicker color={tag.color}
+                      <SwatchPicker shape="round" cols={5} label="Tag color"
+                        swatches={TAG_SWATCHES} value={tag.color}
                         onPick={(c) => onRecolorTag(tag.id, c)} C={C} />
                       <input value={tag.name}
                         onChange={(e) => onRenameTag(tag.id, e.target.value)}
@@ -2899,9 +2911,11 @@ export default function App() {
   };
   const renameColumn = (id, label) =>
     store.setColumns(columns.map((c) => (c.id === id ? { ...c, label } : c)));
-  const recolorColumn = (id) =>
+  const recolorColumn = (id, accentKey) =>
     store.setColumns(columns.map((c) => {
       if (c.id !== id) return c;
+      // Explicit accent from the palette picker; fall back to cycling when omitted.
+      if (accentKey && COLUMN_ACCENTS.includes(accentKey)) return { ...c, accentKey };
       const idx = COLUMN_ACCENTS.indexOf(c.accentKey);
       return { ...c, accentKey: COLUMN_ACCENTS[(idx + 1) % COLUMN_ACCENTS.length] };
     }));
