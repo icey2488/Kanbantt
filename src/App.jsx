@@ -28,6 +28,11 @@ import { initAuth, signIn, signOut, isGisReady } from './lib/auth.js';
 import { store, bootError, subscribe, getSnapshot, readLegacyDump, STORAGE_KEY } from './lib/store-instance.js';
 import { orderBetween, compareCards } from './lib/card-store.js';
 
+/* global __APP_VERSION__, __GIT_COMMIT__ */
+// Injected by Vite's define() as string literals (see vite.config.js). In dev the
+// commit is "dev" -> "+dev"; a real build stamps the short hash (or "nogit").
+const BUILD_STAMP = `Kanbantt · v${__APP_VERSION__}+${__GIT_COMMIT__}`;
+
 /* ============================================================
    THEMES
    ============================================================ */
@@ -49,7 +54,10 @@ const THEMES = {
     bg: '#f5f5f4', bgGrain: '#fafaf9',
     surface: '#ffffff', surfaceHi: '#f9fafb', surfaceDrop: '#eef2f7',
     border: '#e5e7eb', borderHi: '#cbd5e1',
-    text: '#0f172a', textMuted: '#64748b', textDim: '#94a3b8',
+    // textDim darkened #94a3b8 -> #6b7687 so card date/footer/priority text hits
+    // 4.60:1 on the #ffffff card (was 2.56:1). textMuted is 4.76:1 (body, unchanged);
+    // textDim stays below it to keep body more prominent than metadata.
+    text: '#0f172a', textMuted: '#64748b', textDim: '#6b7687',
     ice: '#0369a1', iceDeep: '#075985',
     frost: '#6d28d9', amber: '#b45309', coral: '#dc2626', mint: '#047857',
     eventText: '#6d28d9',
@@ -82,12 +90,6 @@ const useTheme = () => useContext(ThemeContext);
 /* ============================================================
    CONSTANTS
    ============================================================ */
-const DEFAULT_COLUMNS = [
-  { id: 'backlog', label: 'Backlog', accentKey: 'textDim' },
-  { id: 'todo', label: 'To Do', accentKey: 'ice' },
-  { id: 'doing', label: 'In Progress', accentKey: 'amber' },
-  { id: 'done', label: 'Done', accentKey: 'mint' },
-];
 
 const COLUMN_ACCENTS = ['textDim', 'frost', 'ice', 'amber', 'mint', 'coral'];
 
@@ -127,15 +129,50 @@ const TAG_PALETTE = {
 };
 const TAG_COLOR_CYCLE = ['blue', 'green', 'red', 'purple', 'amber', 'cyan', 'pink', 'orange', 'slate'];
 
-const DEFAULT_TAGS = [
-  { id: 'tag-frontend', name: 'frontend', color: 'cyan' },
-  { id: 'tag-backend', name: 'backend', color: 'blue' },
-  { id: 'tag-privacy', name: 'privacy', color: 'red' },
-  { id: 'tag-mobile', name: 'mobile', color: 'orange' },
-  { id: 'tag-v1', name: 'v1', color: 'amber' },
-  { id: 'tag-polish', name: 'polish', color: 'slate' },
-  { id: 'tag-bug', name: 'bug', color: 'pink' },
-];
+// Opaque per-hue chips for EVERY theme. Translucent tints (`${hue}22`) make the
+// text/background ratio undefined — it depends on whatever renders behind the
+// chip. Instead each chip background is the hue composited at 13.3% (alpha 0x22,
+// matching the old tint) over that theme's card surface, baked to an opaque hex.
+// Chip text is the SAME hue with only its HSL lightness shifted — lightened on
+// Dark (dark bg), darkened on Light/Mist (pale bg) — until it clears >=4.5:1
+// against its own opaque background. Computed, not eyeballed; worst pair per
+// theme: Dark slate 4.60:1, Light pink 4.60:1 (amber/"v1" 4.64:1), Mist orange
+// 4.62:1. The tag hues themselves (TAG_PALETTE, used for swatches) are unchanged.
+const CHIP_COLORS = {
+  Dark: {
+    slate: { bg: '#1c2434', text: '#7e8da2' },
+    blue: { bg: '#172643', text: '#4d8df7' },
+    cyan: { bg: '#102d3e', text: '#06b6d4' },
+    green: { bg: '#112d33', text: '#10b981' },
+    amber: { bg: '#2f2a23', text: '#f59e0b' },
+    orange: { bg: '#302425', text: '#f97316' },
+    red: { bg: '#2f1e2b', text: '#f15757' },
+    pink: { bg: '#2e1e36', text: '#ed519e' },
+    purple: { bg: '#252043', text: '#b36af8' },
+  },
+  Light: {
+    slate: { bg: '#eaecf0', text: '#5b6a7f' },
+    blue: { bg: '#e5eefe', text: '#0b60eb' },
+    cyan: { bg: '#def5f9', text: '#04778b' },
+    green: { bg: '#dff6ee', text: '#0b7b56' },
+    amber: { bg: '#fef2de', text: '#986206' },
+    orange: { bg: '#feece0', text: '#b34c05' },
+    red: { bg: '#fde6e6', text: '#d01212' },
+    pink: { bg: '#fce7f1', text: '#cb156f' },
+    purple: { bg: '#f3e8fe', text: '#9128f5' },
+  },
+  Mist: {
+    slate: { bg: '#bfc8d5', text: '#475263' },
+    blue: { bg: '#bacae3', text: '#255199' },
+    cyan: { bg: '#b2d1de', text: '#035d6c' },
+    green: { bg: '#b4d1d3', text: '#086043' },
+    amber: { bg: '#d2cec4', text: '#784d05' },
+    orange: { bg: '#d3c8c5', text: '#893f0c' },
+    red: { bg: '#d2c2cb', text: '#942a2a' },
+    pink: { bg: '#d1c2d7', text: '#8e2b5c' },
+    purple: { bg: '#c8c4e3', text: '#6c369e' },
+  },
+};
 
 /* ============================================================
    HELPERS
@@ -155,350 +192,6 @@ const uid = (prefix) => `${prefix}-${Date.now().toString(36)}-${Math.random().to
 const isOverdue = (task) => {
   return startOfDay(new Date(task.dueDate)) < startOfDay(new Date()) && task.status !== 'done';
 };
-
-/* ============================================================
-   SEED DATA
-   ============================================================ */
-const today = new Date();
-
-const SEED_TASKS = [
-  // ─────────────── DONE ───────────────
-  {
-    id: 't-views',
-    title: 'Three view modes: Board, Calendar, Timeline',
-    description: 'Core surface area. Kanban for status flow, calendar for due dates, timeline for span.',
-    status: 'done',
-    startDate: iso(addDays(today, -6)),
-    dueDate: iso(addDays(today, -4)),
-    priority: 'high',
-    effort: 'high',
-    tags: ['tag-frontend', 'tag-v1'],
-    checklist: [
-      { id: 'cvi-1', text: 'Board with four columns', done: true },
-      { id: 'cvi-2', text: 'Calendar month grid', done: true },
-      { id: 'cvi-3', text: 'Timeline with date axis + today marker', done: true },
-    ],
-  },
-  {
-    id: 't-themes',
-    title: 'Theme system: Dark, Light, Mist',
-    description: 'Three themes via React context, picker in header, **persists per user**.',
-    status: 'done',
-    startDate: iso(addDays(today, -3)),
-    dueDate: iso(addDays(today, -2)),
-    priority: 'med',
-    effort: 'low',
-    tags: ['tag-frontend', 'tag-polish'],
-    checklist: [],
-  },
-  {
-    id: 't-dnd',
-    title: 'Drag-and-drop with overdue + drop indicators',
-    description: 'HTML5 native DnD between columns. Overdue cards get coral outline. Drop indicator shows landing position.',
-    status: 'done',
-    startDate: iso(addDays(today, -3)),
-    dueDate: iso(today),
-    priority: 'med',
-    effort: 'low',
-    tags: ['tag-frontend', 'tag-polish', 'tag-bug'],
-    checklist: [
-      { id: 'cdn-1', text: 'Basic HTML5 DnD between columns', done: true },
-      { id: 'cdn-2', text: 'Overdue card outline + date styling', done: true },
-      { id: 'cdn-3', text: 'Drop indicator above hovered card', done: true },
-      { id: 'cdn-4', text: 'Bottom-of-stack drop indicator', done: true },
-      { id: 'cdn-5', text: 'Fix: stale card target on drag-off', done: true },
-    ],
-  },
-  {
-    id: 't-cal-mock',
-    title: 'Mock Google Calendar event overlay',
-    description: 'Calendar events shown in Calendar and Timeline views as dashed italic chips. Currently mocked — real API in roadmap.',
-    status: 'done',
-    startDate: iso(addDays(today, -2)),
-    dueDate: iso(addDays(today, -2)),
-    priority: 'med',
-    effort: 'low',
-    tags: ['tag-backend'],
-    checklist: [],
-  },
-  {
-    id: 't-tags',
-    title: 'Tag system + filter bar',
-    description: 'Color-coded tag chips on cards, filter bar with multi-select. Search also matches tag names and checklist text.',
-    status: 'done',
-    startDate: iso(addDays(today, -1)),
-    dueDate: iso(addDays(today, -1)),
-    priority: 'high',
-    effort: 'high',
-    tags: ['tag-frontend', 'tag-v1'],
-    checklist: [
-      { id: 'ctg-1', text: 'TagChip component + palette', done: true },
-      { id: 'ctg-2', text: 'Tag selection in modal', done: true },
-      { id: 'ctg-3', text: 'Filter bar with toggleable tags', done: true },
-      { id: 'ctg-4', text: 'Inline tag creation', done: true },
-      { id: 'ctg-5', text: 'Search includes tag names + checklist text', done: true },
-    ],
-  },
-  {
-    id: 't-checklists',
-    title: 'Checklists / subtasks',
-    description: 'Nested checkbox items. Progress indicator (`n/m`) on card preview. Add, toggle, delete in modal.',
-    status: 'done',
-    startDate: iso(addDays(today, -1)),
-    dueDate: iso(addDays(today, -1)),
-    priority: 'high',
-    effort: 'low',
-    tags: ['tag-frontend'],
-    checklist: [],
-  },
-  {
-    id: 't-quickadd',
-    title: 'Quick add inline',
-    description: 'Inline card creation at the bottom of each column. *Enter* to save, *Esc* to cancel.',
-    status: 'done',
-    startDate: iso(addDays(today, -1)),
-    dueDate: iso(addDays(today, -1)),
-    priority: 'med',
-    effort: 'low',
-    tags: ['tag-frontend', 'tag-polish'],
-    checklist: [],
-  },
-  {
-    id: 't-markdown',
-    title: 'Markdown in notes',
-    description: 'Bold, italic, `code`, [links](url), line breaks, and bullet lists. Edit/Preview toggle.',
-    status: 'done',
-    startDate: iso(addDays(today, -1)),
-    dueDate: iso(addDays(today, -1)),
-    priority: 'low',
-    effort: 'low',
-    tags: ['tag-frontend', 'tag-polish'],
-    checklist: [],
-  },
-  {
-    id: 't-dogfood',
-    title: 'Dogfood: load this roadmap into Kanbantt',
-    description: 'Use the tool to plan its own development. Every card in this board is the actual roadmap.',
-    status: 'done',
-    startDate: iso(today),
-    dueDate: iso(today),
-    priority: 'low',
-    effort: 'low',
-    tags: ['tag-polish'],
-    checklist: [],
-  },
-
-  // ─────────────── IN PROGRESS ───────────────
-  {
-    id: 't-columns',
-    title: 'Custom columns',
-    description: 'Let users rename, add, remove, recolor, and reorder columns. Lives in the Settings modal alongside tag management.',
-    status: 'done',
-    startDate: iso(addDays(today, -1)),
-    dueDate: iso(today),
-    priority: 'high',
-    effort: 'high',
-    tags: ['tag-frontend', 'tag-v1'],
-    checklist: [
-      { id: 'ccol-1', text: 'Move COLUMNS from constant to state', done: true },
-      { id: 'ccol-2', text: 'Persist column config to storage', done: true },
-      { id: 'ccol-3', text: 'Build column management modal', done: true },
-      { id: 'ccol-4', text: 'Inline rename in settings', done: true },
-      { id: 'ccol-5', text: 'Up/down arrow reordering', done: true },
-      { id: 'ccol-6', text: 'Handle deletion (move cards to default)', done: true },
-    ],
-  },
-  {
-    id: 't-mobile',
-    title: 'Mobile / PWA pass',
-    description: 'Current grid breaks below ~900px. Friends will use phones. Add PWA install, service worker for offline read.',
-    status: 'doing',
-    startDate: iso(addDays(today, 4)),
-    dueDate: iso(addDays(today, 15)),
-    priority: 'high',
-    effort: 'high',
-    tags: ['tag-mobile', 'tag-v1'],
-    checklist: [
-      { id: 'cmob-1', text: 'Identify breakpoint issues', done: true },
-      { id: 'cmob-2', text: 'Responsive layout (stack columns on mobile)', done: false },
-      { id: 'cmob-3', text: 'Touch-friendly DnD (depends on @dnd-kit)', done: false },
-      { id: 'cmob-4', text: 'PWA manifest + app icons', done: false },
-      { id: 'cmob-5', text: 'Service worker for offline read', done: false },
-    ],
-  },
-
-  // ─────────────── TO DO ───────────────
-  {
-    id: 't-oauth',
-    title: 'Google OAuth sign-in (real)',
-    description: 'Replace mock sign-in with Google Identity Services. Scopes: `drive.file` + `calendar.events.readonly`. Pure client-side, no relay.',
-    status: 'todo',
-    startDate: iso(addDays(today, 8)),
-    dueDate: iso(addDays(today, 15)),
-    priority: 'high',
-    effort: 'high',
-    tags: ['tag-backend', 'tag-privacy', 'tag-v1'],
-    checklist: [
-      { id: 'coa-1', text: 'Create GCP project + OAuth client ID', done: false },
-      { id: 'coa-2', text: 'Configure consent screen (testing mode)', done: false },
-      { id: 'coa-3', text: 'Integrate Google Identity Services library', done: false },
-      { id: 'coa-4', text: 'Silent token refresh', done: false },
-      { id: 'coa-5', text: 'Handle 401 / expired token retry', done: false },
-      { id: 'coa-6', text: 'Sign out / revoke flow', done: false },
-    ],
-  },
-  {
-    id: 't-drive',
-    title: 'Drive-backed storage',
-    description: 'Replace `window.storage` with Google Drive API. One JSON file per user in app folder, `drive.file` scope only.',
-    status: 'todo',
-    startDate: iso(addDays(today, 12)),
-    dueDate: iso(addDays(today, 19)),
-    priority: 'high',
-    effort: 'high',
-    tags: ['tag-backend', 'tag-privacy', 'tag-v1'],
-    checklist: [
-      { id: 'cdr-1', text: 'Create app folder in user Drive', done: false },
-      { id: 'cdr-2', text: 'Write tasks.json on save', done: false },
-      { id: 'cdr-3', text: 'Read on load', done: false },
-      { id: 'cdr-4', text: 'Conflict resolution (last-write-wins)', done: false },
-      { id: 'cdr-5', text: 'Optional migration from window.storage', done: false },
-    ],
-  },
-  {
-    id: 't-cal-api',
-    title: 'Real Google Calendar integration',
-    description: 'Replace `MOCK_EVENTS` with `calendar.events.list`. Read-only on primary calendar, paginate by month range.',
-    status: 'todo',
-    startDate: iso(addDays(today, 15)),
-    dueDate: iso(addDays(today, 22)),
-    priority: 'high',
-    effort: 'high',
-    tags: ['tag-backend', 'tag-v1'],
-    checklist: [
-      { id: 'cca-1', text: 'API call by month range', done: false },
-      { id: 'cca-2', text: 'Refresh on view navigation', done: false },
-      { id: 'cca-3', text: 'In-memory caching', done: false },
-      { id: 'cca-4', text: 'Error states (offline, throttled)', done: false },
-    ],
-  },
-  {
-    id: 't-dndkit',
-    title: '@dnd-kit/core migration',
-    description: 'HTML5 native DnD has subtle state edge cases and zero touch support. dnd-kit handles both, plus keyboard a11y. Do this **before** mobile launch.',
-    status: 'todo',
-    startDate: iso(addDays(today, 17)),
-    dueDate: iso(addDays(today, 22)),
-    priority: 'med',
-    effort: 'low',
-    tags: ['tag-frontend', 'tag-mobile', 'tag-polish'],
-    checklist: [],
-  },
-  {
-    id: 't-deploy',
-    title: 'Deploy to kanbantt.icehunter.net',
-    description: 'Cloudflare Pages, CNAME setup, build pipeline. Static HTML/JS, no backend.',
-    status: 'todo',
-    startDate: iso(addDays(today, 19)),
-    dueDate: iso(addDays(today, 25)),
-    priority: 'high',
-    effort: 'low',
-    tags: ['tag-backend', 'tag-v1'],
-    checklist: [],
-  },
-
-  // ─────────────── BACKLOG ───────────────
-  {
-    id: 't-attachments',
-    title: 'Drive attachments on cards',
-    description: 'Drop a file onto a card, stored in same Drive folder. `drive.file` scope already covers this — no permission expansion.',
-    status: 'backlog',
-    startDate: iso(addDays(today, 25)),
-    dueDate: iso(addDays(today, 32)),
-    priority: 'med',
-    tags: ['tag-backend', 'tag-polish'],
-    checklist: [],
-  },
-  {
-    id: 't-mgmt',
-    title: 'Tag + column management UI',
-    description: 'Settings modal with two tabs: rename, recolor, reorder columns and tags. Click the swatch to cycle accent or color.',
-    status: 'done',
-    startDate: iso(today),
-    dueDate: iso(today),
-    priority: 'med',
-    effort: 'low',
-    tags: ['tag-frontend'],
-    checklist: [],
-  },
-  {
-    id: 't-swimlanes',
-    title: 'Swimlanes',
-    description: 'Group rows by tag within columns. Depends on tags (✓) and custom columns shipping first.',
-    status: 'backlog',
-    startDate: iso(addDays(today, 32)),
-    dueDate: iso(addDays(today, 42)),
-    priority: 'low',
-    effort: 'high',
-    tags: ['tag-frontend'],
-    checklist: [],
-  },
-  {
-    id: 't-recurring',
-    title: 'Recurring tasks',
-    description: 'Daily / weekly / monthly. If syncing to a Kanbantt sub-calendar in Google, can lean on their RRULE.',
-    status: 'backlog',
-    startDate: iso(addDays(today, 38)),
-    dueDate: iso(addDays(today, 47)),
-    priority: 'med',
-    tags: ['tag-backend'],
-    checklist: [],
-  },
-  {
-    id: 't-shortcuts',
-    title: 'Keyboard shortcuts',
-    description: '`N` for new, `E` for edit, arrows for nav, `/` to focus search. Modal `Esc` already works.',
-    status: 'backlog',
-    startDate: iso(addDays(today, 42)),
-    dueDate: iso(addDays(today, 47)),
-    priority: 'low',
-    effort: 'low',
-    tags: ['tag-frontend', 'tag-polish'],
-    checklist: [],
-  },
-  {
-    id: 't-polish-trio',
-    title: 'Card aging + bulk actions + event→task',
-    description: 'Three small polish features bundled. Aging: fade stale cards. Bulk: multi-select for move/delete. Event→task: right-click a calendar event to convert.',
-    status: 'backlog',
-    startDate: iso(addDays(today, 45)),
-    dueDate: iso(addDays(today, 55)),
-    priority: 'low',
-    effort: 'low',
-    tags: ['tag-frontend', 'tag-polish'],
-    checklist: [
-      { id: 'cpt-1', text: 'Card aging indicator', done: false },
-      { id: 'cpt-2', text: 'Bulk multi-select', done: false },
-      { id: 'cpt-3', text: 'Calendar event → task', done: false },
-    ],
-  },
-  {
-    id: 't-verification',
-    title: 'Privacy policy + OAuth verification',
-    description: 'Required to go past 100 users in testing mode. ~2 week Google review for public launch.',
-    status: 'backlog',
-    startDate: iso(addDays(today, 52)),
-    dueDate: iso(addDays(today, 62)),
-    priority: 'med',
-    effort: 'high',
-    tags: ['tag-privacy', 'tag-v1'],
-    checklist: [
-      { id: 'cver-1', text: 'Write privacy policy', done: false },
-      { id: 'cver-2', text: 'Write terms of service', done: false },
-      { id: 'cver-3', text: 'Submit for OAuth verification', done: false },
-    ],
-  },
-];
 
 /* ============================================================
    MOCK GOOGLE CALENDAR EVENTS
@@ -696,12 +389,20 @@ function Markdown({ text, dim = false }) {
    ============================================================ */
 function TagChip({ tag, size = 'sm', active, onClick, dimmed }) {
   const C = useTheme();
-  const hex = TAG_PALETTE[tag.color] || TAG_PALETTE.slate;
   const isInteractive = !!onClick;
   const isSel = active !== false;
 
   const padding = size === 'sm' ? '2px 7px' : '5px 10px';
   const fontSize = size === 'sm' ? 10 : 11;
+
+  // Every theme uses opaque per-hue chips so the text/background ratio is
+  // deterministic and AA-compliant (see CHIP_COLORS). Border is the chip text
+  // color at low alpha — a same-hue hairline that works on any chip bg.
+  const cc = (CHIP_COLORS[C.name] || CHIP_COLORS.Dark);
+  const chip = cc[tag.color] || cc.slate;
+  const selBg = chip.bg;
+  const selText = chip.text;
+  const selBorder = `${chip.text}33`;
 
   return (
     <span
@@ -716,9 +417,9 @@ function TagChip({ tag, size = 'sm', active, onClick, dimmed }) {
         letterSpacing: '0.04em',
         borderRadius: 4,
         cursor: isInteractive ? 'pointer' : 'default',
-        background: isSel ? `${hex}22` : 'transparent',
-        color: isSel ? hex : C.textDim,
-        border: `1px solid ${isSel ? `${hex}55` : C.border}`,
+        background: isSel ? selBg : 'transparent',
+        color: isSel ? selText : C.textDim,
+        border: `1px solid ${isSel ? selBorder : C.border}`,
         opacity: dimmed ? 0.5 : 1,
         transition: 'all 120ms ease',
         whiteSpace: 'nowrap',
@@ -727,104 +428,6 @@ function TagChip({ tag, size = 'sm', active, onClick, dimmed }) {
     >
       {tag.name}
     </span>
-  );
-}
-
-/* ============================================================
-   SIGN IN
-   ============================================================ */
-function SignIn({ onSignIn }) {
-  const C = useTheme();
-  return (
-    <div style={{
-      minHeight: '100vh',
-      background: `radial-gradient(ellipse at 30% 20%, ${C.surface} 0%, ${C.bg} 60%)`,
-      fontFamily: F.body, color: C.text,
-      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2rem',
-    }}>
-      <div style={{ maxWidth: 440, width: '100%', textAlign: 'center' }}>
-        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 12, marginBottom: 40 }}>
-          <Snowflake size={22} color={C.ice} strokeWidth={1.5} />
-          <span style={{
-            fontFamily: F.mono, fontSize: 11, letterSpacing: '0.2em',
-            color: C.textMuted, textTransform: 'uppercase',
-          }}>kanbantt.icehunter.net</span>
-        </div>
-        <h1 style={{
-          fontFamily: F.display, fontStyle: 'italic', fontWeight: 400,
-          fontSize: 72, lineHeight: 1, margin: 0, color: C.text, letterSpacing: '-0.03em',
-        }}>Kanbantt</h1>
-        <p style={{
-          fontSize: 15, color: C.textMuted, marginTop: 20, marginBottom: 32,
-          lineHeight: 1.6, maxWidth: 360, marginLeft: 'auto', marginRight: 'auto',
-        }}>
-          Board, calendar, and timeline for the things you're tracking. Signs into
-          your own Google account. Your data stays in your Drive.
-        </p>
-        <button onClick={onSignIn} style={{
-          width: '100%', background: C.text, color: C.bg, border: 'none',
-          padding: '14px 20px', borderRadius: 8, fontSize: 14, fontWeight: 500,
-          fontFamily: F.body, cursor: 'pointer', display: 'flex',
-          alignItems: 'center', justifyContent: 'center', gap: 10,
-          transition: 'transform 120ms ease, box-shadow 120ms ease',
-        }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.transform = 'translateY(-1px)';
-            e.currentTarget.style.boxShadow = `0 8px 24px -8px ${C.ice}40`;
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.transform = 'translateY(0)';
-            e.currentTarget.style.boxShadow = 'none';
-          }}>
-          <svg width="16" height="16" viewBox="0 0 24 24">
-            <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
-            <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
-            <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
-            <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
-          </svg>
-          Sign in with Google
-        </button>
-
-        <div style={{
-          marginTop: 24, padding: '14px 16px',
-          border: `1px solid ${C.border}`, borderRadius: 8,
-          background: C.surface,
-        }}>
-          <div style={{
-            fontFamily: F.mono, fontSize: 10, letterSpacing: '0.15em',
-            textTransform: 'uppercase', color: C.textMuted,
-            marginBottom: 10, textAlign: 'left',
-          }}>Kanbantt will be able to</div>
-          {[
-            { label: 'Drive', scope: 'drive.file', note: 'only files this app creates' },
-            { label: 'Calendar', scope: 'calendar.events.readonly', note: 'read events from primary' },
-            { label: 'Profile', scope: 'openid email profile', note: 'name + email for display' },
-          ].map((s) => (
-            <div key={s.scope} style={{
-              display: 'flex', alignItems: 'baseline', gap: 8,
-              padding: '4px 0', textAlign: 'left',
-            }}>
-              <Check size={11} color={C.mint} strokeWidth={2.5} style={{ flexShrink: 0, alignSelf: 'center' }} />
-              <span style={{
-                fontFamily: F.body, fontSize: 12, color: C.text, fontWeight: 500,
-                minWidth: 56,
-              }}>{s.label}</span>
-              <span style={{
-                fontFamily: F.mono, fontSize: 10, color: C.textDim,
-              }}>{s.note}</span>
-            </div>
-          ))}
-        </div>
-
-        <p style={{
-          fontFamily: F.mono, fontSize: 10, color: C.textDim,
-          marginTop: 18, lineHeight: 1.7, letterSpacing: '0.02em',
-        }}>
-          No backend. No relay. The app talks only to your Google account —
-          there's no server here that could see or store your data.
-        </p>
-      </div>
-    </div>
   );
 }
 
@@ -920,6 +523,31 @@ function ConnectButton({ onConnect, gisStatus, hideLabel = false, full = false }
       <GoogleG size={15} />
       {!hideLabel && <span>Connect Google</span>}
     </button>
+  );
+}
+
+// Small monospace build stamp; click to copy. Shown in the Settings Account tab.
+function BuildStamp() {
+  const C = useTheme();
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(BUILD_STAMP);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch { /* clipboard blocked; no-op */ }
+  };
+  return (
+    <div
+      onClick={copy}
+      title="Click to copy"
+      style={{
+        fontFamily: F.mono, fontSize: 10, color: C.textDim,
+        cursor: 'pointer', userSelect: 'all', marginTop: 2,
+      }}
+    >
+      {BUILD_STAMP}{copied ? '  ✓ copied' : ''}
+    </div>
   );
 }
 
@@ -2828,6 +2456,8 @@ function SettingsModal({
                 and remove Kanbantt. Your board lives in this browser; once Drive
                 sync ships, this will also remove the synced copy.
               </div>
+
+              <BuildStamp />
             </>
           ) : (
             <>
@@ -2912,6 +2542,8 @@ function SettingsModal({
                 organize cards offline, saved on this device. Connecting only adds
                 sync and the calendar overlay (both upcoming); it’s never required.
               </div>
+
+              <BuildStamp />
             </>
           ))}
         </div>
@@ -3022,6 +2654,9 @@ export default function App() {
       if (th && THEMES[th]) setTheme(th);
     })();
   }, []);
+
+  // Stamp the build into the tab title (Kanbantt · v{version}+{commit}).
+  useEffect(() => { document.title = BUILD_STAMP; }, []);
 
   // Surface a sync time whenever the store changes (drives the Settings readout).
   useEffect(() => { if (snapshot.seq > 0) setLastSync(Date.now()); }, [snapshot]);
