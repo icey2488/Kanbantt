@@ -2061,6 +2061,78 @@ function RelativeTime({ ts }) {
 /* ============================================================
    SETTINGS MODAL (columns + tags management)
    ============================================================ */
+
+// Tag-row color swatch that opens a palette of the TAG_PALETTE hues. The swatch
+// is a focusable button; clicking or Enter/Space opens the popover, each hue is
+// itself a focusable button (Enter/Space selects), Escape closes and restores
+// focus to the swatch. Selecting calls onPick(hue) — the parent routes that
+// through the same store.setTags path the rename flow uses. No free-form hex.
+function TagSwatchPicker({ color, onPick, C }) {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef(null);
+  const popRef = useRef(null);
+  const hex = TAG_PALETTE[color] || TAG_PALETTE.slate;
+
+  // Close when clicking outside the swatch + popover.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => {
+      if (!popRef.current?.contains(e.target) && !triggerRef.current?.contains(e.target)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+
+  // On open, move focus into the palette (selected hue, else the first).
+  useEffect(() => {
+    if (!open) return;
+    const target = popRef.current?.querySelector('[data-selected="true"]')
+      || popRef.current?.querySelector('button');
+    target?.focus();
+  }, [open]);
+
+  const closeAndRefocus = () => { setOpen(false); triggerRef.current?.focus(); };
+  const select = (name) => { onPick(name); closeAndRefocus(); };
+
+  return (
+    <div style={{ position: 'relative', flexShrink: 0, display: 'flex' }}>
+      <button ref={triggerRef} onClick={() => setOpen((o) => !o)}
+        title="Set color" aria-haspopup="true" aria-expanded={open} style={{
+          width: 18, height: 18, borderRadius: '50%', padding: 0, display: 'block',
+          background: hex, border: `1px solid ${C.border}`,
+          cursor: 'pointer', transition: 'all 120ms ease',
+        }} />
+      {open && (
+        <div ref={popRef} role="menu" aria-label="Tag color"
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') { e.stopPropagation(); closeAndRefocus(); }
+          }}
+          style={{
+            position: 'absolute', top: 26, left: 0, zIndex: 10,
+            display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6,
+            padding: 8, background: C.panel, border: `1px solid ${C.border}`,
+            borderRadius: 8, boxShadow: '0 10px 30px rgba(0,0,0,0.35)',
+          }}>
+          {Object.entries(TAG_PALETTE).map(([name, h]) => {
+            const isSel = name === color;
+            return (
+              <button key={name} data-selected={isSel} onClick={() => select(name)}
+                title={name} aria-label={name} role="menuitemradio" aria-checked={isSel}
+                style={{
+                  width: 20, height: 20, borderRadius: '50%', padding: 0,
+                  background: h, cursor: 'pointer', outlineOffset: 2,
+                  border: isSel ? `2px solid ${C.text}` : `1px solid ${C.border}`,
+                }} />
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SettingsModal({
   columns, tags, tasks, user, onSignOut, onConnect, gisStatus, lastSync, onClose,
   onAddColumn, onRenameColumn, onRecolorColumn, onReorderColumn, onDeleteColumn,
@@ -2258,18 +2330,14 @@ function SettingsModal({
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {tags.map((tag) => {
                   const count = tagCardCount(tag.id);
-                  const hex = TAG_PALETTE[tag.color] || TAG_PALETTE.slate;
                   return (
                     <div key={tag.id} style={{
                       display: 'flex', alignItems: 'center', gap: 8,
                       padding: 8, background: C.surface,
                       border: `1px solid ${C.border}`, borderRadius: 8,
                     }}>
-                      <button onClick={() => onRecolorTag(tag.id)} title="Cycle color" style={{
-                        width: 18, height: 18, borderRadius: '50%',
-                        background: hex, border: `1px solid ${C.border}`,
-                        cursor: 'pointer', flexShrink: 0, transition: 'all 120ms ease',
-                      }} />
+                      <TagSwatchPicker color={tag.color}
+                        onPick={(c) => onRecolorTag(tag.id, c)} C={C} />
                       <input value={tag.name}
                         onChange={(e) => onRenameTag(tag.id, e.target.value)}
                         style={{ ...input, padding: '6px 10px' }} />
@@ -2860,9 +2928,11 @@ export default function App() {
 
   const renameTag = (id, name) =>
     store.setTags(tags.map((t) => (t.id === id ? { ...t, name } : t)));
-  const recolorTag = (id) =>
+  const recolorTag = (id, color) =>
     store.setTags(tags.map((t) => {
       if (t.id !== id) return t;
+      // Explicit hue from the palette picker; fall back to cycling when omitted.
+      if (color && TAG_PALETTE[color]) return { ...t, color };
       const idx = TAG_COLOR_CYCLE.indexOf(t.color);
       return { ...t, color: TAG_COLOR_CYCLE[(idx + 1) % TAG_COLOR_CYCLE.length] };
     }));
