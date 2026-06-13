@@ -41,6 +41,8 @@ let currentUser = null;    // { sub, email, name, picture }
 let onChangeCb = null;
 let pendingTokenResolvers = []; // Resolved when next callback fires.
 let initialized = false;
+let clientId = null;          // stashed by initAuth for lazy GIS setup
+let gisLoadPromise = null;    // memoized GIS script load (loaded on demand)
 
 /* ------------------------------------------------------------------------ */
 /* Setup                                                                    */
@@ -73,19 +75,41 @@ function loadGIS() {
  * @param {object} opts
  * @param {(state: {user, signedIn}) => void} opts.onChange - Called on sign-in/out
  */
-export async function initAuth(clientId, { onChange } = {}) {
-  if (!clientId) throw new Error('initAuth: clientId is required');
-  await loadGIS();
+export async function initAuth(id, { onChange } = {}) {
+  if (!id) throw new Error('initAuth: clientId is required');
+  clientId = id;
   onChangeCb = onChange || null;
-
-  tokenClient = window.google.accounts.oauth2.initTokenClient({
-    client_id: clientId,
-    scope: SCOPES,
-    // The single callback for both interactive and silent token requests.
-    callback: handleTokenResponse,
-    error_callback: handleTokenError,
-  });
   initialized = true;
+
+  // Local-first: do NOT touch Google on a fresh device. The GIS script and any
+  // network traffic are deferred until either (a) this device previously
+  // connected — then we silently re-acquire now — or (b) the user clicks
+  // Connect (signIn). A fresh, never-connected device stays fully offline.
+  if (isConnectedFlag()) {
+    await ensureGis();        // returning device: load GIS now…
+    maybeSilentReacquire();   // …and try once, silently, to restore the session
+  }
+}
+
+/**
+ * Lazily load the GIS script and create the token client. Memoized — safe to
+ * call repeatedly (StrictMode, multiple connect attempts). Throws if the script
+ * can't load (offline / ad-blocker), which callers translate to a disabled
+ * Connect control.
+ */
+async function ensureGis() {
+  if (tokenClient) return;
+  if (!gisLoadPromise) gisLoadPromise = loadGIS();
+  await gisLoadPromise;
+  if (!tokenClient) {
+    tokenClient = window.google.accounts.oauth2.initTokenClient({
+      client_id: clientId,
+      scope: SCOPES,
+      // The single callback for both interactive and silent token requests.
+      callback: handleTokenResponse,
+      error_callback: handleTokenError,
+    });
+  }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -96,10 +120,19 @@ export async function initAuth(clientId, { onChange } = {}) {
  * Trigger interactive sign-in. Shows Google's account picker + consent screen.
  * Resolves with the user profile, or rejects on user dismissal / error.
  */
-export function signIn() {
-  if (!initialized) return Promise.reject(new Error('signIn: call initAuth first'));
+export async function signIn() {
+  if (!initialized) throw new Error('signIn: call initAuth first');
+  // Load GIS on demand — this is the first Google traffic for a fresh device,
+  // and it happens inside the user's click gesture. If GIS can't load this
+  // throws, and the caller renders the Connect control disabled.
+  await ensureGis();
   return new Promise((resolve, reject) => {
-    pendingTokenResolvers.push({ resolve, reject });
+    // Remember the explicit connection (device-local) so future loads can try a
+    // silent re-acquire. Only an explicit, gesture-driven sign-in sets the flag.
+    pendingTokenResolvers.push({
+      resolve: (user) => { setConnectedFlag(); resolve(user); },
+      reject,
+    });
     tokenClient.requestAccessToken({ prompt: 'consent' });
   });
 }
@@ -113,6 +146,7 @@ export async function signOut() {
   }
   currentToken = null;
   currentUser = null;
+  clearConnectedFlag(); // explicit disconnect: don't silently reconnect next load
   onChangeCb?.({ user: null, signedIn: false });
 }
 
@@ -141,6 +175,60 @@ function refreshSilently() {
     pendingTokenResolvers.push({ resolve, reject });
     // Empty prompt = silent; Google reuses existing consent.
     tokenClient.requestAccessToken({ prompt: '' });
+  });
+}
+
+/* ------------------------------------------------------------------------ */
+/* Device-local "previously connected" flag + silent re-acquisition         */
+/* ------------------------------------------------------------------------ */
+
+// Device-local config (NOT board data): a plain localStorage boolean, never the
+// store blob. Set on explicit sign-in, cleared on explicit sign-out.
+const CONNECTED_FLAG = 'kanbantt_google_connected';
+const SILENT_TIMEOUT_MS = 8000;
+let silentAttempted = false;
+
+function isConnectedFlag() {
+  try { return localStorage.getItem(CONNECTED_FLAG) === '1'; } catch { return false; }
+}
+function setConnectedFlag() {
+  try { localStorage.setItem(CONNECTED_FLAG, '1'); } catch { /* private mode, etc. */ }
+}
+function clearConnectedFlag() {
+  try { localStorage.removeItem(CONNECTED_FLAG); } catch { /* ignore */ }
+}
+
+/**
+ * One-shot, module-scope silent re-acquisition. Runs at most once per page load
+ * — the guard lives at module scope precisely because React 18 StrictMode
+ * double-invokes component effects, and this must not.
+ *
+ * If this device previously connected, ask GIS for a token with NO prompt. EVERY
+ * failure mode resolves to signed-out quietly: error_callback, a thrown
+ * exception, GIS never loaded, or no callback at all (timeout). No popup, no
+ * error UI, no retry, and no unhandled rejection reaching the console.
+ */
+function maybeSilentReacquire() {
+  if (silentAttempted) return;
+  silentAttempted = true;
+  if (!isConnectedFlag() || !tokenClient) return; // never connected, or GIS down
+
+  // This promise only ever resolves (never rejects), so nothing downstream can
+  // surface an unhandled rejection.
+  new Promise((resolve) => {
+    let settled = false;
+    const finish = () => { if (!settled) { settled = true; resolve(); } };
+    // Catch BOTH outcomes of the shared GIS callback; reject is swallowed.
+    pendingTokenResolvers.push({ resolve: finish, reject: finish });
+    // "No callback at all" guard.
+    setTimeout(finish, SILENT_TIMEOUT_MS);
+    try {
+      // prompt: 'none' => GIS renders no UI; if it can't comply it errors via
+      // error_callback rather than opening a popup. No user gesture, no popup.
+      tokenClient.requestAccessToken({ prompt: 'none' });
+    } catch {
+      finish(); // synchronous throw (e.g., GIS object vanished mid-flight)
+    }
   });
 }
 
@@ -199,6 +287,11 @@ export function getUser() {
 
 export function isSignedIn() {
   return !!currentToken && Date.now() < currentToken.expires_at;
+}
+
+/** Whether GIS has loaded and a token client exists (i.e. Connect can proceed). */
+export function isGisReady() {
+  return !!tokenClient;
 }
 
 export function getGrantedScopes() {

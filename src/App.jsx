@@ -24,7 +24,7 @@ import {
   ArrowDown,
   Settings,
 } from 'lucide-react';
-import { initAuth, signIn, signOut } from './lib/auth.js';
+import { initAuth, signIn, signOut, isGisReady } from './lib/auth.js';
 import { store, bootError, subscribe, getSnapshot, readLegacyDump, STORAGE_KEY } from './lib/store-instance.js';
 import { orderBetween, compareCards } from './lib/card-store.js';
 
@@ -858,10 +858,77 @@ function ThemePicker({ theme, setTheme }) {
 }
 
 /* ============================================================
+   GOOGLE CONNECT AFFORDANCE
+   ============================================================ */
+// Track narrow viewports so the header Connect control can collapse to an icon.
+function useNarrow(maxWidth = 600) {
+  const [narrow, setNarrow] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia(`(max-width:${maxWidth}px)`).matches,
+  );
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mq = window.matchMedia(`(max-width:${maxWidth}px)`);
+    const on = () => setNarrow(mq.matches);
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, [maxWidth]);
+  return narrow;
+}
+
+function GoogleG({ size = 16 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" style={{ flexShrink: 0 }}>
+      <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+      <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+      <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
+      <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
+    </svg>
+  );
+}
+
+// One control, two placements (header + Settings). Disabled with an explanatory
+// title when GIS isn't ready (e.g. blocked by an ad-blocker / offline) so it is
+// never a dead button.
+function ConnectButton({ onConnect, gisStatus, hideLabel = false, full = false }) {
+  const C = useTheme();
+  // 'idle' and 'ready' are clickable; only a failed load or an in-flight attempt
+  // disable the control. A failed load is never a dead button — it explains why.
+  const disabled = gisStatus === 'failed' || gisStatus === 'loading';
+  const title =
+    gisStatus === 'failed'
+      ? 'Google sign-in is unavailable — check your connection or disable your ad blocker'
+      : gisStatus === 'loading'
+        ? 'Loading Google sign-in…'
+        : 'Connect your Google account';
+  return (
+    <button
+      onClick={onConnect}
+      disabled={disabled}
+      title={title}
+      aria-label="Connect Google"
+      style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+        padding: full ? '12px 16px' : '7px 12px',
+        width: full ? '100%' : 'auto',
+        background: C.surface, color: disabled ? C.textDim : C.text,
+        border: `1px solid ${C.border}`, borderRadius: 8,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        fontFamily: F.body, fontSize: 13, fontWeight: 500,
+        opacity: disabled ? 0.6 : 1, transition: 'all 120ms ease', whiteSpace: 'nowrap',
+      }}
+    >
+      <GoogleG size={15} />
+      {!hideLabel && <span>Connect Google</span>}
+    </button>
+  );
+}
+
+/* ============================================================
    HEADER
    ============================================================ */
-function Header({ view, setView, user, onSignOut, onNewTask, onOpenSettings, theme, setTheme, eventCount }) {
+function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTask, onOpenSettings, theme, setTheme }) {
   const C = useTheme();
+  const narrow = useNarrow();
   const tabs = [
     { id: 'board', label: 'Board', Icon: LayoutGrid },
     { id: 'calendar', label: 'Calendar', Icon: CalendarDays },
@@ -883,20 +950,8 @@ function Header({ view, setView, user, onSignOut, onNewTask, onOpenSettings, the
             fontSize: 22, color: C.text, letterSpacing: '-0.02em',
           }}>Kanbantt</span>
         </div>
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 6,
-          padding: '4px 10px', background: `${C.mint}15`,
-          borderRadius: 6, border: `1px solid ${C.mint}30`,
-        }} title="Google Calendar synced">
-          <div style={{
-            width: 6, height: 6, borderRadius: '50%',
-            background: C.mint, boxShadow: `0 0 8px ${C.mint}`,
-          }} />
-          <span style={{
-            fontFamily: F.mono, fontSize: 10, letterSpacing: '0.08em',
-            color: C.text, textTransform: 'uppercase',
-          }}>{eventCount} events synced</span>
-        </div>
+        {/* Events-synced badge removed with mock Calendar data; returns with
+            real Google Calendar integration. */}
       </div>
 
       <nav style={{
@@ -941,20 +996,26 @@ function Header({ view, setView, user, onSignOut, onNewTask, onOpenSettings, the
           <Plus size={14} strokeWidth={2.5} />
           New
         </button>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <div style={{
-            width: 28, height: 28, borderRadius: '50%',
-            background: `linear-gradient(135deg, ${C.frost}, ${C.ice})`,
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: 12, fontWeight: 600, color: '#fff', fontFamily: F.body,
-          }}>{user.initials}</div>
-          <button onClick={onSignOut} style={{
-            background: 'transparent', border: 'none', color: C.textMuted,
-            cursor: 'pointer', padding: 6, display: 'flex', alignItems: 'center',
-          }} title="Sign out">
-            <LogOut size={15} strokeWidth={1.5} />
-          </button>
-        </div>
+        {user ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{
+              width: 28, height: 28, borderRadius: '50%',
+              background: `linear-gradient(135deg, ${C.frost}, ${C.ice})`,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 12, fontWeight: 600, color: '#fff', fontFamily: F.body,
+            }}>{user.initials}</div>
+            <button onClick={onSignOut} style={{
+              background: 'transparent', border: 'none', color: C.textMuted,
+              cursor: 'pointer', padding: 6, display: 'flex', alignItems: 'center',
+            }} title="Sign out">
+              <LogOut size={15} strokeWidth={1.5} />
+            </button>
+          </div>
+        ) : (
+          // Signed out: Google is optional. Collapses to an icon when narrow so
+          // the header never overflows.
+          <ConnectButton onConnect={onConnect} gisStatus={gisStatus} hideLabel={narrow} />
+        )}
       </div>
     </header>
   );
@@ -2373,7 +2434,7 @@ function RelativeTime({ ts }) {
    SETTINGS MODAL (columns + tags management)
    ============================================================ */
 function SettingsModal({
-  columns, tags, tasks, user, onSignOut, lastSync, onClose,
+  columns, tags, tasks, user, onSignOut, onConnect, gisStatus, lastSync, onClose,
   onAddColumn, onRenameColumn, onRecolorColumn, onReorderColumn, onDeleteColumn,
   onAddTag, onRenameTag, onRecolorTag, onDeleteTag,
 }) {
@@ -2621,7 +2682,7 @@ function SettingsModal({
             </>
           )}
 
-          {tab === 'account' && (
+          {tab === 'account' && (user ? (
             <>
               <div style={{
                 display: 'flex', alignItems: 'center', gap: 14,
@@ -2712,12 +2773,19 @@ function SettingsModal({
                 }}>
                   <div style={{ flex: 1 }}>
                     <div style={{ fontFamily: F.body, fontSize: 13, color: C.text }}>
-                      kanbantt-data.json
+                      This device
                     </div>
                     <div style={{
                       fontFamily: F.mono, fontSize: 10, color: C.textMuted, marginTop: 2,
                     }}>
-                      in your Drive's app data folder
+                      saved in your browser’s local storage
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, marginTop: 6 }}>
+                      <span style={{ fontFamily: F.mono, fontSize: 10, color: C.textMuted }}>Drive sync</span>
+                      <span style={{
+                        fontFamily: F.mono, fontSize: 9, color: C.amber,
+                        letterSpacing: '0.1em', textTransform: 'uppercase',
+                      }}>Upcoming</span>
                     </div>
                   </div>
                   <div style={{
@@ -2740,7 +2808,7 @@ function SettingsModal({
                   }}>Sign out</div>
                   <div style={{
                     fontFamily: F.mono, fontSize: 10, color: C.textMuted, marginTop: 2,
-                  }}>Disconnect this device. Your Drive data is untouched.</div>
+                  }}>Disconnect this device. Your board stays saved on this device.</div>
                 </div>
                 <button onClick={onSignOut} style={{
                   display: 'flex', alignItems: 'center', gap: 6,
@@ -2757,10 +2825,95 @@ function SettingsModal({
               <div style={helperText}>
                 To fully revoke access, visit your{' '}
                 <span style={{ color: C.text }}>Google Account → Security → Third-party apps</span>{' '}
-                and remove Kanbantt. This also deletes the app's data file from your Drive.
+                and remove Kanbantt. Your board lives in this browser; once Drive
+                sync ships, this will also remove the synced copy.
               </div>
             </>
-          )}
+          ) : (
+            <>
+              {/* Local-first: the board works without Google. Connecting is optional. */}
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 14,
+                padding: 14, background: C.surface,
+                border: `1px solid ${C.border}`, borderRadius: 10,
+              }}>
+                <div style={{
+                  width: 44, height: 44, borderRadius: '50%',
+                  background: C.surfaceHi, border: `1px solid ${C.border}`,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  flexShrink: 0,
+                }}>
+                  <Snowflake size={18} color={C.textDim} strokeWidth={1.5} />
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontFamily: F.body, fontSize: 14, color: C.text, fontWeight: 500 }}>
+                    Not signed in
+                  </div>
+                  <div style={{ fontFamily: F.mono, fontSize: 11, color: C.textMuted, marginTop: 2 }}>
+                    Your board is saved locally on this device
+                  </div>
+                </div>
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '4px 10px', background: C.surfaceHi,
+                  borderRadius: 6, border: `1px solid ${C.border}`, flexShrink: 0,
+                }}>
+                  <span style={{
+                    fontFamily: F.mono, fontSize: 10, letterSpacing: '0.08em',
+                    color: C.textMuted, textTransform: 'uppercase',
+                  }}>Local</span>
+                </div>
+              </div>
+
+              <div>
+                <ConnectButton onConnect={onConnect} gisStatus={gisStatus} full />
+                {gisStatus === 'failed' && (
+                  <div style={{ ...helperText, color: C.coral, marginTop: 8 }}>
+                    Google sign-in didn’t load — likely an ad-blocker or no connection.
+                    The board still works without it.
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <div style={{
+                  fontFamily: F.mono, fontSize: 10, letterSpacing: '0.18em',
+                  textTransform: 'uppercase', color: C.textMuted, marginBottom: 10,
+                }}>Connecting Google enables</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {[
+                    { name: 'Drive sync', note: 'back up and sync your board across devices' },
+                    { name: 'Calendar overlay', note: 'see your Google Calendar events alongside due dates' },
+                  ].map((f) => (
+                    <div key={f.name} style={{
+                      display: 'flex', alignItems: 'baseline', gap: 10,
+                      padding: '10px 12px', background: C.surface,
+                      border: `1px solid ${C.border}`, borderRadius: 8,
+                    }}>
+                      <Clock size={12} color={C.textDim} strokeWidth={2}
+                        style={{ flexShrink: 0, alignSelf: 'center' }} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+                          <span style={{ fontFamily: F.body, fontSize: 13, color: C.text, fontWeight: 500 }}>{f.name}</span>
+                          <span style={{
+                            fontFamily: F.mono, fontSize: 9, color: C.amber,
+                            letterSpacing: '0.1em', textTransform: 'uppercase',
+                          }}>Upcoming</span>
+                        </div>
+                        <div style={{ fontFamily: F.mono, fontSize: 10, color: C.textMuted, marginTop: 2 }}>{f.note}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div style={helperText}>
+                The board works fully without Google — create, edit, drag, and
+                organize cards offline, saved on this device. Connecting only adds
+                sync and the calendar overlay (both upcoming); it’s never required.
+              </div>
+            </>
+          ))}
         </div>
       </div>
     </div>
@@ -2843,7 +2996,13 @@ export default function App() {
   const [otherTabChanged, setOtherTabChanged] = useState(false);
   const [notice, setNotice] = useState(null);
   const [filters, setFilters] = useState({ search: '', tags: [], overdueOnly: false });
-  const [events] = useState(MOCK_EVENTS);
+  // 'idle' = GIS not loaded yet (fresh device, no traffic); 'loading' = connect
+  // in flight; 'ready' = GIS up; 'failed' = GIS couldn't load (ad-blocker/offline).
+  const [gisStatus, setGisStatus] = useState('idle');
+  // MOCK_EVENTS no longer renders; the Calendar/Timeline overlay plumbing stays
+  // wired to this empty list as an attachment point for real Google Calendar
+  // integration (see MOCK_EVENTS above).
+  const events = [];
 
   // Board data comes exclusively from the card store via useSyncExternalStore.
   const snapshot = useSyncExternalStore(subscribe, getSnapshot);
@@ -2879,26 +3038,38 @@ export default function App() {
     initAuth(import.meta.env.VITE_GOOGLE_CLIENT_ID, {
       onChange: ({ user, signedIn }) => {
         if (signedIn && user) {
+          const label = user.name || user.email || 'You';
           setUser({
-            name: user.name,
-            email: user.email,
-            initials: user.name.split(' ').map((p) => p[0]).slice(0, 2).join('').toUpperCase(),
+            name: user.name || user.email || 'Google user',
+            email: user.email || '',
+            initials: label.split(' ').map((p) => p[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || 'G',
           });
         } else {
           setUser(null);
         }
       },
-    }).catch((e) => console.error('initAuth failed:', e));
+    })
+      // Returning device loaded GIS for the silent re-acquire => 'ready'. Fresh
+      // device loaded nothing => stays 'idle' (still clickable). GIS load failure
+      // on a returning device => 'failed' (Connect renders disabled).
+      .then(() => setGisStatus(isGisReady() ? 'ready' : 'idle'))
+      .catch((e) => { console.error('initAuth failed:', e); setGisStatus('failed'); });
   }, []);
 
   // Theme is device-local; board data persists through the store, not here.
   useEffect(() => { safeSet(K_THEME, theme); }, [theme]);
 
-  const handleSignIn = async () => {
+  // Connect: loads GIS on demand (first Google traffic, inside the click), then
+  // runs interactive sign-in. A GIS load failure flips the control to disabled;
+  // a user-dismissed popup leaves it ready to retry.
+  const handleConnect = async () => {
+    setGisStatus('loading');
     try {
       await signIn();
+      setGisStatus('ready');
     } catch (e) {
-      console.error('Sign-in failed:', e);
+      console.error('Connect failed:', e);
+      setGisStatus(isGisReady() ? 'ready' : 'failed');
     }
   };
   const handleSignOut = async () => {
@@ -3125,14 +3296,9 @@ export default function App() {
     return <BootError code={bootError.code} message={bootError.message} />;
   }
 
-  if (!user) {
-    return (
-      <ThemeContext.Provider value={C}>
-        <SignIn onSignIn={handleSignIn} />
-      </ThemeContext.Provider>
-    );
-  }
-
+  // Local-first: the board renders for everyone. Google is an optional
+  // connection surfaced in the header / Settings, not a gate. (?spike=1 and the
+  // boot-error screen above still take precedence.)
   return (
     <ThemeContext.Provider value={C}>
       <div style={{
@@ -3172,9 +3338,9 @@ export default function App() {
           </div>
         )}
         <Header view={view} setView={setView} user={user}
-          onSignOut={handleSignOut} onNewTask={openNew}
-          onOpenSettings={() => setShowSettings(true)}
-          theme={theme} setTheme={setTheme} eventCount={events.length} />
+          onSignOut={handleSignOut} onConnect={handleConnect} gisStatus={gisStatus}
+          onNewTask={openNew} onOpenSettings={() => setShowSettings(true)}
+          theme={theme} setTheme={setTheme} />
         <FilterBar tags={tags} filters={filters} setFilters={setFilters} />
         {view === 'board' && (
           <BoardView tasks={filteredTasks} tags={tags} columns={columns}
@@ -3198,6 +3364,7 @@ export default function App() {
         {showSettings && (
           <SettingsModal columns={columns} tags={tags} tasks={tasks}
             user={user} onSignOut={() => { setShowSettings(false); handleSignOut(); }}
+            onConnect={() => { setShowSettings(false); handleConnect(); }} gisStatus={gisStatus}
             lastSync={lastSync}
             onClose={() => setShowSettings(false)}
             onAddColumn={addColumn} onRenameColumn={renameColumn}
