@@ -588,9 +588,9 @@ test('subscribe fires a listener on every successful mutation', () => {
   assert.equal(calls, 2);
   store.move('c1', { column_id: 'done' }, { expected_version: 2 });
   assert.equal(calls, 3);
-  store.setColumns([{ id: 'todo', label: 'To Do' }]);
+  store.columnUpdate('todo', { label: 'To Do' });
   assert.equal(calls, 4);
-  store.setTags([{ id: 't1', name: 'x', color: 'gray' }]);
+  store.tagCreate({ id: 't1', name: 'x', color: 'gray' });
   assert.equal(calls, 5);
   store.delete('c1', { expected_version: 3 });
   assert.equal(calls, 6);
@@ -628,17 +628,176 @@ test('getSnapshot is referentially stable between mutations and fresh after one'
   assert.equal(s2.cards[0].title, 'B');
 });
 
-test('setColumns / setTags update the snapshot and persist', () => {
+test('columnCreate/Update and tagCreate/Update update the snapshot and persist', () => {
   const { store, storage } = freshStore();
-  store.setColumns([{ id: 'a', label: 'Alpha' }, { id: 'b', label: 'Beta' }]);
-  store.setTags([{ id: 'tag-x', name: 'x', color: 'red' }]);
+  store.columnCreate({ id: 'alpha', label: 'Alpha', accentKey: 'ice' });
+  store.columnUpdate('backlog', { label: 'Backlog!' });
+  store.tagCreate({ id: 'tag-x', name: 'x', color: 'red' });
+  store.tagUpdate('tag-x', { name: 'X2' });
 
   const snap = store.getSnapshot();
-  assert.deepEqual(snap.columns.map((c) => c.id), ['a', 'b']);
-  assert.deepEqual(snap.tags.map((t) => t.id), ['tag-x']);
+  assert.ok(snap.columns.some((c) => c.id === 'alpha'), 'created column in snapshot');
+  assert.equal(snap.columns.find((c) => c.id === 'backlog').label, 'Backlog!', 'rename applied');
+  assert.equal(snap.tags.find((t) => t.id === 'tag-x').name, 'X2', 'tag rename applied');
 
   // Persisted to storage under the v1 blob.
   const onDisk = JSON.parse(storage._raw(STORAGE_KEY));
-  assert.deepEqual(onDisk.columns.map((c) => c.id), ['a', 'b']);
-  assert.deepEqual(onDisk.tags.map((t) => t.id), ['tag-x']);
+  assert.ok(onDisk.columns.some((c) => c.id === 'alpha'));
+  assert.equal(onDisk.tags.find((t) => t.id === 'tag-x').name, 'X2');
+});
+
+test('columnCreate/tagCreate reject a duplicate id; update/reorder reject an unknown id', () => {
+  const { store } = freshStore();
+  assert.equal(grab(() => store.columnCreate({ id: 'todo', label: 'dup' })).code, 'validation_failed');
+  store.tagCreate({ id: 'tag-x', name: 'x', color: 'red' });
+  assert.equal(grab(() => store.tagCreate({ id: 'tag-x', name: 'y', color: 'blue' })).code, 'validation_failed');
+  assert.equal(grab(() => store.columnUpdate('nope', { label: 'x' })).code, 'column_unknown');
+  assert.equal(grab(() => store.columnReorder('nope', 0)).code, 'column_unknown');
+  assert.equal(grab(() => store.tagUpdate('nope', { name: 'x' })).code, 'not_found');
+});
+
+/* ================================================================== */
+/* board-config bulk ops — orphan-move, ref-strip, atomicity (A.5)    */
+/* ================================================================== */
+
+test('tagDelete strips the tag from every referencing card and leaves no dangling ref', () => {
+  const { store } = freshStore();
+  store.tagCreate({ id: 'tag-x', name: 'x', color: 'red' });
+  store.create({ id: 'c1', title: 'A', column_id: 'todo', tags: ['tag-x', 'tag-y'] });
+  store.create({ id: 'c2', title: 'B', column_id: 'todo', tags: ['tag-y'] });
+  store.create({ id: 'c3', title: 'C', column_id: 'done', tags: ['tag-x'] });
+
+  const v1Before = store.get('c1').version;
+  store.tagDelete('tag-x');
+
+  // Tag gone from the board, and not one surviving card still references it.
+  assert.equal(store.getSnapshot().tags.some((t) => t.id === 'tag-x'), false);
+  const all = store.list({ includeDeleted: true }).cards;
+  assert.equal(all.some((c) => (c.tags || []).includes('tag-x')), false, 'no dangling tag ref');
+
+  // Affected cards stripped + version bumped; untouched cards left alone.
+  assert.deepEqual(store.get('c1').tags, ['tag-y']);
+  assert.equal(store.get('c1').version, v1Before + 1, 'affected card version bumped');
+  assert.deepEqual(store.get('c3').tags, []);
+  assert.equal(store.get('c2').version, 1, 'unaffected card untouched');
+});
+
+test('tagDelete strips the ref from a tombstoned card without resurrecting it', () => {
+  const { store } = freshStore();
+  store.tagCreate({ id: 'tag-x', name: 'x', color: 'red' });
+  store.create({ id: 'c1', title: 'A', column_id: 'todo', tags: ['tag-x'] });
+  const tomb = store.delete('c1', { expected_version: 1 }); // -> v2 tombstone
+  assert.ok(tomb.deleted_at);
+
+  store.tagDelete('tag-x');
+
+  const dead = store.list({ includeDeleted: true }).cards.find((c) => c.id === 'c1');
+  assert.deepEqual(dead.tags, [], 'ref stripped from the tombstone too');
+  assert.ok(dead.deleted_at, 'still a tombstone — never resurrected');
+  assert.equal(dead.version, 3, 'version bumped by the system strip');
+  assert.equal(store.list().cards.find((c) => c.id === 'c1'), undefined, 'not in the live list');
+});
+
+test('columnDelete moves live cards to the destination, preserving order, with bumped versions', () => {
+  const { store } = freshStore();
+  store.create({ id: 'd1', title: 'D1', column_id: 'done' });   // sits in destination
+  store.create({ id: 'c1', title: 'C1', column_id: 'todo' });
+  store.create({ id: 'c2', title: 'C2', column_id: 'todo' });
+  store.create({ id: 'c3', title: 'C3', column_id: 'todo' });
+  const tomb = store.create({ id: 'tz', title: 'Tomb', column_id: 'todo' });
+  store.delete('tz', { expected_version: tomb.version }); // a tombstone in the doomed column
+  const vBefore = store.get('c1').version;
+
+  store.columnDelete('todo', 'done');
+
+  // Column gone; no LIVE card still points at it.
+  assert.equal(store.getSnapshot().columns.some((c) => c.id === 'todo'), false);
+  assert.equal(store.list().cards.some((c) => c.column_id === 'todo'), false, 'no live orphan');
+
+  // The three live cards landed in 'done', after d1, in their original order.
+  const done = store.list().cards.filter((c) => c.column_id === 'done').sort(compareCards);
+  assert.deepEqual(done.map((c) => c.id), ['d1', 'c1', 'c2', 'c3'], 'appended below, order preserved');
+  assert.ok(done.find((c) => c.id === 'c1').order > done.find((c) => c.id === 'd1').order);
+  assert.equal(store.get('c1').version, vBefore + 1, 'moved card version bumped');
+
+  // The tombstone was skipped: not moved, not bumped, still dead with its old column_id.
+  const dead = store.list({ includeDeleted: true }).cards.find((c) => c.id === 'tz');
+  assert.equal(dead.column_id, 'todo', 'tombstone keeps its defunct column_id (skipped)');
+  assert.equal(dead.version, 2, 'tombstone version untouched');
+});
+
+test('each bulk op fires notify exactly once, regardless of how many cards it touches', () => {
+  const { store } = freshStore();
+  store.tagCreate({ id: 'tag-x', name: 'x', color: 'red' });
+  store.create({ id: 'c1', title: 'A', column_id: 'todo', tags: ['tag-x'] });
+  store.create({ id: 'c2', title: 'B', column_id: 'todo', tags: ['tag-x'] });
+  store.create({ id: 'c3', title: 'C', column_id: 'todo', tags: ['tag-x'] });
+
+  let calls = 0;
+  store.subscribe(() => calls++); // subscribe AFTER seeding
+
+  store.tagDelete('tag-x');          // touches 3 cards
+  assert.equal(calls, 1, 'tagDelete notified exactly once');
+
+  store.columnDelete('todo', 'done'); // moves 3 cards
+  assert.equal(calls, 2, 'columnDelete notified exactly once');
+});
+
+test('columnDelete to an unknown/invalid destination throws and changes nothing', () => {
+  const { store, storage } = freshStore();
+  store.create({ id: 'c1', title: 'A', column_id: 'todo' });
+  const before = storage._raw(STORAGE_KEY);
+  const snapBefore = store.getSnapshot();
+
+  for (const [dest, code] of [['ghost', 'column_unknown'], ['todo', 'column_unknown'], [null, 'column_unknown']]) {
+    const err = grab(() => store.columnDelete('todo', dest));
+    assert.ok(err instanceof StoreError);
+    assert.equal(err.code, code, `dest ${dest}`);
+  }
+  // Byte-identical on disk + same snapshot reference (no notify happened).
+  assert.equal(storage._raw(STORAGE_KEY), before, 'localStorage untouched');
+  assert.equal(store.getSnapshot(), snapBefore, 'snapshot reference unchanged');
+});
+
+test('columnDelete on the last remaining column throws column_last_forbidden', () => {
+  const { store } = freshStore();
+  // Reduce to a single column via the store, then try to delete it.
+  store.columnDelete('backlog', 'todo');
+  store.columnDelete('doing', 'todo');
+  store.columnDelete('done', 'todo');
+  assert.deepEqual(store.getSnapshot().columns.map((c) => c.id), ['todo']);
+
+  const err = grab(() => store.columnDelete('todo', 'todo'));
+  assert.ok(err instanceof StoreError);
+  assert.equal(err.code, 'column_last_forbidden');
+  assert.deepEqual(store.getSnapshot().columns.map((c) => c.id), ['todo'], 'still there');
+});
+
+test('a bulk op whose single persist throws rolls back to a byte-identical state', () => {
+  const { store, storage } = freshStore();
+  store.tagCreate({ id: 'tag-x', name: 'x', color: 'red' });
+  store.create({ id: 'c1', title: 'A', column_id: 'todo', tags: ['tag-x'] });
+  store.create({ id: 'c2', title: 'B', column_id: 'todo', tags: ['tag-x'] });
+
+  const before = storage._raw(STORAGE_KEY);
+  const snapBefore = store.getSnapshot();
+  let calls = 0;
+  store.subscribe(() => calls++);
+
+  storage._failSetItem(STORAGE_KEY, quotaError()); // the one write will throw
+  const err = grab(() => store.tagDelete('tag-x'));
+  assert.ok(err instanceof StoreError);
+  assert.equal(err.code, 'persist_failed');
+  assert.deepEqual(err.meta.affectedCardIds.sort(), ['c1', 'c2'], 'error names the cards it would touch');
+
+  assert.equal(storage._raw(STORAGE_KEY), before, 'nothing written to localStorage');
+  assert.equal(store.getSnapshot(), snapBefore, 'snapshot reference unchanged');
+  assert.deepEqual(store.get('c1').tags, ['tag-x'], 'in-memory state intact');
+  assert.equal(calls, 0, 'no notify on a failed bulk op');
+});
+
+test('the raw whole-array setters are not exported on the store', () => {
+  const { store } = freshStore();
+  assert.equal(typeof store.setColumns, 'undefined', 'setColumns must not be externally callable');
+  assert.equal(typeof store.setTags, 'undefined', 'setTags must not be externally callable');
 });

@@ -221,6 +221,23 @@ function encodeFixed(v, width) {
   return s;
 }
 
+/**
+ * `n` strictly-increasing keys all greater than `after` (null => start fresh),
+ * minted in a single pass. Each step advances the lower bound to the key just
+ * minted, so the results are distinct and correctly sorted — never N keys minted
+ * between the same two boundaries (which would collide). Used to append a run of
+ * orphaned cards below a destination column's existing cards.
+ */
+export function appendOrders(after, n) {
+  const out = [];
+  let prev = after;
+  for (let i = 0; i < n; i++) {
+    prev = orderBetween(prev, null); // shortest key > prev; bound moves each step
+    out.push(prev);
+  }
+  return out;
+}
+
 /** Total order over cards: by `order`, then `id` as the collision tiebreak. */
 export function compareCards(x, y) {
   if (x.order !== y.order) return x.order < y.order ? -1 : 1;
@@ -409,16 +426,40 @@ export function createStore({
     notify();
   }
 
+  /**
+   * Atomically adopt a fully-built draft blob (used by the bulk board-config ops
+   * — columnDelete / tagDelete). The single localStorage write happens FIRST; only
+   * once it succeeds do we swap `blob`, mint exactly one fresh snapshot reference,
+   * and fire exactly one notify. A throw from the write leaves blob, snapshotRef,
+   * and listeners untouched — the draft is discarded and nothing is persisted.
+   * Mirrors the build-in-memory-then-write-once pattern the migration uses.
+   */
+  function persistDraft(draft, affectedCardIds = []) {
+    try {
+      storage.setItem(STORAGE_KEY, JSON.stringify(draft));
+    } catch (e) {
+      throw new StoreError('persist_failed', `could not persist board mutation: ${e?.name || e}`, {
+        affectedCardIds, cause: e,
+      });
+    }
+    blob = draft;
+    snapshotRef = buildSnapshot();
+    notify();
+  }
+
   /* ---- internal lookups ------------------------------------------------ */
 
   const findCard = (id) => ensureLoaded().cards.find((c) => c.id === id) || null;
 
-  function lastOrderInColumn(columnId) {
-    const inCol = blob.cards
+  // Last live order key in `columnId`, computed over an explicit card array so a
+  // not-yet-adopted bulk-op draft can be measured the same way live state is.
+  function lastLiveOrder(cards, columnId) {
+    const inCol = cards
       .filter((c) => c.column_id === columnId && !c.deleted_at)
       .sort(compareCards);
     return inCol.length ? inCol[inCol.length - 1].order : null;
   }
+  const lastOrderInColumn = (columnId) => lastLiveOrder(blob.cards, columnId);
 
   // A tombstone is immutable; even force cannot resurrect it.
   function assertMutable(card, opts) {
@@ -565,23 +606,156 @@ export function createStore({
   }
 
   /* ---- board config (columns + tags) ----------------------------------- */
-  // Board config is not card data: it has no version token and no delta cursor
-  // (the spec models column edits as an optional, locally-owned capability). The
-  // store simply owns the canonical arrays so there is one legal write path.
+  // Board config is not card data: a column/tag carries no version token and no
+  // delta cursor (the spec models these as optional, locally-owned capabilities).
+  // The store owns the canonical arrays AND the integrity invariants a conforming
+  // MCP server would enforce — orphan-move on column delete, tag ref-strip on tag
+  // delete — so there is no whole-array setter that could introduce a dangling
+  // tag ref or an orphaned column_id. The simple ops (create/update/reorder) touch
+  // a single config entity and mutate-then-commit; the two bulk ops (delete) build
+  // a complete draft and adopt it in one atomic write (see persistDraft).
+  //
+  // These are SYSTEM mutations: they mint each affected card's next version token
+  // internally and do NOT take or check an expected_version — the operation is
+  // itself the authority, so they never route through the card concurrency path
+  // (which would deadlock on a tombstone or a caller-less version).
 
-  function setColumns(next) {
+  function columnCreate(col) {
     ensureLoaded();
-    if (!Array.isArray(next)) throw new StoreError('validation', 'columns must be an array');
-    blob.columns = next.map((c) => ({ ...c }));
+    if (!col || typeof col !== 'object' || typeof col.id !== 'string' || col.id === '') {
+      throw new StoreError('validation_failed', 'column requires a non-empty string id');
+    }
+    if (blob.columns.some((c) => c.id === col.id)) {
+      throw new StoreError('validation_failed', `column ${col.id} already exists`, { id: col.id });
+    }
+    blob.columns.push({ ...col });
     commit();
     return clone(blob.columns);
   }
 
-  function setTags(next) {
+  // Board-config patch (rename and/or recolor). `id` is immutable.
+  function columnUpdate(id, patch = {}) {
     ensureLoaded();
-    if (!Array.isArray(next)) throw new StoreError('validation', 'tags must be an array');
-    blob.tags = next.map((t) => ({ ...t }));
+    const col = blob.columns.find((c) => c.id === id);
+    if (!col) throw new StoreError('column_unknown', `no column ${id}`, { id });
+    const fields = { ...patch };
+    delete fields.id;
+    Object.assign(col, fields);
     commit();
+    return clone(blob.columns);
+  }
+
+  // Columns are positioned by array order (the board has no per-column LexoRank
+  // field in v1); `toIndex` is the destination index, clamped into range.
+  function columnReorder(id, toIndex) {
+    ensureLoaded();
+    const from = blob.columns.findIndex((c) => c.id === id);
+    if (from < 0) throw new StoreError('column_unknown', `no column ${id}`, { id });
+    const dest = Math.max(0, Math.min(toIndex, blob.columns.length - 1));
+    const [col] = blob.columns.splice(from, 1);
+    blob.columns.splice(dest, 0, col);
+    commit();
+    return clone(blob.columns);
+  }
+
+  /**
+   * Delete a column, moving every LIVE card in it to `orphanDestinationColumnId`
+   * (a new version minted per moved card). Cascade-deleting cards is forbidden.
+   * Tombstones are skipped: a soft-deleted card has no live column placement to
+   * rescue, so it keeps its (now-defunct) column_id and is never resurrected.
+   * The destination must exist and differ from the deleted id; the last remaining
+   * column cannot be deleted. Atomic: one write, one notify, or nothing at all.
+   */
+  function columnDelete(id, orphanDestinationColumnId) {
+    ensureLoaded();
+    if (!blob.columns.some((c) => c.id === id)) {
+      throw new StoreError('column_unknown', `no column ${id}`, { id });
+    }
+    if (blob.columns.length <= 1) {
+      throw new StoreError('column_last_forbidden', 'cannot delete the last remaining column', { id });
+    }
+    const dest = orphanDestinationColumnId;
+    // Destination must exist, not be the column being deleted, and (trivially in a
+    // single-column delete) not itself be slated for deletion.
+    if (dest == null || dest === id || !blob.columns.some((c) => c.id === dest)) {
+      throw new StoreError('column_unknown', `invalid orphan destination: ${dest}`, {
+        id, destination: dest,
+      });
+    }
+
+    const draft = clone(blob);
+    const ts = iso();
+    const orphans = draft.cards
+      .filter((c) => c.column_id === id && !c.deleted_at) // live only
+      .sort(compareCards);                                // preserve relative order
+    const orders = appendOrders(lastLiveOrder(draft.cards, dest), orphans.length);
+    const affectedCardIds = orphans.map((c) => c.id);
+    orphans.forEach((card, i) => {
+      card.column_id = dest;
+      card.order = orders[i];
+      card.version += 1;
+      card.updated_at = ts;
+      card.updated_by = actor;
+      card.seq = ++draft.seq;
+    });
+    draft.columns = draft.columns.filter((c) => c.id !== id);
+
+    persistDraft(draft, affectedCardIds);
+    return clone(blob.columns);
+  }
+
+  function tagCreate(tag) {
+    ensureLoaded();
+    if (!tag || typeof tag !== 'object' || typeof tag.id !== 'string' || tag.id === '') {
+      throw new StoreError('validation_failed', 'tag requires a non-empty string id');
+    }
+    if (blob.tags.some((t) => t.id === tag.id)) {
+      throw new StoreError('validation_failed', `tag ${tag.id} already exists`, { id: tag.id });
+    }
+    blob.tags.push({ ...tag });
+    commit();
+    return clone(blob.tags);
+  }
+
+  // Tag patch (covers both recolor and rename). `id` is immutable.
+  function tagUpdate(id, patch = {}) {
+    ensureLoaded();
+    const tag = blob.tags.find((t) => t.id === id);
+    if (!tag) throw new StoreError('not_found', `no tag ${id}`, { id });
+    const fields = { ...patch };
+    delete fields.id;
+    Object.assign(tag, fields);
+    commit();
+    return clone(blob.tags);
+  }
+
+  /**
+   * Delete a tag, stripping its id from EVERY card that references it — including
+   * tombstones (the ref is removed and a new version minted, but deleted_at is
+   * left intact so the card stays a tombstone; it is never resurrected). A
+   * dangling tag reference is never left behind. Atomic: one write, one notify.
+   */
+  function tagDelete(id) {
+    ensureLoaded();
+    if (!blob.tags.some((t) => t.id === id)) {
+      throw new StoreError('not_found', `no tag ${id}`, { id });
+    }
+    const draft = clone(blob);
+    const ts = iso();
+    const affectedCardIds = [];
+    for (const card of draft.cards) {
+      if (!(card.tags || []).includes(id)) continue;
+      card.tags = card.tags.filter((t) => t !== id);
+      card.version += 1;
+      card.updated_at = ts;
+      card.updated_by = actor;
+      card.seq = ++draft.seq;
+      // deleted_at deliberately untouched: tombstones stay tombstoned.
+      affectedCardIds.push(card.id);
+    }
+    draft.tags = draft.tags.filter((t) => t.id !== id);
+
+    persistDraft(draft, affectedCardIds);
     return clone(blob.tags);
   }
 
@@ -607,7 +781,8 @@ export function createStore({
 
   return {
     load, list, get, create, update, move, delete: remove,
-    setColumns, setTags,
+    columnCreate, columnUpdate, columnReorder, columnDelete,
+    tagCreate, tagUpdate, tagDelete,
     subscribe, getSnapshot,
     orderBetween, snapshot, isLoaded,
   };

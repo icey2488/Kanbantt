@@ -2070,7 +2070,7 @@ function RelativeTime({ ts }) {
 // Settings. The trigger shows the current color; clicking or Enter/Space opens a
 // popover, each choice is itself a focusable button (Enter/Space selects), Escape
 // closes and restores focus to the trigger. Selecting calls onPick(key) — the
-// parent routes that through the store (setTags / setColumns). No free-form hex.
+// parent routes that through the store (tagUpdate / columnUpdate). No free-form hex.
 //   swatches : [{ key, hex }]  — opaque hues to choose from
 //   value    : currently selected key
 //   shape    : 'round' (tag dots) | 'square' (column accents), matching the row
@@ -2900,69 +2900,63 @@ export default function App() {
   };
 
   /* ---- board config (columns + tags) via the store --------------------- */
-  const createTag = (tag) => store.setTags([...tags, tag]);
+  // Every board-config mutation routes through a card-store method that owns the
+  // integrity invariants (orphan-move on column delete, tag ref-strip on tag
+  // delete). The app no longer computes replacement columns/tags arrays itself;
+  // it only mints ids and picks the next accent/hue (UI palette concerns) before
+  // handing the change to the store.
+  const createTag = (tag) => store.tagCreate(tag);
 
   const addColumn = (label) => {
     const trimmed = label.trim();
     if (!trimmed) return;
     const id = `col-${uid('').slice(2, 8)}`;
     const accentKey = COLUMN_ACCENTS[columns.length % COLUMN_ACCENTS.length];
-    store.setColumns([...columns, { id, label: trimmed, accentKey }]);
+    store.columnCreate({ id, label: trimmed, accentKey });
   };
-  const renameColumn = (id, label) =>
-    store.setColumns(columns.map((c) => (c.id === id ? { ...c, label } : c)));
-  const recolorColumn = (id, accentKey) =>
-    store.setColumns(columns.map((c) => {
-      if (c.id !== id) return c;
-      // Explicit accent from the palette picker; fall back to cycling when omitted.
-      if (accentKey && COLUMN_ACCENTS.includes(accentKey)) return { ...c, accentKey };
-      const idx = COLUMN_ACCENTS.indexOf(c.accentKey);
-      return { ...c, accentKey: COLUMN_ACCENTS[(idx + 1) % COLUMN_ACCENTS.length] };
-    }));
+  const renameColumn = (id, label) => store.columnUpdate(id, { label });
+  const recolorColumn = (id, accentKey) => {
+    // Explicit accent from the palette picker; fall back to cycling when omitted.
+    let next = accentKey;
+    if (!next || !COLUMN_ACCENTS.includes(next)) {
+      const cur = columns.find((c) => c.id === id);
+      const idx = COLUMN_ACCENTS.indexOf(cur?.accentKey);
+      next = COLUMN_ACCENTS[(idx + 1) % COLUMN_ACCENTS.length];
+    }
+    store.columnUpdate(id, { accentKey: next });
+  };
   const reorderColumn = (id, direction) => {
     const idx = columns.findIndex((c) => c.id === id);
     const target = idx + direction;
     if (idx < 0 || target < 0 || target >= columns.length) return;
-    const next = [...columns];
-    [next[idx], next[target]] = [next[target], next[idx]];
-    store.setColumns(next);
+    store.columnReorder(id, target);
   };
   const deleteColumn = (id) => {
+    // Guard mirrors the disabled delete control: the last column can't be deleted,
+    // and we never call with a null destination. The store moves orphaned cards.
     if (columns.length <= 1) return;
-    const remaining = columns.filter((c) => c.id !== id);
-    const fallback = remaining[0].id;
-    // Move every live card out to the fallback column (each gets a new version);
-    // cascade-deleting cards is forbidden. Then drop the column.
-    for (const card of getSnapshot().cards.filter((c) => c.column_id === id && !c.deleted_at)) {
-      const order = orderBetween(lastOrderOf(fallback, card.id), null);
-      store.move(card.id, { column_id: fallback, order }, { expected_version: card.version });
-    }
-    store.setColumns(remaining);
+    const fallback = columns.find((c) => c.id !== id).id;
+    store.columnDelete(id, fallback);
   };
 
-  const renameTag = (id, name) =>
-    store.setTags(tags.map((t) => (t.id === id ? { ...t, name } : t)));
-  const recolorTag = (id, color) =>
-    store.setTags(tags.map((t) => {
-      if (t.id !== id) return t;
-      // Explicit hue from the palette picker; fall back to cycling when omitted.
-      if (color && TAG_PALETTE[color]) return { ...t, color };
-      const idx = TAG_COLOR_CYCLE.indexOf(t.color);
-      return { ...t, color: TAG_COLOR_CYCLE[(idx + 1) % TAG_COLOR_CYCLE.length] };
-    }));
-  const deleteTag = (id) => {
-    // Strip the tag from every card that references it (one update each)…
-    for (const card of getSnapshot().cards.filter((c) => !c.deleted_at && (c.tags || []).includes(id))) {
-      store.update(card.id, { tags: (card.tags || []).filter((t) => t !== id) }, { expected_version: card.version });
+  const renameTag = (id, name) => store.tagUpdate(id, { name });
+  const recolorTag = (id, color) => {
+    // Explicit hue from the palette picker; fall back to cycling when omitted.
+    let next = color;
+    if (!next || !TAG_PALETTE[next]) {
+      const cur = tags.find((t) => t.id === id);
+      const idx = TAG_COLOR_CYCLE.indexOf(cur?.color);
+      next = TAG_COLOR_CYCLE[(idx + 1) % TAG_COLOR_CYCLE.length];
     }
-    store.setTags(tags.filter((t) => t.id !== id)); // …then drop it from config.
+    store.tagUpdate(id, { color: next });
   };
+  const deleteTag = (id) => store.tagDelete(id); // store strips refs (live + tombstoned)
   const addTag = (name) => {
     const trimmed = name.trim();
     if (!trimmed) return;
     const id = `tag-${uid('').slice(2, 8)}`;
     const color = TAG_COLOR_CYCLE[tags.length % TAG_COLOR_CYCLE.length];
-    store.setTags([...tags, { id, name: trimmed, color }]);
+    store.tagCreate({ id, name: trimmed, color });
   };
 
   const classifyTask = (taskId, update) => {
