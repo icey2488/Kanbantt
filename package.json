@@ -9,7 +9,7 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "spike:server": "node spike/mcp-server.mjs",
-    "test": "node --test src/lib/card-store.test.js src/lib/sync-merge.test.js"
+    "test": "node --test src/lib/card-store.test.js src/lib/sync-merge.test.js src/lib/drive-sync.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
