@@ -324,6 +324,97 @@ export function emptyBlob() {
   };
 }
 
+/**
+ * The single source of truth for "is this blob safe to load into the store?".
+ * Pure: it inspects only its argument — no module state, no localStorage, no
+ * mutation. Both load() (reading the persisted blob) and hydrate() (applying an
+ * externally-sourced blob) call this exact helper, so there is ZERO validation
+ * drift between them. Throws a StoreError on the first problem; returns nothing.
+ *
+ * Checks (parity with what load historically refused, PLUS hardening): schema
+ * version, structural shape, required card fields, duplicate ids, no dangling
+ * tag refs, and single-blob column self-consistency. The dangling-ref and
+ * column-consistency checks are the A.5-proper integrity invariants — hydrate is
+ * the one sanctioned whole-blob replace, so it must not become a way to smuggle
+ * a corrupt blob (dangling tag ref / orphaned column_id) past those invariants.
+ */
+export function validateBlob(blob) {
+  if (blob == null || typeof blob !== 'object' || Array.isArray(blob)) {
+    throw new StoreError('invalid_blob', 'blob must be an object');
+  }
+  // Schema: refuse any mismatch, exactly as load() does today (parity, not just
+  // "newer than supported"). A future/foreign schema is never partially adopted.
+  if (blob.schema_version !== SCHEMA_VERSION) {
+    throw new StoreError(
+      'schema_unsupported',
+      `unsupported schema_version ${blob.schema_version}; expected ${SCHEMA_VERSION}`,
+      { found: blob.schema_version, expected: SCHEMA_VERSION },
+    );
+  }
+  // Structural shape.
+  if (!Array.isArray(blob.cards)) throw new StoreError('invalid_blob', 'cards must be an array');
+  if (!Array.isArray(blob.tags)) throw new StoreError('invalid_blob', 'tags must be an array');
+  if (!Array.isArray(blob.columns)) throw new StoreError('invalid_blob', 'columns must be an array');
+  if (blob.settings == null || typeof blob.settings !== 'object' || Array.isArray(blob.settings)) {
+    throw new StoreError('invalid_blob', 'settings must be an object');
+  }
+  if (typeof blob.seq !== 'number' || !Number.isFinite(blob.seq)) {
+    throw new StoreError('invalid_blob', 'seq must be a finite number');
+  }
+
+  // Tag id set (+ no duplicate tag ids).
+  const tagIds = new Set();
+  for (const t of blob.tags) {
+    if (t == null || typeof t !== 'object' || typeof t.id !== 'string') {
+      throw new StoreError('invalid_blob', 'every tag needs a string id');
+    }
+    if (tagIds.has(t.id)) throw new StoreError('invalid_blob', `duplicate tag id ${t.id}`, { id: t.id });
+    tagIds.add(t.id);
+  }
+
+  // Column id set (+ no duplicate column ids).
+  const columnIds = new Set();
+  for (const c of blob.columns) {
+    if (c == null || typeof c !== 'object' || typeof c.id !== 'string') {
+      throw new StoreError('invalid_blob', 'every column needs a string id');
+    }
+    if (columnIds.has(c.id)) throw new StoreError('invalid_blob', `duplicate column id ${c.id}`, { id: c.id });
+    columnIds.add(c.id);
+  }
+
+  // Cards: required fields, no duplicate ids, no dangling tag refs, and column
+  // self-consistency (a card's column_id must exist in THIS blob's own columns —
+  // distinct from the spec's fallback-tray case for columns the CLIENT lacks).
+  const cardIds = new Set();
+  for (const card of blob.cards) {
+    if (card == null || typeof card !== 'object') {
+      throw new StoreError('invalid_blob', 'every card must be an object');
+    }
+    for (const f of ['id', 'column_id', 'order', 'version']) {
+      if (card[f] == null) throw new StoreError('invalid_blob', `card missing ${f}`, { id: card.id });
+    }
+    if (cardIds.has(card.id)) throw new StoreError('invalid_blob', `duplicate card id ${card.id}`, { id: card.id });
+    cardIds.add(card.id);
+    if (!columnIds.has(card.column_id)) {
+      throw new StoreError('invalid_blob', `card ${card.id} references unknown column ${card.column_id}`, {
+        id: card.id, column_id: card.column_id,
+      });
+    }
+    if (card.tags != null) {
+      if (!Array.isArray(card.tags)) {
+        throw new StoreError('invalid_blob', `card ${card.id} tags must be an array`, { id: card.id });
+      }
+      for (const ref of card.tags) {
+        if (!tagIds.has(ref)) {
+          throw new StoreError('invalid_blob', `card ${card.id} references unknown tag ${ref}`, {
+            id: card.id, tag: ref,
+          });
+        }
+      }
+    }
+  }
+}
+
 /* ======================================================================== */
 /* Store                                                                    */
 /* ======================================================================== */
@@ -375,16 +466,16 @@ export function createStore({
       loaded = false;
       throw new StoreError('corrupt_blob', `${STORAGE_KEY} is not valid JSON`);
     }
-    if (parsed.schema_version !== SCHEMA_VERSION) {
-      // A future/foreign schema is refused outright: nothing is loaded into
-      // memory, so a newer client's data can't be clobbered by this one.
+    // Single shared validator (schema + structure + integrity invariants). On any
+    // refusal, nothing is loaded into memory — a newer/foreign/corrupt blob can't
+    // be partially adopted or clobber a newer client's data. Same helper hydrate
+    // uses, so load and hydrate never drift.
+    try {
+      validateBlob(parsed);
+    } catch (e) {
       blob = null;
       loaded = false;
-      throw new StoreError(
-        'schema_unsupported',
-        `unsupported schema_version ${parsed.schema_version}; expected ${SCHEMA_VERSION}`,
-        { found: parsed.schema_version, expected: SCHEMA_VERSION },
-      );
+      throw e;
     }
     blob = parsed;
     loaded = true;
@@ -445,6 +536,56 @@ export function createStore({
     blob = draft;
     snapshotRef = buildSnapshot();
     notify();
+  }
+
+  /**
+   * Replace the ENTIRE local blob with an externally-sourced one (the Drive blob,
+   * already merged + canonical from sync-merge.js). This is the SOLE sanctioned
+   * whole-blob-replace path — the deliberate, narrow exception to A.5-proper's
+   * removal of whole-array setters. It is apply-or-refuse, never transform.
+   *
+   * 1. Validate the INCOMING ARGUMENT in total isolation (validateBlob) BEFORE
+   *    touching any live state. On failure it throws and live state, the in-memory
+   *    cache, and localStorage are left byte-identical — no persist, no snapshot
+   *    swap, no notify. A malformed external blob can never partially apply.
+   * 2. Apply verbatim with exactly two exceptions:
+   *      - seq      -> max(localSeq, incoming.seq): never regress the local
+   *                    version-token counter (a lower seq would reissue consumed
+   *                    sequence numbers and mint duplicate version tokens).
+   *      - settings -> local settings preserved verbatim. The codebase has NO
+   *                    explicit device-local-vs-board-wide settings key split
+   *                    (settings is a reserved, always-empty object; the one
+   *                    device-local pref, theme, lives outside the blob), so per
+   *                    the batch's stop-and-report rule we do NOT guess a merge;
+   *                    we keep local settings, which cannot corrupt device prefs.
+   *    Everything else (cards, tags, columns) applies verbatim — no version
+   *    minting, no content transform.
+   * 3. Apply as a single atomic swap: persist once (write first, so a failed
+   *    write leaves everything untouched), then swap the live blob, mint one fresh
+   *    snapshot reference, and notify exactly once.
+   */
+  function hydrate(incoming) {
+    ensureLoaded(); // need the local blob for the seq/settings exceptions
+    validateBlob(incoming); // throws on any invalid blob; nothing mutated yet
+
+    const next = {
+      ...incoming,
+      seq: Math.max(blob.seq, incoming.seq), // never regress the local counter
+      settings: blob.settings, // preserve device-local settings (see doc above)
+    };
+
+    // Atomic swap: write first; a throw here leaves blob/snapshot/listeners and
+    // localStorage byte-identical. Only on a successful write do we adopt it.
+    try {
+      storage.setItem(STORAGE_KEY, JSON.stringify(next));
+    } catch (e) {
+      throw new StoreError('persist_failed', `could not persist hydrated blob: ${e?.name || e}`, { cause: e });
+    }
+    blob = next;
+    loaded = true;
+    snapshotRef = buildSnapshot();
+    notify();
+    return clone(blob);
   }
 
   /* ---- internal lookups ------------------------------------------------ */
@@ -780,7 +921,7 @@ export function createStore({
   const isLoaded = () => loaded;
 
   return {
-    load, list, get, create, update, move, delete: remove,
+    load, hydrate, list, get, create, update, move, delete: remove,
     columnCreate, columnUpdate, columnReorder, columnDelete,
     tagCreate, tagUpdate, tagDelete,
     subscribe, getSnapshot,

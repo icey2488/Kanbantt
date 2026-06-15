@@ -11,6 +11,7 @@ import {
   orderBetween,
   mintOrders,
   compareCards,
+  validateBlob,
   StoreError,
   STORAGE_KEY,
   MIGRATED_MARKER,
@@ -800,4 +801,173 @@ test('the raw whole-array setters are not exported on the store', () => {
   const { store } = freshStore();
   assert.equal(typeof store.setColumns, 'undefined', 'setColumns must not be externally callable');
   assert.equal(typeof store.setTags, 'undefined', 'setTags must not be externally callable');
+});
+
+/* ================================================================== */
+/* hydrate(blob) + shared validateBlob (Feature 3a)                   */
+/* ================================================================== */
+
+// A structurally-valid blob (passes validateBlob) for the hydrate tests.
+const validBlob = (over = {}) => ({
+  schema_version: 1,
+  seq: 5,
+  cards: [
+    { id: 'k1', column_id: 'todo', order: 'V', version: 1, deleted_at: null, seq: 1, title: 'K1', tags: ['t1'] },
+    { id: 'k2', column_id: 'done', order: 'W', version: 1, deleted_at: null, seq: 2, title: 'K2', tags: [] },
+  ],
+  tags: [{ id: 't1', name: 'one', color: 'red' }],
+  columns: [{ id: 'todo', label: 'To Do', accentKey: 'ice' }, { id: 'done', label: 'Done', accentKey: 'mint' }],
+  settings: {},
+  ...over,
+});
+
+test('hydrate replaces the whole blob, fires exactly one notify, snapshot reflects it', () => {
+  const { store } = freshStore();
+  store.create({ id: 'old', title: 'Old', column_id: 'todo' });
+  let calls = 0;
+  store.subscribe(() => calls++);
+
+  const result = store.hydrate(validBlob());
+  assert.equal(calls, 1, 'exactly one notify');
+  const snap = store.getSnapshot();
+  assert.deepEqual(snap.cards.map((c) => c.id).sort(), ['k1', 'k2'], 'old state fully replaced');
+  assert.deepEqual(snap.tags.map((t) => t.id), ['t1']);
+  assert.deepEqual(snap.columns.map((c) => c.id).sort(), ['done', 'todo']);
+  assert.ok(result && result.cards.length === 2, 'returns the applied blob');
+});
+
+test('hydrate produces a fresh snapshot reference (drives a useSyncExternalStore re-render)', () => {
+  const { store } = freshStore();
+  store.create({ id: 'a', title: 'A', column_id: 'todo' });
+  const before = store.getSnapshot();
+  let fired = false;
+  store.subscribe(() => { fired = true; });
+
+  store.hydrate(validBlob());
+  assert.ok(fired, 'subscription fired');
+  assert.notEqual(store.getSnapshot(), before, 'fresh snapshot reference after hydrate');
+});
+
+test('hydrate never regresses seq; the next mutation mints strictly above the prior local max', () => {
+  const { store } = freshStore();
+  store.create({ id: 'a', title: 'A', column_id: 'todo' }); // seq 1
+  store.create({ id: 'b', title: 'B', column_id: 'todo' }); // seq 2
+  store.update('a', { title: 'A2' }, { expected_version: 1 }); // seq 3
+  assert.equal(store.getSnapshot().seq, 3);
+
+  store.hydrate(validBlob({ seq: 1 })); // incoming seq LOWER than local
+  assert.equal(store.getSnapshot().seq, 3, 'counter held at the higher local value');
+
+  const c = store.create({ id: 'fresh', title: 'New', column_id: 'todo' });
+  assert.ok(c.seq > 3, `next mutation seq ${c.seq} strictly above prior local max 3`);
+  assert.ok(c.seq > 1, 'and above the incoming seq (no reissue of consumed numbers)');
+});
+
+test('hydrate preserves local settings verbatim (no guessed device-local/board-wide merge)', () => {
+  // Seed a store whose persisted blob carries device-local settings.
+  const seeded = validBlob({ settings: { theme_pref: 'dark', deviceId: 'A' } });
+  const storage = makeStorage({ [STORAGE_KEY]: JSON.stringify(seeded) });
+  const { store } = freshStore({ storage });
+  store.load();
+
+  store.hydrate(validBlob({ settings: { theme_pref: 'light', other: 'x' } }));
+  assert.deepEqual(
+    store.getSnapshot().settings,
+    { theme_pref: 'dark', deviceId: 'A' },
+    'local settings preserved; incoming settings NOT adopted (stop-and-report: no explicit key split)',
+  );
+});
+
+// Deferred: the full device-local-vs-board-wide settings merge requires an
+// explicit key split, which the codebase does not define (settings is a reserved,
+// always-empty object; theme — the one device-local pref — lives outside the blob).
+// Per the batch's step-3 stop-and-report rule, hydrate preserves local settings
+// (tested above) and this graduates to a real test once the split is defined.
+test('settings device-local-vs-board-wide merge', { skip: 'deferred: no explicit settings key split (step 3 stop-and-report)' }, () => {});
+
+// Refusal must leave EVERYTHING byte-identical. Reference identity alone is
+// insufficient (a poisoned singleton still passes ===), so assert deep-equality of
+// in-memory state, the stringified localStorage value, AND that no notify fired.
+function assertRefused(store, storage, badBlob, code) {
+  const deepBefore = store.snapshot(); // deep clone of the in-memory blob
+  const rawBefore = storage._raw(STORAGE_KEY);
+  const refBefore = store.getSnapshot();
+  let calls = 0;
+  const unsub = store.subscribe(() => calls++);
+
+  const err = grab(() => store.hydrate(badBlob));
+  unsub();
+
+  assert.ok(err instanceof StoreError, 'refusal throws a StoreError');
+  if (code) assert.equal(err.code, code, 'expected refusal code');
+  assert.deepEqual(store.snapshot(), deepBefore, 'in-memory blob byte-identical (deep)');
+  assert.equal(storage._raw(STORAGE_KEY), rawBefore, 'localStorage byte-identical');
+  assert.equal(store.getSnapshot(), refBefore, 'no new snapshot reference produced');
+  assert.equal(calls, 0, 'no notify fired on refusal');
+}
+
+test('hydrate atomic refusal: every invalid blob leaves state + localStorage byte-identical, no notify', () => {
+  const { store, storage } = freshStore();
+  store.create({ id: 'a', title: 'A', column_id: 'todo', tags: [] });
+  store.create({ id: 'b', title: 'B', column_id: 'done', tags: [] });
+  const oneCol = [{ id: 'todo', label: 'T', accentKey: 'ice' }];
+
+  // schema_version too new
+  assertRefused(store, storage, validBlob({ schema_version: 2 }), 'schema_unsupported');
+  // dangling tag ref
+  assertRefused(store, storage, validBlob({
+    cards: [{ id: 'x', column_id: 'todo', order: 'V', version: 1, deleted_at: null, tags: ['ghost'] }],
+    tags: [], columns: oneCol,
+  }), 'invalid_blob');
+  // card missing column_id
+  assertRefused(store, storage, validBlob({
+    cards: [{ id: 'x', order: 'V', version: 1, deleted_at: null, tags: [] }],
+    tags: [], columns: oneCol,
+  }), 'invalid_blob');
+  // card missing id
+  assertRefused(store, storage, validBlob({
+    cards: [{ column_id: 'todo', order: 'V', version: 1, deleted_at: null, tags: [] }],
+    tags: [], columns: oneCol,
+  }), 'invalid_blob');
+  // card missing order
+  assertRefused(store, storage, validBlob({
+    cards: [{ id: 'x', column_id: 'todo', version: 1, deleted_at: null, tags: [] }],
+    tags: [], columns: oneCol,
+  }), 'invalid_blob');
+  // card column_id absent from this blob's own columns
+  assertRefused(store, storage, validBlob({
+    cards: [{ id: 'x', column_id: 'ghostcol', order: 'V', version: 1, deleted_at: null, tags: [] }],
+    tags: [], columns: oneCol,
+  }), 'invalid_blob');
+  // duplicate card id
+  assertRefused(store, storage, validBlob({
+    cards: [
+      { id: 'dup', column_id: 'todo', order: 'V', version: 1, deleted_at: null, tags: [] },
+      { id: 'dup', column_id: 'todo', order: 'W', version: 1, deleted_at: null, tags: [] },
+    ],
+    tags: [], columns: oneCol,
+  }), 'invalid_blob');
+});
+
+test('validator parity: a blob load() refuses is refused identically by hydrate (shared validateBlob)', () => {
+  const bad = validBlob({
+    cards: [{ id: 'x', column_id: 'todo', order: 'V', version: 1, deleted_at: null, tags: ['ghost'] }],
+    tags: [], columns: [{ id: 'todo', label: 'T', accentKey: 'ice' }],
+  });
+
+  // load() reading this persisted blob refuses it, with nothing in memory.
+  const storage = makeStorage({ [STORAGE_KEY]: JSON.stringify(bad) });
+  const { store } = freshStore({ storage });
+  const loadErr = grab(() => store.load());
+  assert.equal(loadErr.code, 'invalid_blob', 'load refuses the dangling-ref blob');
+  assert.equal(store.isLoaded(), false, 'nothing loaded into memory on refusal');
+
+  // hydrate on a healthy store refuses the SAME blob with the SAME code.
+  const { store: store2 } = freshStore();
+  store2.create({ id: 'a', title: 'A', column_id: 'todo' });
+  assert.equal(grab(() => store2.hydrate(bad)).code, 'invalid_blob', 'hydrate refuses identically');
+
+  // and the shared helper called directly.
+  assert.equal(grab(() => validateBlob(bad)).code, 'invalid_blob');
+  assert.doesNotThrow(() => validateBlob(validBlob()), 'a valid blob passes the shared validator');
 });
