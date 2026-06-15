@@ -23,8 +23,11 @@ import {
   Flag,
   ArrowDown,
   Settings,
+  Cloud,
+  RefreshCw,
 } from 'lucide-react';
 import { initAuth, signIn, signOut, isGisReady } from './lib/auth.js';
+import { driveSync } from './lib/sync-instance.js';
 import { store, bootError, subscribe, getSnapshot, readLegacyDump, STORAGE_KEY } from './lib/store-instance.js';
 import { orderBetween, compareCards } from './lib/card-store.js';
 
@@ -239,6 +242,9 @@ const MOCK_EVENTS = generateMockEvents();
 // the session is never persisted. Kept only to purge the stale key on mount.
 const K_SESSION = 'kanbantt:session:v1';
 const K_THEME = 'kanbantt:theme:v1';
+// Drive-sync enabled toggle — device-local config (its own key, NOT in the blob),
+// same pattern as theme and the google-connected flag. Defaults on when signed in.
+const K_SYNC = 'kanbantt:sync-enabled:v1';
 
 const safeGet = async (key, fallback) => {
   try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
@@ -558,7 +564,95 @@ function BuildStamp() {
 /* ============================================================
    HEADER
    ============================================================ */
-function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTask, onOpenSettings, theme, setTheme }) {
+/* ============================================================
+   DRIVE SYNC — status chip + collision dialog
+   ============================================================ */
+
+// Display config for each of the controller's 7 sync states. The chip is a pure
+// view of controller state — never its own source of truth.
+const SYNC_CHIP = {
+  synced: { label: 'Synced', colorKey: 'mint', Icon: Cloud },
+  syncing: { label: 'Syncing', colorKey: 'ice', Icon: RefreshCw },
+  paused_reconnect: { label: 'Reconnect', colorKey: 'amber', Icon: AlertTriangle },
+  paused_ratelimited: { label: 'Rate-limited', colorKey: 'amber', Icon: Clock },
+  paused_quota: { label: 'Drive full', colorKey: 'coral', Icon: AlertTriangle },
+  collision_pending: { label: 'Action needed', colorKey: 'coral', Icon: AlertTriangle },
+  error: { label: 'Sync error', colorKey: 'coral', Icon: AlertTriangle },
+};
+
+// Header chip. Clicking syncs now (or reconnects on a 401); it's inert while a
+// collision is pending (the blocking dialog drives that). Rendered only when
+// signed in AND sync is enabled — signed out shows no chip at all.
+function SyncChip({ status, onSyncNow, onReconnect }) {
+  const C = useTheme();
+  const cfg = SYNC_CHIP[status] || SYNC_CHIP.synced;
+  const tint = C[cfg.colorKey] || C.textMuted;
+  const isReconnect = status === 'paused_reconnect';
+  const isBlocked = status === 'collision_pending';
+  const onClick = isBlocked ? undefined : isReconnect ? onReconnect : onSyncNow;
+  return (
+    <button onClick={onClick} disabled={isBlocked}
+      title={isReconnect ? 'Reconnect Google to resume sync' : isBlocked ? 'Resolve the sync conflict' : 'Sync now'}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 6, padding: '5px 9px',
+        background: `${tint}1f`, border: `1px solid ${tint}55`, borderRadius: 8,
+        color: C.text, cursor: isBlocked ? 'default' : 'pointer',
+        fontFamily: F.mono, fontSize: 10, letterSpacing: '0.06em', textTransform: 'uppercase',
+      }}>
+      <cfg.Icon size={12} strokeWidth={2} color={tint} />
+      {cfg.label}
+    </button>
+  );
+}
+
+// Blocking modal for the unrelated-histories case. Exactly three choices, all
+// wired to the controller's resolveCollision — no auto-merge, no "merge" option.
+// The controller already snapshots the pre-action local blob as a safety copy.
+function CollisionDialog({ onResolve, busy }) {
+  const C = useTheme();
+  const choices = [
+    { key: 'adopt_drive', label: 'Use the Drive copy', note: 'replace this device’s board with the one in Drive' },
+    { key: 'upload_local', label: 'Upload this device', note: 'replace the Drive copy with this device’s board' },
+    { key: 'disconnect', label: 'Disconnect sync', note: 'keep this board local and stop syncing' },
+  ];
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: `${C.bg}cc`, backdropFilter: 'blur(4px)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 300, padding: 24,
+    }}>
+      <div style={{
+        background: C.surfaceHi, border: `1px solid ${C.border}`, borderRadius: 14,
+        width: '100%', maxWidth: 460, padding: 24, boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+          <AlertTriangle size={18} color={C.coral} strokeWidth={2} />
+          <span style={{ fontFamily: F.display, fontStyle: 'italic', fontSize: 18, color: C.text }}>
+            Unrelated boards detected
+          </span>
+        </div>
+        <p style={{ fontFamily: F.body, fontSize: 13, color: C.textMuted, lineHeight: 1.6, margin: '0 0 18px' }}>
+          This device and your Google Drive copy have unrelated histories — they were never
+          synced from a shared point, so they can’t be merged automatically. Choose how to
+          reconcile. Your current local board is kept as a safety copy before anything changes.
+        </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {choices.map((o) => (
+            <button key={o.key} disabled={busy} onClick={() => onResolve(o.key)} style={{
+              textAlign: 'left', padding: '12px 14px', background: C.surface,
+              border: `1px solid ${C.border}`, borderRadius: 10, cursor: busy ? 'default' : 'pointer',
+              opacity: busy ? 0.6 : 1, transition: 'all 120ms ease',
+            }}>
+              <div style={{ fontFamily: F.body, fontSize: 13, color: C.text, fontWeight: 500 }}>{o.label}</div>
+              <div style={{ fontFamily: F.mono, fontSize: 10, color: C.textMuted, marginTop: 2 }}>{o.note}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTask, onOpenSettings, theme, setTheme, syncEnabled, syncStatus, onSyncNow, onReconnect }) {
   const C = useTheme();
   const narrow = useNarrow();
   const tabs = [
@@ -609,6 +703,9 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
       </nav>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        {user && syncEnabled && (
+          <SyncChip status={syncStatus} onSyncNow={onSyncNow} onReconnect={onReconnect} />
+        )}
         <ThemePicker theme={theme} setTheme={setTheme} />
         <button onClick={onOpenSettings} style={{
           background: 'transparent', border: `1px solid ${C.border}`,
@@ -2147,6 +2244,7 @@ function SwatchPicker({ swatches, value, onPick, C, shape = 'round', cols = 5, l
 
 function SettingsModal({
   columns, tags, tasks, user, onSignOut, onConnect, gisStatus, lastSync, onClose,
+  syncEnabled, onToggleSync, syncStatus, onSyncNow,
   onAddColumn, onRenameColumn, onRecolorColumn, onReorderColumn, onDeleteColumn,
   onAddTag, onRenameTag, onRecolorTag, onDeleteTag,
 }) {
@@ -2488,12 +2586,34 @@ function SettingsModal({
                     }}>
                       saved in your browser’s local storage
                     </div>
-                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, marginTop: 6 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
                       <span style={{ fontFamily: F.mono, fontSize: 10, color: C.textMuted }}>Drive sync</span>
+                      <button onClick={() => onToggleSync(!syncEnabled)} role="switch" aria-checked={!!syncEnabled}
+                        title={syncEnabled ? 'Disable Drive sync' : 'Enable Drive sync'} style={{
+                          width: 34, height: 18, borderRadius: 9, padding: 0, flexShrink: 0,
+                          border: `1px solid ${syncEnabled ? C.ice : C.border}`,
+                          background: syncEnabled ? C.ice : C.surfaceHi,
+                          position: 'relative', cursor: 'pointer', transition: 'all 120ms ease',
+                        }}>
+                        <span style={{
+                          position: 'absolute', top: 1, left: syncEnabled ? 17 : 1,
+                          width: 14, height: 14, borderRadius: '50%',
+                          background: syncEnabled ? '#fff' : C.textMuted, transition: 'left 120ms ease',
+                        }} />
+                      </button>
                       <span style={{
-                        fontFamily: F.mono, fontSize: 9, color: C.amber,
-                        letterSpacing: '0.1em', textTransform: 'uppercase',
-                      }}>Upcoming</span>
+                        fontFamily: F.mono, fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase',
+                        color: syncEnabled ? (C[SYNC_CHIP[syncStatus]?.colorKey] || C.mint) : C.textDim,
+                      }}>{syncEnabled ? (SYNC_CHIP[syncStatus]?.label || 'On') : 'Off'}</span>
+                      {syncEnabled && syncStatus !== 'collision_pending' && (
+                        <button onClick={onSyncNow} title="Sync now" style={{
+                          marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5,
+                          fontFamily: F.mono, fontSize: 10, color: C.ice, background: 'transparent',
+                          border: `1px solid ${C.border}`, borderRadius: 6, padding: '3px 8px', cursor: 'pointer',
+                        }}>
+                          <RefreshCw size={11} strokeWidth={2} /> Sync now
+                        </button>
+                      )}
                     </div>
                   </div>
                   <div style={{
@@ -2711,6 +2831,11 @@ export default function App() {
   // 'idle' = GIS not loaded yet (fresh device, no traffic); 'loading' = connect
   // in flight; 'ready' = GIS up; 'failed' = GIS couldn't load (ad-blocker/offline).
   const [gisStatus, setGisStatus] = useState('idle');
+  // Drive sync: device-local enable toggle + a mirror of the controller's status.
+  // The controller is the source of truth; these only reflect it for the UI.
+  const [syncEnabled, setSyncEnabled] = useState(true);
+  const [syncStatus, setSyncStatus] = useState(() => driveSync?.getStatus().status ?? 'synced');
+  const [collisionBusy, setCollisionBusy] = useState(false);
   // MOCK_EVENTS no longer renders; the Calendar/Timeline overlay plumbing stays
   // wired to this empty list as an attachment point for real Google Calendar
   // integration (see MOCK_EVENTS above).
@@ -2726,12 +2851,15 @@ export default function App() {
     [snapshot],
   );
 
-  // Theme + the retired-session purge are the only device-local concerns left.
+  // Theme + sync toggle are device-local; load them on mount (and purge the
+  // retired session key). Board data does NOT come from here — the store owns it.
   useEffect(() => {
     (async () => {
       await safeDelete(K_SESSION);
       const th = await safeGet(K_THEME, 'dark');
       if (th && THEMES[th]) setTheme(th);
+      const se = await safeGet(K_SYNC, true);
+      setSyncEnabled(se !== false); // default on; only an explicit `false` disables
     })();
   }, []);
 
@@ -2773,6 +2901,32 @@ export default function App() {
 
   // Theme is device-local; board data persists through the store, not here.
   useEffect(() => { safeSet(K_THEME, theme); }, [theme]);
+  // Sync toggle is device-local config (its own key, never the blob).
+  useEffect(() => { safeSet(K_SYNC, syncEnabled); }, [syncEnabled]);
+
+  // Mirror the controller's status into React for the chip/Settings (read-only).
+  // Initial value comes from the lazy useState init; we subscribe before the
+  // controller can change status (start() runs in a later effect), so no update
+  // is missed and we avoid a synchronous setState in the effect body.
+  useEffect(() => driveSync ? driveSync.subscribeStatus(({ status }) => setSyncStatus(status)) : undefined, []);
+
+  // Sync lifecycle. Signed in AND enabled => start the controller and wire the
+  // focus read + the best-effort lifecycle flush (visibilitychange/pagehide,
+  // keepalive, as the controller implements). Otherwise dispose: stop all I/O and
+  // timers, leaving local data untouched. This runs in an effect (post-render), so
+  // it NEVER gates or blocks the board, which already rendered from local-first.
+  useEffect(() => {
+    if (!driveSync) return undefined;
+    if (user && syncEnabled) {
+      driveSync.start();
+      const onFocus = () => driveSync.onFocus();
+      window.addEventListener('focus', onFocus);
+      const removeFlush = driveSync.installLifecycleFlush();
+      return () => { window.removeEventListener('focus', onFocus); removeFlush(); };
+    }
+    driveSync.dispose();
+    return undefined;
+  }, [user, syncEnabled]);
 
   // Connect: loads GIS on demand (first Google traffic, inside the click), then
   // runs interactive sign-in. A GIS load failure flips the control to disabled;
@@ -2790,6 +2944,25 @@ export default function App() {
   const handleSignOut = async () => {
     await signOut();
     setUser(null);
+  };
+
+  /* ---- Drive sync triggers + collision resolution ----------------------- */
+  const handleSyncNow = () => driveSync?.syncNow();
+  // 401 reconnect affordance: re-acquire a token interactively, then re-sync.
+  const handleReconnect = async () => {
+    await handleConnect();
+    driveSync?.syncNow();
+  };
+  const handleResolveCollision = async (choice) => {
+    if (!driveSync) return;
+    setCollisionBusy(true);
+    try {
+      await driveSync.resolveCollision(choice);
+      // Disconnect is also a local "sync off" — reflect it in the device toggle.
+      if (choice === 'disconnect') setSyncEnabled(false);
+    } finally {
+      setCollisionBusy(false);
+    }
   };
 
   const openNew = () => {
@@ -3053,7 +3226,9 @@ export default function App() {
         <Header view={view} setView={setView} user={user}
           onSignOut={handleSignOut} onConnect={handleConnect} gisStatus={gisStatus}
           onNewTask={openNew} onOpenSettings={() => setShowSettings(true)}
-          theme={theme} setTheme={setTheme} />
+          theme={theme} setTheme={setTheme}
+          syncEnabled={syncEnabled} syncStatus={syncStatus}
+          onSyncNow={handleSyncNow} onReconnect={handleReconnect} />
         <FilterBar tags={tags} filters={filters} setFilters={setFilters} />
         {view === 'board' && (
           <BoardView tasks={filteredTasks} tags={tags} columns={columns}
@@ -3084,7 +3259,12 @@ export default function App() {
             onRecolorColumn={recolorColumn} onReorderColumn={reorderColumn}
             onDeleteColumn={deleteColumn}
             onAddTag={addTag} onRenameTag={renameTag}
-            onRecolorTag={recolorTag} onDeleteTag={deleteTag} />
+            onRecolorTag={recolorTag} onDeleteTag={deleteTag}
+            syncEnabled={syncEnabled} onToggleSync={setSyncEnabled}
+            syncStatus={syncStatus} onSyncNow={handleSyncNow} />
+        )}
+        {driveSync && syncStatus === 'collision_pending' && (
+          <CollisionDialog onResolve={handleResolveCollision} busy={collisionBusy} />
         )}
       </div>
     </ThemeContext.Provider>
