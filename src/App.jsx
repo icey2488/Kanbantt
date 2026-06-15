@@ -1157,9 +1157,78 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
 /* ============================================================
    CALENDAR VIEW
    ============================================================ */
+// Device-local calendar view preference — its own localStorage key, NOT board data
+// (same pattern as theme). v0.2 layouts: month grid, week row, work-week (Mon-Fri) row.
+const K_CAL_VIEW = 'kanbantt:calendar-view:v1';
+const CAL_LAYOUTS = [
+  { id: 'month', label: 'Month' },
+  { id: 'week', label: 'Week' },
+  { id: 'workweek', label: 'Work Week' },
+];
+
+// Shared day-cell chips — the SAME markup the month grid has always used, lifted into
+// one place so the week / work-week day-columns reuse it verbatim (no parallel chip).
+// `max` caps the list: month keeps its 3 + "+N more"; week/work-week pass Infinity to
+// show the full day (the column is tall and has no expand affordance for "+N more").
+function DayChips({ dayTasks, dayEvents, columns, onTaskClick, max = 3 }) {
+  const C = useTheme();
+  const combined = [
+    ...dayTasks.map((t) => ({ kind: 'task', data: t })),
+    ...dayEvents.map((e) => ({ kind: 'event', data: e })),
+  ];
+  const shown = combined.slice(0, max);
+  const overflow = combined.length - shown.length;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+      {shown.map((item) => {
+        if (item.kind === 'task') {
+          const t = item.data;
+          const col = columns.find((c) => c.id === t.status);
+          const overdue = isOverdue(t);
+          return (
+            <div key={t.id} onClick={() => onTaskClick(t)} style={{
+              fontSize: 11, color: C.text, background: C.surfaceHi,
+              borderLeft: `2px solid ${overdue ? C.coral : C[col.accentKey]}`,
+              padding: '3px 6px', borderRadius: 3, cursor: 'pointer',
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            }}>{t.title}</div>
+          );
+        }
+        const ev = item.data;
+        return (
+          <div key={ev.id} title={`${ev.time} · ${ev.title} (calendar)`} style={{
+            fontSize: 11, color: C.eventText, background: 'transparent',
+            border: `1px dashed ${C.eventText}50`,
+            padding: '2px 6px', borderRadius: 3,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            display: 'flex', alignItems: 'center', gap: 4, fontStyle: 'italic',
+          }}>
+            <Clock size={9} strokeWidth={2} />{ev.title}
+          </div>
+        );
+      })}
+      {overflow > 0 && (
+        <div style={{ fontFamily: F.mono, fontSize: 10, color: C.textDim, paddingLeft: 6 }}>
+          +{overflow} more
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CalendarView({ tasks, events, columns, onTaskClick }) {
   const C = useTheme();
   const [cursor, setCursor] = useState(new Date());
+  // Device-local view preference (NOT board data): synchronous lazy read so the first
+  // paint is the saved layout; persisted via safeSet, same as theme. Only the two new
+  // layouts are honored — anything else (incl. absent) falls back to Month.
+  const [layout, setLayout] = useState(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(K_CAL_VIEW));
+      return v === 'week' || v === 'workweek' ? v : 'month';
+    } catch { return 'month'; }
+  });
+  useEffect(() => { safeSet(K_CAL_VIEW, layout); }, [layout]);
 
   const monthStart = new Date(cursor.getFullYear(), cursor.getMonth(), 1);
   const monthEnd = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0);
@@ -1174,10 +1243,39 @@ function CalendarView({ tasks, events, columns, onTaskClick }) {
       : new Date(cursor.getFullYear(), cursor.getMonth(), dayNum));
   }
 
+  // Week / work-week buckets — Sunday-anchored to match the month grid's weekday order
+  // (Sun-Sat); work-week is the Mon-Fri slice of that same week. Built as local-midnight
+  // dates exactly like the month cells so iso()-based bucketing is the identical path.
+  const weekStart = startOfDay(addDays(cursor, -cursor.getDay()));
+  const weekDays = layout === 'workweek'
+    ? Array.from({ length: 5 }, (_, i) => addDays(weekStart, i + 1))
+    : Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
+
   const tasksForDay = (d) => d ? tasks.filter((t) => t.dueDate === iso(d)) : [];
   const eventsForDay = (d) => d ? events.filter((e) => e.date === iso(d)) : [];
-  const monthLabel = cursor.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   const isToday = (d) => d && iso(d) === iso(new Date());
+
+  const monthLabel = cursor.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  const fmtRange = (start, end) => {
+    const md = { month: 'short', day: 'numeric' };
+    const ymd = { month: 'short', day: 'numeric', year: 'numeric' };
+    if (start.getFullYear() === end.getFullYear() && start.getMonth() === end.getMonth())
+      return `${start.toLocaleDateString('en-US', md)} – ${end.getDate()}, ${end.getFullYear()}`;
+    if (start.getFullYear() === end.getFullYear())
+      return `${start.toLocaleDateString('en-US', md)} – ${end.toLocaleDateString('en-US', md)}, ${end.getFullYear()}`;
+    return `${start.toLocaleDateString('en-US', ymd)} – ${end.toLocaleDateString('en-US', ymd)}`;
+  };
+  const title = layout === 'month'
+    ? monthLabel
+    : fmtRange(weekDays[0], weekDays[weekDays.length - 1]);
+
+  // prev/next: by one month in month view, by one week in week / work-week.
+  const goPrev = () => setCursor(layout === 'month'
+    ? new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1)
+    : addDays(cursor, -7));
+  const goNext = () => setCursor(layout === 'month'
+    ? new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1)
+    : addDays(cursor, 7));
 
   const navBtn = {
     background: C.surface, border: `1px solid ${C.border}`, color: C.text,
@@ -1188,105 +1286,127 @@ function CalendarView({ tasks, events, columns, onTaskClick }) {
   return (
     <div style={{ padding: 28 }}>
       <div style={{
-        display: 'flex', alignItems: 'center',
+        display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 12,
         justifyContent: 'space-between', marginBottom: 24,
       }}>
         <div>
           <h2 style={{
             fontFamily: F.display, fontStyle: 'italic', fontWeight: 400,
             fontSize: 28, margin: 0, color: C.text, letterSpacing: '-0.02em',
-          }}>{monthLabel}</h2>
+          }}>{title}</h2>
           <Legend />
         </div>
-        <div style={{ display: 'flex', gap: 4 }}>
-          <button onClick={() => setCursor(new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1))} style={navBtn}>
-            <ChevronLeft size={16} strokeWidth={1.5} />
-          </button>
-          <button onClick={() => setCursor(new Date())} style={{
-            ...navBtn, padding: '0 14px', width: 'auto', fontFamily: F.mono, fontSize: 11,
-          }}>TODAY</button>
-          <button onClick={() => setCursor(new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1))} style={navBtn}>
-            <ChevronRight size={16} strokeWidth={1.5} />
-          </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <div style={{
+            display: 'flex', gap: 4, background: C.surface,
+            padding: 4, borderRadius: 10, border: `1px solid ${C.border}`,
+          }}>
+            {CAL_LAYOUTS.map(({ id, label }) => {
+              const active = layout === id;
+              return (
+                <button key={id} onClick={() => setLayout(id)} style={{
+                  padding: '6px 12px',
+                  background: active ? C.surfaceHi : 'transparent',
+                  color: active ? C.text : C.textMuted, border: 'none',
+                  borderRadius: 7, cursor: 'pointer', fontFamily: F.body,
+                  fontSize: 12, fontWeight: 500, transition: 'all 120ms ease',
+                  whiteSpace: 'nowrap',
+                }}>{label}</button>
+              );
+            })}
+          </div>
+          <div style={{ display: 'flex', gap: 4 }}>
+            <button onClick={goPrev} style={navBtn}>
+              <ChevronLeft size={16} strokeWidth={1.5} />
+            </button>
+            <button onClick={() => setCursor(new Date())} style={{
+              ...navBtn, padding: '0 14px', width: 'auto', fontFamily: F.mono, fontSize: 11,
+            }}>TODAY</button>
+            <button onClick={goNext} style={navBtn}>
+              <ChevronRight size={16} strokeWidth={1.5} />
+            </button>
+          </div>
         </div>
       </div>
 
-      <div style={{
-        display: 'grid', gridTemplateColumns: 'repeat(7, minmax(0, 1fr))', gap: 1,
-        background: C.border, border: `1px solid ${C.border}`,
-        borderRadius: 10, overflow: 'hidden',
-      }}>
-        {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => (
-          <div key={d} style={{
-            background: C.bgGrain, padding: '10px 12px',
-            fontFamily: F.mono, fontSize: 10.5, letterSpacing: '0.1em',
-            color: C.textMuted, textTransform: 'uppercase',
-          }}>{d}</div>
-        ))}
-        {cells.map((d, i) => {
-          const dayTasks = tasksForDay(d);
-          const dayEvents = eventsForDay(d);
-          const todayCell = isToday(d);
-          const combined = [
-            ...dayTasks.map((t) => ({ kind: 'task', data: t })),
-            ...dayEvents.map((e) => ({ kind: 'event', data: e })),
-          ];
-          return (
-            <div key={i} style={{
-              background: C.surface, minHeight: 118, padding: 8,
-              position: 'relative', opacity: d ? 1 : 0.3,
-            }}>
-              {d && (
-                <>
-                  <div style={{
+      {layout === 'month' ? (
+        <div style={{
+          display: 'grid', gridTemplateColumns: 'repeat(7, minmax(0, 1fr))', gap: 1,
+          background: C.border, border: `1px solid ${C.border}`,
+          borderRadius: 10, overflow: 'hidden',
+        }}>
+          {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => (
+            <div key={d} style={{
+              background: C.bgGrain, padding: '10px 12px',
+              fontFamily: F.mono, fontSize: 10.5, letterSpacing: '0.1em',
+              color: C.textMuted, textTransform: 'uppercase',
+            }}>{d}</div>
+          ))}
+          {cells.map((d, i) => {
+            const todayCell = isToday(d);
+            return (
+              <div key={i} style={{
+                background: C.surface, minHeight: 118, padding: 8,
+                position: 'relative', opacity: d ? 1 : 0.3,
+              }}>
+                {d && (
+                  <>
+                    <div style={{
+                      fontFamily: F.mono, fontSize: 12,
+                      color: todayCell ? (C.isLight ? '#fff' : C.bg) : C.textMuted,
+                      background: todayCell ? C.ice : 'transparent',
+                      borderRadius: 4, padding: todayCell ? '2px 6px' : '0',
+                      display: 'inline-block', marginBottom: 6,
+                      fontWeight: todayCell ? 600 : 400,
+                    }}>{d.getDate()}</div>
+                    <DayChips dayTasks={tasksForDay(d)} dayEvents={eventsForDay(d)}
+                      columns={columns} onTaskClick={onTaskClick} />
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: `repeat(${weekDays.length}, minmax(0, 1fr))`, gap: 1,
+          background: C.border, border: `1px solid ${C.border}`,
+          borderRadius: 10, overflow: 'hidden',
+        }}>
+          {weekDays.map((d, i) => {
+            const todayCell = isToday(d);
+            return (
+              <div key={i} style={{
+                background: C.surface, minHeight: 520,
+                display: 'flex', flexDirection: 'column',
+              }}>
+                <div style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  background: C.bgGrain, padding: '10px 12px',
+                  borderBottom: `1px solid ${C.border}`,
+                }}>
+                  <span style={{
+                    fontFamily: F.mono, fontSize: 10.5, letterSpacing: '0.1em',
+                    color: C.textMuted, textTransform: 'uppercase',
+                  }}>{d.toLocaleDateString('en-US', { weekday: 'short' })}</span>
+                  <span style={{
                     fontFamily: F.mono, fontSize: 12,
                     color: todayCell ? (C.isLight ? '#fff' : C.bg) : C.textMuted,
                     background: todayCell ? C.ice : 'transparent',
                     borderRadius: 4, padding: todayCell ? '2px 6px' : '0',
-                    display: 'inline-block', marginBottom: 6,
                     fontWeight: todayCell ? 600 : 400,
-                  }}>{d.getDate()}</div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-                    {combined.slice(0, 3).map((item) => {
-                      if (item.kind === 'task') {
-                        const t = item.data;
-                        const col = columns.find((c) => c.id === t.status);
-                        const overdue = isOverdue(t);
-                        return (
-                          <div key={t.id} onClick={() => onTaskClick(t)} style={{
-                            fontSize: 11, color: C.text, background: C.surfaceHi,
-                            borderLeft: `2px solid ${overdue ? C.coral : C[col.accentKey]}`,
-                            padding: '3px 6px', borderRadius: 3, cursor: 'pointer',
-                            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                          }}>{t.title}</div>
-                        );
-                      } else {
-                        const ev = item.data;
-                        return (
-                          <div key={ev.id} title={`${ev.time} · ${ev.title} (calendar)`} style={{
-                            fontSize: 11, color: C.eventText, background: 'transparent',
-                            border: `1px dashed ${C.eventText}50`,
-                            padding: '2px 6px', borderRadius: 3,
-                            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                            display: 'flex', alignItems: 'center', gap: 4, fontStyle: 'italic',
-                          }}>
-                            <Clock size={9} strokeWidth={2} />{ev.title}
-                          </div>
-                        );
-                      }
-                    })}
-                    {combined.length > 3 && (
-                      <div style={{ fontFamily: F.mono, fontSize: 10, color: C.textDim, paddingLeft: 6 }}>
-                        +{combined.length - 3} more
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
-          );
-        })}
-      </div>
+                  }}>{d.getDate()}</span>
+                </div>
+                <div style={{ padding: 8 }}>
+                  <DayChips dayTasks={tasksForDay(d)} dayEvents={eventsForDay(d)}
+                    columns={columns} onTaskClick={onTaskClick} max={Infinity} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
