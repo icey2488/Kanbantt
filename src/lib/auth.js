@@ -12,7 +12,7 @@
  * Usage:
  *   import { initAuth, signIn, signOut, withToken, getUser, isSignedIn } from './auth.js';
  *
- *   await initAuth(import.meta.env.PUBLIC_GOOGLE_CLIENT_ID, {
+ *   await initAuth(import.meta.env.VITE_GOOGLE_CLIENT_ID, {
  *     onChange: (state) => setUserState(state),
  *   });
  *
