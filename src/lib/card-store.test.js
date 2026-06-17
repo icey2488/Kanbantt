@@ -462,7 +462,18 @@ test('migration with K_COLUMNS/K_TAGS absent uses defaults', () => {
   assert.equal(res.status, 'migrated');
 
   const blob = JSON.parse(storage._raw(STORAGE_KEY));
-  assert.deepEqual(blob.columns, DEFAULT_COLUMNS);
+  // Columns are the defaults PLUS a LexoRank `rank` minted by array order (ticket #5):
+  // same ids/labels/accents in the same order, now each carrying a strictly-increasing
+  // rank so column ordering is fractional rather than array-index.
+  assert.deepEqual(
+    blob.columns.map(({ rank, ...rest }) => rest),
+    DEFAULT_COLUMNS,
+    'columns match the defaults (modulo the added rank)',
+  );
+  const ranks = blob.columns.map((c) => c.rank);
+  assert.ok(ranks.every((r) => typeof r === 'string' && r.length > 0), 'every column has a rank');
+  assert.deepEqual(ranks, [...ranks].sort(), 'ranks are strictly increasing in array order');
+  assert.equal(new Set(ranks).size, ranks.length, 'ranks are distinct');
   assert.deepEqual(blob.tags, DEFAULT_TAGS);
 });
 
@@ -970,4 +981,86 @@ test('validator parity: a blob load() refuses is refused identically by hydrate 
   // and the shared helper called directly.
   assert.equal(grab(() => validateBlob(bad)).code, 'invalid_blob');
   assert.doesNotThrow(() => validateBlob(validBlob()), 'a valid blob passes the shared validator');
+});
+
+/* ================================================================== */
+/* column LexoRank ordering (ticket #5)                               */
+/* ================================================================== */
+
+test('columnReorder mints a midpoint rank: order changes, sibling ranks untouched (no renumber)', () => {
+  const { store } = freshStore();
+  // Fresh board is born ranked by array order: backlog, todo, doing, done.
+  const before = store.getSnapshot().columns;
+  assert.deepEqual(before.map((c) => c.id), ['backlog', 'todo', 'doing', 'done'], 'default display order');
+  const ranksBefore = Object.fromEntries(before.map((c) => [c.id, c.rank]));
+
+  // Move 'done' up to index 1 (between backlog and todo).
+  store.columnReorder('done', 1);
+  const after = store.getSnapshot().columns;
+  assert.deepEqual(after.map((c) => c.id), ['backlog', 'done', 'todo', 'doing'], 'display order reflects the move');
+
+  // Insert-between: every NON-moved column keeps its exact prior rank (no renumber).
+  for (const id of ['backlog', 'todo', 'doing']) {
+    assert.equal(after.find((c) => c.id === id).rank, ranksBefore[id], `${id} rank untouched`);
+  }
+  const movedRank = after.find((c) => c.id === 'done').rank;
+  assert.notEqual(movedRank, ranksBefore.done, 'moved column got a new rank');
+  assert.ok(ranksBefore.backlog < movedRank && movedRank < ranksBefore.todo, 'new rank is the midpoint of its new neighbors');
+});
+
+test('column-rank migration: a pre-rank board is ranked by array order on load (one-time, idempotent, order-preserving)', () => {
+  // A legacy v1 blob whose columns carry NO rank (array-index ordering).
+  const legacy = {
+    schema_version: 1, seq: 0, cards: [], tags: [],
+    columns: [
+      { id: 'a', label: 'A', accentKey: 'ice' },
+      { id: 'b', label: 'B', accentKey: 'mint' },
+      { id: 'c', label: 'C', accentKey: 'amber' },
+    ],
+    settings: {},
+  };
+  const storage = makeStorage({ [STORAGE_KEY]: JSON.stringify(legacy) });
+  const { store } = freshStore({ storage });
+  store.load();
+
+  // Ranks assigned by current array order; same order out as in (deterministic, stable).
+  const cols = store.getSnapshot().columns;
+  assert.deepEqual(cols.map((c) => c.id), ['a', 'b', 'c'], 'array order preserved');
+  assert.ok(cols.every((c) => typeof c.rank === 'string' && c.rank.length > 0), 'every column ranked');
+  assert.deepEqual(cols.map((c) => c.rank), [...cols.map((c) => c.rank)].sort(), 'ranks strictly increasing in order');
+
+  // Persisted once on the migrating load.
+  const rawAfterFirst = storage._raw(STORAGE_KEY);
+  assert.ok(JSON.parse(rawAfterFirst).columns.every((c) => typeof c.rank === 'string'), 'ranks written to disk');
+
+  // Idempotent + already-migrated-is-untouched: re-loading the now-ranked blob does
+  // NOT rewrite storage (backfill is a no-op) and yields byte-identical ranks.
+  const { store: store2 } = freshStore({ storage });
+  store2.load();
+  assert.equal(storage._raw(STORAGE_KEY), rawAfterFirst, 'second load does not rewrite (one-time)');
+  assert.deepEqual(store2.getSnapshot().columns.map((c) => c.rank), cols.map((c) => c.rank), 'ranks unchanged on re-load');
+});
+
+test('columnCreate appends after the last column by rank; ranks stay ordered', () => {
+  const { store } = freshStore();
+  store.columnCreate({ id: 'extra', label: 'Extra', accentKey: 'ice' });
+  const cols = store.getSnapshot().columns;
+  assert.equal(cols[cols.length - 1].id, 'extra', 'new column lands last');
+  assert.ok(cols.every((c) => typeof c.rank === 'string' && c.rank.length > 0), 'all ranked');
+  assert.deepEqual(cols.map((c) => c.rank), [...cols.map((c) => c.rank)].sort(), 'ranks remain ordered');
+});
+
+test('card ordering regression: column ranks do not disturb card order keys', () => {
+  const { store } = freshStore();
+  const a = store.create({ id: 'a', title: 'A', column_id: 'todo' });
+  const b = store.create({ id: 'b', title: 'B', column_id: 'todo' });
+  const c = store.create({ id: 'c', title: 'C', column_id: 'todo' });
+  const todo = () => store.list().cards.filter((x) => x.column_id === 'todo').sort(compareCards);
+
+  assert.deepEqual(todo().map((x) => x.id), ['a', 'b', 'c'], 'cards ordered by their fractional order keys');
+  assert.ok(a.order < b.order && b.order < c.order, 'card order keys strictly increasing');
+
+  const ordersBefore = todo().map((x) => x.order);
+  store.columnReorder('todo', 0); // a column-level op
+  assert.deepEqual(todo().map((x) => x.order), ordersBefore, 'card order keys untouched by a column reorder');
 });

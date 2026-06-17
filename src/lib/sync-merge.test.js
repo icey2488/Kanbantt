@@ -274,6 +274,56 @@ test('resolver branch 3: empty side ignores lastSynced -> adopt/push', () => {
   assert.equal(resolve({ local: populated, drive: empty, lastSynced: null }).action, 'push_local');
 });
 
+/* ================================================================== */
+/* column LexoRank under merge — ticket #5, Option A (columns = CONFIG) */
+/* ================================================================== */
+/* The DESIGN DECISION proof. Columns stay a CONFIG collection (unionById,    */
+/* lesser-canonical): the LexoRank `rank` is just another column field that   */
+/* rides the EXISTING merge path — sync-merge.js is byte-unchanged. So the    */
+/* merge stays convergent and never corrupts, with NO conflict-copy columns   */
+/* and NO array-index drift. Option B (columns -> UNION_COLLECTIONS) is        */
+/* rejected: the union path mints conflict copies, which for columns are       */
+/* phantom duplicate columns (the second test makes that concrete).            */
+
+const col = (id, rank, extra = {}) => ({ id, label: id.toUpperCase(), accentKey: 'ice', rank, ...extra });
+
+test('column ranks merge convergently (CONFIG): well-formed total order, no conflict columns, no array drift', () => {
+  // Two clients reordered columns concurrently -> same ids, divergent ranks.
+  const A = blob({ columns: [col('x', '1'), col('y', '2'), col('z', '3')], cards: [card('k', '1')] });
+  const B = blob({ columns: [col('z', '0'), col('x', '4'), col('y', '5')], cards: [card('k', '1')] });
+
+  const ab = mergeBlobs(A, B);
+  const ba = mergeBlobs(B, A);
+
+  // Convergent (the non-negotiable property) — order-independent under canonicalize.
+  assert.ok(eq(ab, ba), 'commutative under canonicalize with rank fields present');
+  assert.ok(eq(mergeBlobs(ab, ab), ab), 'idempotent under canonicalize');
+
+  // Every column survives exactly once: no dropped column, NO phantom conflict copy.
+  assert.deepEqual(ab.columns.map((c) => c.id).sort(), ['x', 'y', 'z'], 'all columns preserved, none duplicated');
+  assert.equal(ab.columns.some((c) => c.id.includes('.conflict.')), false, 'NO conflict-copy columns (CONFIG, not UNION)');
+
+  // Ranks are well-formed strings sorting to a strict total order (no array-index drift):
+  // a clean render order, even if — the honest Option A limit — it need not equal either
+  // client's whole order under simultaneous reorder.
+  assert.ok(ab.columns.every((c) => typeof c.rank === 'string' && c.rank.length > 0), 'well-formed ranks after merge');
+  const ranks = ab.columns.map((c) => c.rank);
+  assert.equal(new Set(ranks).size, ranks.length, 'distinct ranks -> a clean total order, no positional corruption');
+});
+
+test('same-column divergence stays CONFIG: one column wins, no phantom conflict-copy column (why not Option B)', () => {
+  // Two clients renamed the SAME column differently (same id, divergent content).
+  const A = blob({ columns: [col('todo', '1', { label: 'To Do (A)' })] });
+  const B = blob({ columns: [col('todo', '1', { label: 'To Do (B)' })] });
+  const m = mergeBlobs(A, B);
+
+  // Exactly ONE 'todo' survives — no `todo.conflict.<hash>` phantom. Under the UNION
+  // path (Option B) this very divergence would mint a duplicate empty column.
+  assert.deepEqual(m.columns.map((c) => c.id), ['todo'], 'single column, no phantom duplicate');
+  assert.equal(m.columns.some((c) => c.id.includes('.conflict.')), false, 'no conflict-copy column');
+  assert.ok(eq(mergeBlobs(A, B), mergeBlobs(B, A)), 'and still convergent');
+});
+
 test('resolver branch 4: local unchanged since sync, drive advanced -> adopt_drive', () => {
   const local = blob({ cards: [card('X', '1')] });
   const drive = blob({ cards: [card('X', '1'), card('Y', '1')] });

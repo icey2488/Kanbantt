@@ -30,7 +30,10 @@
  *     deleted card still throws `conflict`.
  *   - Order keys are base-62 fractional strings compared lexicographically.
  *     `orderBetween` mints a key between two neighbors; the migration instead
- *     uses a dedicated even-distribution pass (no chained orderBetween).
+ *     uses a dedicated even-distribution pass (no chained orderBetween). Columns
+ *     carry a `rank` minted by the SAME primitives (ticket #5) — display order is
+ *     sort-by-(rank, id), so a single client's column reorder is a clean
+ *     insert-between with no sibling renumber.
  *   - Reads/writes are injected (storage, clock, uuid, actor) so the whole
  *     thing is deterministically testable without a browser.
  */
@@ -246,6 +249,50 @@ export function compareCards(x, y) {
 }
 
 /* ======================================================================== */
+/* Column ranks — LexoRank for column ORDER (the SAME scheme as card order)  */
+/* ======================================================================== */
+
+// Columns are positioned by a fractional `rank` string, minted by the very same
+// base-62 LexoRank primitives as card `order` (orderBetween / mintOrders) — ONE
+// ranking system, not two. Display order is sort-by-(rank, id); `id` is the
+// deterministic tiebreak (mirrors compareCards), so even a post-merge rank
+// collision across two columns still resolves to one convergent total order that
+// is identical on every client.
+function byColumnRank(x, y) {
+  const xr = x.rank == null ? '' : x.rank;
+  const yr = y.rank == null ? '' : y.rank;
+  if (xr !== yr) return xr < yr ? -1 : 1;
+  if (x.id !== y.id) return x.id < y.id ? -1 : 1;
+  return 0;
+}
+
+/** Columns in display order (rank, then id). Pure; returns a new array. */
+function sortedColumns(columns) {
+  return [...columns].sort(byColumnRank);
+}
+
+/**
+ * Assign a `rank` to every column, by CURRENT ARRAY ORDER, in one even-distribution
+ * pass (mintOrders — the same primitive the legacy card migration uses). Mutates
+ * `columns` in place and returns true iff it changed anything. Order-preserving
+ * (same order out as in) and idempotent: a column set that ALREADY carries ranks is
+ * left byte-untouched and returns false (so a migrated board is never rewritten).
+ */
+function backfillColumnRanks(columns) {
+  if (!columns.some((c) => typeof c.rank !== 'string')) return false;
+  const ranks = mintOrders(columns.length);
+  columns.forEach((c, i) => { c.rank = ranks[i]; });
+  return true;
+}
+
+/** A fresh (cloned) copy of `columns` guaranteed to carry ranks, by array order. */
+function rankedColumns(columns) {
+  const out = clone(columns);
+  backfillColumnRanks(out);
+  return out;
+}
+
+/* ======================================================================== */
 /* Sync tokens                                                              */
 /* ======================================================================== */
 
@@ -319,7 +366,7 @@ export function emptyBlob() {
     seq: 0,
     cards: [],
     tags: [],
-    columns: clone(DEFAULT_COLUMNS),
+    columns: rankedColumns(DEFAULT_COLUMNS), // born with LexoRank ranks (ticket #5)
     settings: {},
   };
 }
@@ -478,6 +525,13 @@ export function createStore({
       throw e;
     }
     blob = parsed;
+    // One-time, idempotent column-rank migration (ticket #5): a pre-rank board
+    // (array-index columns, no `rank`) is assigned ranks by current array order and
+    // persisted once. A board that already carries ranks changes nothing here and is
+    // not rewritten. Runs AFTER validateBlob (rank is optional, so a legacy blob
+    // still validates) and BEFORE the first snapshot (so the board never renders an
+    // unranked column).
+    if (backfillColumnRanks(blob.columns)) persist();
     loaded = true;
     snapshotRef = buildSnapshot();
     return blob;
@@ -500,7 +554,10 @@ export function createStore({
       seq: blob.seq,
       cards: blob.cards.map((c) => ({ ...c })),
       tags: blob.tags.map((t) => ({ ...t })),
-      columns: blob.columns.map((c) => ({ ...c })),
+      // Present columns in display (rank) order. This is the single chokepoint that
+      // guarantees rank-ordered columns to every consumer — notably after hydrate,
+      // whose merged blob carries columns in by-id merge order, not rank order.
+      columns: sortedColumns(blob.columns).map((c) => ({ ...c })),
       settings: blob.settings,
     };
   }
@@ -769,32 +826,60 @@ export function createStore({
     if (blob.columns.some((c) => c.id === col.id)) {
       throw new StoreError('validation_failed', `column ${col.id} already exists`, { id: col.id });
     }
-    blob.columns.push({ ...col });
+    // The store owns position: a new column is appended after the current last one
+    // (the board never supplies a rank). Same append logic cards use on create.
+    const last = sortedColumns(blob.columns).slice(-1)[0];
+    const rank = orderBetween(last ? last.rank : null, null);
+    blob.columns.push({ ...col, rank }); // `rank` last => any client-supplied rank ignored
+    blob.columns = sortedColumns(blob.columns);
     commit();
     return clone(blob.columns);
   }
 
-  // Board-config patch (rename and/or recolor). `id` is immutable.
+  // Board-config patch (rename and/or recolor). `id` is immutable; `rank` is owned by
+  // columnReorder (positional), so a stray rank in a content patch is ignored.
   function columnUpdate(id, patch = {}) {
     ensureLoaded();
     const col = blob.columns.find((c) => c.id === id);
     if (!col) throw new StoreError('column_unknown', `no column ${id}`, { id });
     const fields = { ...patch };
     delete fields.id;
+    delete fields.rank;
     Object.assign(col, fields);
     commit();
     return clone(blob.columns);
   }
 
-  // Columns are positioned by array order (the board has no per-column LexoRank
-  // field in v1); `toIndex` is the destination index, clamped into range.
+  // Reorder by minting a midpoint `rank` between the moved column's NEW neighbors —
+  // insert-between, so NO sibling rank is renumbered (the whole point of ticket #5).
+  // `toIndex` is the destination index in DISPLAY (rank) order, clamped into range —
+  // the same contract the array-index version honored, so callers are unchanged.
   function columnReorder(id, toIndex) {
     ensureLoaded();
-    const from = blob.columns.findIndex((c) => c.id === id);
+    const sorted = sortedColumns(blob.columns);
+    const from = sorted.findIndex((c) => c.id === id);
     if (from < 0) throw new StoreError('column_unknown', `no column ${id}`, { id });
-    const dest = Math.max(0, Math.min(toIndex, blob.columns.length - 1));
-    const [col] = blob.columns.splice(from, 1);
-    blob.columns.splice(dest, 0, col);
+
+    const dest = Math.max(0, Math.min(toIndex, sorted.length - 1));
+    const order = sorted.filter((c) => c.id !== id); // the other columns, in order
+    order.splice(dest, 0, sorted[from]);             // moved column placed at dest
+    const left = order[dest - 1] ? order[dest - 1].rank : null;
+    const right = order[dest + 1] ? order[dest + 1].rank : null;
+
+    const col = blob.columns.find((c) => c.id === id);
+    if (left != null && right != null && left >= right) {
+      // Degenerate gap: the two neighbors share (or invert) a rank — only reachable
+      // after a cross-client rank collision merged in. Rebalance the whole set by the
+      // intended display order (mintOrders — the migration primitive, not a new
+      // system); strictly-increasing distinct ranks are restored and the moved column
+      // keeps its destination slot.
+      const fresh = mintOrders(order.length);
+      const rankById = new Map(order.map((c, i) => [c.id, fresh[i]]));
+      blob.columns.forEach((c) => { c.rank = rankById.get(c.id); });
+    } else {
+      col.rank = orderBetween(left, right);
+    }
+    blob.columns = sortedColumns(blob.columns);
     commit();
     return clone(blob.columns);
   }
@@ -995,10 +1080,11 @@ export function runLegacyMigration({
   // Columns / tags: absent => app defaults; present-but-corrupt => halt.
   const colsRead = readLegacy(storage, LEGACY_KEYS.columns, 'columns');
   const tagsRead = readLegacy(storage, LEGACY_KEYS.tags, 'tags');
-  const columns =
+  const columns = rankedColumns(
     colsRead.present && Array.isArray(colsRead.value) && colsRead.value.length
       ? colsRead.value
-      : clone(DEFAULT_COLUMNS);
+      : DEFAULT_COLUMNS,
+  ); // born with LexoRank ranks by legacy array order (ticket #5)
   const baseTags =
     tagsRead.present && Array.isArray(tagsRead.value) ? tagsRead.value : clone(DEFAULT_TAGS);
 
