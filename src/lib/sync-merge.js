@@ -302,12 +302,28 @@ function unionById(listA, listB) {
   return [...m.values()];
 }
 
-/** Merge all top-level keys except the entity arrays, deterministically. */
+/* ------------------------------------------------------------------------ */
+/* Collection registry — declares WHICH top-level collections merge HOW.      */
+/* This is the ONLY thing that determines collection dispatch. The union /     */
+/* conflictId / tombstone algorithm is UNCHANGED; enrolling a collection is    */
+/* purely additive (list its name here). The spine's projects/tasks/artifacts/ */
+/* escalations get full id-keyed conflict-copy union by appearing in           */
+/* UNION_COLLECTIONS — no new merge logic, no cross-collection awareness.       */
+/* ------------------------------------------------------------------------ */
+// Full id-keyed union WITH deterministic conflict copies (the cards path).
+const UNION_COLLECTIONS = ['cards', 'projects', 'tasks', 'artifacts', 'escalations'];
+// Union by id, lesser-canonical wins a same-id divergence (NO conflict copies).
+const CONFIG_COLLECTIONS = ['columns', 'tags'];
+// Everything registered is handled by mergeBlobs; mergeRest skips both lists.
+// Anything still unregistered falls through mergeRest exactly as before.
+const REGISTERED_COLLECTIONS = new Set([...UNION_COLLECTIONS, ...CONFIG_COLLECTIONS]);
+
+/** Merge all top-level keys except the registered collections, deterministically. */
 function mergeRest(a, b) {
   const out = {};
   const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
   for (const k of keys) {
-    if (k === 'cards' || k === 'columns' || k === 'tags') continue;
+    if (REGISTERED_COLLECTIONS.has(k)) continue; // handled by the union/config registries
     if (!(k in a)) out[k] = b[k];
     else if (!(k in b)) out[k] = a[k];
     else out[k] = lesserCanon(a[k], b[k]); // deterministic tie-break (commutative + associative)
@@ -318,32 +334,51 @@ function mergeRest(a, b) {
 /**
  * Pure merge of two blobs. Commutative, associative, and idempotent under
  * canonicalize() (see the test matrix). No data is discarded: a same-id
- * divergence keeps the lesser-canonical card at its base id and preserves the
+ * divergence keeps the lesser-canonical entity at its base id and preserves the
  * other as a conflict copy.
+ *
+ * Collection dispatch is driven by the registry (UNION_COLLECTIONS /
+ * CONFIG_COLLECTIONS), NOT hardcoded names. A registered collection is
+ * materialized only when present in at least one input, so output stays
+ * byte-identical to the prior hardcoded behavior for cards/columns/tags and no
+ * empty collection an input never had is injected.
  */
 export function mergeBlobs(a, b) {
-  // Cards: union by id with deterministic conflict resolution + re-homing.
-  const cardMap = new Map();
-  for (const card of a.cards || []) addCard(cardMap, card);
-  for (const card of b.cards || []) addCard(cardMap, card);
+  // Registered union collections: union by id with deterministic conflict
+  // resolution + re-homing (the proven cards path, now applied to every
+  // registered union collection — e.g. the spine's tasks/artifacts/...).
+  const union = {};
+  for (const name of UNION_COLLECTIONS) {
+    if (!(name in a) && !(name in b)) continue;
+    const map = new Map();
+    for (const item of a[name] || []) addCard(map, item);
+    for (const item of b[name] || []) addCard(map, item);
+    union[name] = [...map.values()];
+  }
 
-  // Board config: union by id, lesser-canonical wins a same-id divergence.
-  const columns = unionById(a.columns || [], b.columns || []);
-  const tags = unionById(a.tags || [], b.tags || []);
+  // Registered config collections: union by id, lesser-canonical wins a same-id
+  // divergence (no conflict copies).
+  const config = {};
+  for (const name of CONFIG_COLLECTIONS) {
+    if (!(name in a) && !(name in b)) continue;
+    config[name] = unionById(a[name] || [], b[name] || []);
+  }
 
-  // Strip dangling tag refs (the A.5-proper invariant). This is a no-op on
-  // well-formed inputs (merge never drops a tag id — tags are unioned), so it
-  // does not disturb convergence; it defends against a malformed input and keeps
-  // the output invariant-clean. A card whose column_id is absent from the merged
-  // columns is LEFT INTACT (the UI renders it in a fallback tray per spec).
-  const tagIds = new Set(tags.map((t) => t.id));
-  const cards = [...cardMap.values()].map((c) =>
-    Array.isArray(c.tags) && c.tags.some((t) => !tagIds.has(t))
-      ? { ...c, tags: c.tags.filter((t) => tagIds.has(t)) }
-      : c,
-  );
+  // Strip dangling tag refs (the A.5-proper invariant) — UNCHANGED scope: applies
+  // ONLY to cards, whose `tags:[tagId]` may reference a tag absent from the merged
+  // tags. No-op on well-formed inputs; NOT extended to any other collection (no
+  // new cross-collection awareness). A card whose column_id is absent from the
+  // merged columns is LEFT INTACT (the UI renders it in a fallback tray per spec).
+  if ('cards' in union) {
+    const tagIds = new Set((config.tags || []).map((t) => t.id));
+    union.cards = union.cards.map((c) =>
+      Array.isArray(c.tags) && c.tags.some((t) => !tagIds.has(t))
+        ? { ...c, tags: c.tags.filter((t) => tagIds.has(t)) }
+        : c,
+    );
+  }
 
-  return { ...mergeRest(a, b), cards, columns, tags };
+  return { ...mergeRest(a, b), ...union, ...config };
 }
 
 /* ======================================================================== */
