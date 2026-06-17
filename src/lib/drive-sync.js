@@ -34,10 +34,18 @@ import { STORAGE_KEY } from './card-store.js';
 /* ======================================================================== */
 
 // The Drive file shares the localStorage blob's name, so the two are obviously
-// the same artifact.
-const FILE_NAME = STORAGE_KEY; // 'kanbantt_data_v1'
-const MARKER_KEY = 'kanbantt_sync_marker'; // { syncedHash, driveFileId } — NOT the blob
-const SAFETY_KEY = 'kanbantt_sync_safety'; // pre-action local snapshot before a destructive collision choice
+// the same artifact. These are DEFAULTS — createDriveSync accepts overrides so a
+// SECOND instance can be pointed at a distinct file (e.g. the Claunker spine blob,
+// 'claunker_spine_v1') with its own marker/safety keys. The board keeps these.
+const DEFAULT_FILE_NAME = STORAGE_KEY; // 'kanbantt_data_v1'
+const DEFAULT_MARKER_KEY = 'kanbantt_sync_marker'; // { syncedHash, driveFileId } — NOT the blob
+const DEFAULT_SAFETY_KEY = 'kanbantt_sync_safety'; // pre-action local snapshot before a destructive collision choice
+
+/** Default structural blob check (the board's card shape). Overridable per
+ *  instance so a non-card schema (the spine) validates against its own shape. */
+const defaultIsValidBlob = (b) => b != null && typeof b === 'object' && Array.isArray(b.cards);
+/** Default emptiness check (the board's blank board). Overridable per instance. */
+const defaultIsEmptyBlob = (b) => (b.cards || []).length === 0 && (b.tags || []).length === 0;
 
 const DRIVE_BASE = 'https://www.googleapis.com/drive/v3';
 const UPLOAD_BASE = 'https://www.googleapis.com/upload/drive/v3';
@@ -60,8 +68,8 @@ export const SyncStatus = {
 
 /** Raised when find-or-create sees multiple same-named files (split-brain). */
 export class DuplicateFilesError extends Error {
-  constructor(count) {
-    super(`Found ${count} Drive files named "${FILE_NAME}"; resolve the duplicates in Google Drive`);
+  constructor(count, name = DEFAULT_FILE_NAME) {
+    super(`Found ${count} Drive files named "${name}"; resolve the duplicates in Google Drive`);
     this.name = 'DuplicateFilesError';
     this.count = count;
   }
@@ -175,9 +183,6 @@ const parseOrNull = (text) => {
   }
 };
 
-// Same structural test resolve() uses internally: an object with a cards array.
-const isBlobShape = (b) => b != null && typeof b === 'object' && Array.isArray(b.cards);
-
 const lc = (s) => (s || '').toString().toLowerCase();
 // Drive 403 reasons: storage full vs. rate limiting. Distinguish — they are
 // different states with different handling (suspend vs. auto-retry).
@@ -208,6 +213,14 @@ export function createDriveSync({
   schedule = (fn, ms) => setTimeout(fn, ms),
   cancel = (h) => clearTimeout(h),
   debounceMs = DEFAULT_DEBOUNCE_MS,
+  // Per-instance targeting — a second instance points at a distinct Drive file
+  // (e.g. the spine blob) with its own marker/safety keys and shape predicates.
+  // Defaults reproduce the board exactly.
+  fileName = DEFAULT_FILE_NAME,
+  markerKey = DEFAULT_MARKER_KEY,
+  safetyKey = DEFAULT_SAFETY_KEY,
+  isValidBlob = defaultIsValidBlob,
+  isEmptyBlob = defaultIsEmptyBlob,
 } = {}) {
   if (!store) throw new Error('createDriveSync requires a store');
   if (typeof applyBlob !== 'function') throw new Error('createDriveSync requires an applyBlob(blob) fn');
@@ -231,18 +244,18 @@ export function createDriveSync({
   /* ---- marker (persisted, NOT in the blob) ---------------------------- */
   function getMarker() {
     try {
-      return JSON.parse(storage.getItem(MARKER_KEY)) || {};
+      return JSON.parse(storage.getItem(markerKey)) || {};
     } catch {
       return {};
     }
   }
   function setMarker(patch) {
     const next = { ...getMarker(), ...patch };
-    storage.setItem(MARKER_KEY, JSON.stringify(next));
+    storage.setItem(markerKey, JSON.stringify(next));
   }
   function clearMarker() {
     try {
-      storage.removeItem(MARKER_KEY);
+      storage.removeItem(markerKey);
     } catch {
       /* ignore */
     }
@@ -291,15 +304,15 @@ export function createDriveSync({
     const m = getMarker();
     if (m.driveFileId) return { id: m.driveFileId, created: false };
 
-    const files = await driveClient.listByName(FILE_NAME);
-    if (files.length > 1) throw new DuplicateFilesError(files.length);
+    const files = await driveClient.listByName(fileName);
+    if (files.length > 1) throw new DuplicateFilesError(files.length, fileName);
     if (files.length === 1) {
       setMarker({ driveFileId: files[0].id });
       return { id: files[0].id, created: false };
     }
     // Zero files: create, seeding with the current local blob (an implicit push).
     const local = store.getSnapshot();
-    const res = await driveClient.create(FILE_NAME, JSON.stringify(local));
+    const res = await driveClient.create(fileName, JSON.stringify(local));
     setMarker({ driveFileId: res.id, syncedHash: blobHash(local) });
     return { id: res.id, created: true };
   }
@@ -316,13 +329,16 @@ export function createDriveSync({
       }
       const { text } = await driveClient.read(fileId);
       const driveBlob = parseOrNull(text);
-      if (!isBlobShape(driveBlob)) {
+      if (!isValidBlob(driveBlob)) {
         // Corrupt / non-blob head -> revision recovery (never adopt garbage).
         await recoverFromRevisions(fileId);
         return;
       }
       const local = store.getSnapshot();
-      const decision = resolve({ local, drive: driveBlob, lastSynced: getMarker().syncedHash });
+      const decision = resolve(
+        { local, drive: driveBlob, lastSynced: getMarker().syncedHash },
+        { isBlob: isValidBlob, isEmpty: isEmptyBlob },
+      );
       await applyResolution(decision, fileId, local, driveBlob);
     } catch (e) {
       handleError(e);
@@ -393,7 +409,7 @@ export function createDriveSync({
         continue; // unreadable revision — try the next
       }
       const blob = parseOrNull(text);
-      if (isBlobShape(blob)) {
+      if (isValidBlob(blob)) {
         applyBlob(blob); // adopt the recovered state locally
         await driveClient.update(fileId, JSON.stringify(blob)); // overwrite the corrupt head
         setMarker({ syncedHash: blobHash(blob) });
@@ -504,7 +520,7 @@ export function createDriveSync({
     const { fileId, driveBlob } = collisionPending;
     // Retain the pre-action local blob as a safety copy BEFORE any destructive op.
     try {
-      storage.setItem(SAFETY_KEY, JSON.stringify(store.getSnapshot()));
+      storage.setItem(safetyKey, JSON.stringify(store.getSnapshot()));
     } catch {
       /* best-effort safety copy */
     }

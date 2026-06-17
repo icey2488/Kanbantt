@@ -386,12 +386,12 @@ export function mergeBlobs(a, b) {
 /* ======================================================================== */
 
 /** A blob is "empty" (a blank board) when it has no cards and no tags. */
-function isEmptyBlob(blob) {
+function defaultIsEmptyBlob(blob) {
   return (blob.cards || []).length === 0 && (blob.tags || []).length === 0;
 }
 
 /** Structurally a blob: an object with a cards array. */
-function isBlob(b) {
+function defaultIsBlob(b) {
   return b != null && typeof b === 'object' && Array.isArray(b.cards);
 }
 
@@ -404,10 +404,16 @@ function isBlob(b) {
  * that an empty side (branch 3) must short-circuit BEFORE the lastSynced/merge
  * branches, so it never falls through to an auto-merge.
  *
+ * The blob-shape (`isBlob`) and emptiness (`isEmpty`) predicates are injectable so
+ * the SAME reconcile policy serves a non-card schema (the spine: projects/tasks/
+ * artifacts/escalations) without forking this function. They default to the card
+ * shape, so every existing caller is byte-identical. The reconcile branches and
+ * the convergent `mergeBlobs` are UNCHANGED — only the shape checks are pluggable.
+ *
  * @returns {{ action: 'in_sync'|'adopt_drive'|'push_local'|'merge'|'collision'|'recover',
  *             blob?: object, reason: string }}
  */
-export function resolve({ local, drive, lastSynced }) {
+export function resolve({ local, drive, lastSynced }, { isBlob = defaultIsBlob, isEmpty = defaultIsEmptyBlob } = {}) {
   // 1. Drive missing/malformed — the caller recovers (e.g. restore from .bak).
   if (!isBlob(drive)) {
     return { action: 'recover', reason: 'drive is null or malformed' };
@@ -424,8 +430,8 @@ export function resolve({ local, drive, lastSynced }) {
   // 3. Either side empty — ignore lastSynced entirely (this also catches the
   //    review's fall-through: lastSynced present but matching neither + one side
   //    empty must adopt/push, never merge).
-  const localEmpty = isEmptyBlob(local);
-  const driveEmpty = isEmptyBlob(drive);
+  const localEmpty = isEmpty(local);
+  const driveEmpty = isEmpty(drive);
   if (localEmpty || driveEmpty) {
     if (localEmpty) return { action: 'adopt_drive', reason: 'local is empty; take drive' };
     return { action: 'push_local', reason: 'drive is empty; upload local' };
