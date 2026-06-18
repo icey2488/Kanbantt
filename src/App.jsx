@@ -30,6 +30,7 @@ import { initAuth, signIn, signOut, isGisReady } from './lib/auth.js';
 import { driveSync } from './lib/sync-instance.js';
 import { store, bootError, subscribe, getSnapshot, readLegacyDump, STORAGE_KEY } from './lib/store-instance.js';
 import { orderBetween, compareCards } from './lib/card-store.js';
+import { readKanbanttConfig, hasMcpTarget } from './lib/spine-config.js';
 
 /* global __APP_VERSION__, __GIT_COMMIT__ */
 // Injected by Vite's define() as string literals (see vite.config.js). In dev the
@@ -263,6 +264,12 @@ const safeDelete = async (key) => {
 // Views read `task.status` (the column). Cards use `column_id`. Alias at the
 // boundary so no visual component has to change.
 const cardToTask = (card) => ({ ...card, status: card.column_id });
+
+// Stable empty-tags reference for the live-spine board (spine Tasks carry no
+// board tags); a fresh [] each render would needlessly bust the filter memo.
+const NO_TAGS = [];
+// Shown when a board edit is attempted against the read-only live-spine mirror.
+const READONLY_MSG = 'Live spine view is read-only';
 
 // Content fields the edit modal can change. `status` is excluded — a column
 // change is a move(), not an update() (update never repositions).
@@ -605,6 +612,31 @@ function SyncChip({ status, onSyncNow, onReconnect }) {
   );
 }
 
+// Live-spine (MCP) connection indicator. A pure view of the controller's state:
+// MCP active → mint "MCP: <name>"; graceful fallback → amber "Local (MCP
+// unavailable)"; clean local → dim. Rendered only when a spine target is
+// configured, so a purely-local board shows no chip at all.
+function SpineChip({ state }) {
+  const C = useTheme();
+  if (!state) return null;
+  const active = state.provider === 'mcp';
+  const fallback = !!state.fallback;
+  const tint = active ? C.mint : fallback ? C.amber : C.textDim;
+  const Icon = active ? Cloud : fallback ? AlertTriangle : Cloud;
+  return (
+    <span title={state.error ? `${state.error.code}: ${state.error.message}` : state.indicator}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 6, padding: '5px 9px',
+        background: `${tint}1f`, border: `1px solid ${tint}55`, borderRadius: 8,
+        color: C.text, fontFamily: F.mono, fontSize: 10, letterSpacing: '0.06em',
+        textTransform: 'uppercase', whiteSpace: 'nowrap',
+      }}>
+      <Icon size={12} strokeWidth={2} color={tint} />
+      {state.indicator}
+    </span>
+  );
+}
+
 // Blocking modal for the unrelated-histories case. Exactly three choices, all
 // wired to the controller's resolveCollision — no auto-merge, no "merge" option.
 // The controller already snapshots the pre-action local blob as a safety copy.
@@ -652,7 +684,7 @@ function CollisionDialog({ onResolve, busy }) {
   );
 }
 
-function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTask, onOpenSettings, theme, setTheme, syncEnabled, syncStatus, onSyncNow, onReconnect }) {
+function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTask, onOpenSettings, theme, setTheme, syncEnabled, syncStatus, onSyncNow, onReconnect, spineState }) {
   const C = useTheme();
   const narrow = useNarrow();
   const tabs = [
@@ -703,6 +735,7 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
       </nav>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <SpineChip state={spineState} />
         {user && syncEnabled && (
           <SyncChip status={syncStatus} onSyncNow={onSyncNow} onReconnect={onReconnect} />
         )}
@@ -2956,6 +2989,13 @@ export default function App() {
   const [syncEnabled, setSyncEnabled] = useState(true);
   const [syncStatus, setSyncStatus] = useState(() => driveSync?.getStatus().status ?? 'synced');
   const [collisionBusy, setCollisionBusy] = useState(false);
+  // Live spine (MCP) connection — the first-light demo. `spineModel` holds the
+  // last polled { columns, cards, flags } while an MCP provider is active (else
+  // null); `spineState` mirrors the controller's connection state for the chip.
+  // Both stay null on a purely-local board, so nothing here is reached unless a
+  // kanbantt_config MCP target is set.
+  const [spineModel, setSpineModel] = useState(null);
+  const [spineState, setSpineState] = useState(null);
   // MOCK_EVENTS no longer renders; the Calendar/Timeline overlay plumbing stays
   // wired to this empty list as an attachment point for real Google Calendar
   // integration (see MOCK_EVENTS above).
@@ -2970,6 +3010,34 @@ export default function App() {
     () => snapshot.cards.filter((c) => !c.deleted_at).slice().sort(compareCards).map(cardToTask),
     [snapshot],
   );
+
+  // Live-spine board source. While an MCP provider is active, the board renders
+  // the polled spine model in place of the local store — a READ-ONLY mirror
+  // (writes are gated below; the next poll is the source of truth). Spine Tasks
+  // carry no board tags or dates, so map them to the view's task shape with
+  // neutral display defaults (today's date keeps cards out of a false "overdue").
+  const mcpActive = !!(spineState && spineState.provider === 'mcp' && spineModel);
+  const spineTasks = useMemo(() => {
+    if (!spineModel) return null;
+    const today = iso(new Date());
+    return spineModel.cards
+      .filter((c) => !c.deleted_at)
+      .map((c) => ({
+        ...c,
+        status: c.column_id, // same column_id→status alias cardToTask applies
+        description: c.description || '',
+        startDate: c.startDate || today,
+        dueDate: c.dueDate || c.due || today, // spec Card uses `due`; local uses `dueDate`
+        effort: c.effort,
+        impact: c.impact,
+        priority: c.priority || 'med',
+        tags: c.tags || [],
+        checklist: c.checklist || [],
+      }));
+  }, [spineModel]);
+  const activeColumns = mcpActive ? spineModel.columns : columns;
+  const activeTags = mcpActive ? NO_TAGS : tags;
+  const baseTasks = mcpActive ? spineTasks : tasks;
 
   // Theme + sync toggle are device-local; load them on mount (and purge the
   // retired session key). Board data does NOT come from here — the store owns it.
@@ -3048,6 +3116,34 @@ export default function App() {
     return undefined;
   }, [user, syncEnabled]);
 
+  // First-light demo: stand up the live spine connection from kanbantt_config.
+  // Runs once on mount, AFTER the local-first board has already painted from the
+  // store — so a missing or unreachable spine never blanks the board. The
+  // controller auto-detects: reachable + valid caps → MCP provider + polling
+  // (applyModel repaints the board every tick); otherwise it degrades to Local
+  // and we keep showing local data. No spine target configured → no-op.
+  useEffect(() => {
+    const config = readKanbanttConfig();
+    if (!hasMcpTarget(config)) return undefined;
+    // Lazy-load the connection module (and the MCP SDK it pulls in) only when a
+    // spine target is configured — keeps the SDK out of the default bundle.
+    let conn = null;
+    let unsub = () => {};
+    let disposed = false;
+    import('./lib/mcp-connection.js')
+      .then(({ createMcpConnectionFromConfig }) => {
+        if (disposed) return;
+        conn = createMcpConnectionFromConfig({ config, applyModel: setSpineModel });
+        unsub = conn.subscribe((st) => {
+          setSpineState(st);
+          if (st.provider !== 'mcp') setSpineModel(null); // degrade → revert to local
+        });
+        conn.connect();
+      })
+      .catch((e) => { console.error('MCP connection load failed:', e); });
+    return () => { disposed = true; unsub(); if (conn) conn.disconnect(); };
+  }, []);
+
   // Connect: loads GIS on demand (first Google traffic, inside the click), then
   // runs interactive sign-in. A GIS load failure flips the control to disabled;
   // a user-dismissed popup leaves it ready to retry.
@@ -3123,6 +3219,7 @@ export default function App() {
   };
 
   const saveTask = (task) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
     if (!task.title.trim()) return;
     if (isNew) {
       const { id, status, ...rest } = task; // drop the 'new' placeholder id + status alias
@@ -3147,6 +3244,7 @@ export default function App() {
   };
 
   const deleteTask = (id) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
     withConflict(() => {
       const cur = store.get(id);
       if (!cur) return;
@@ -3157,6 +3255,7 @@ export default function App() {
   };
 
   const quickAdd = (colId, title) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
     const t = new Date();
     store.create({
       title, description: '', column_id: colId,
@@ -3168,6 +3267,7 @@ export default function App() {
   // Drag-and-drop. Mint the order from the drop neighbors (with null-neighbor
   // cases: empty column, drop-before-first, append-to-end) and move().
   const moveTask = (draggedId, target) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
     withConflict(() => {
       const dragged = store.get(draggedId);
       if (!dragged || dragged.deleted_at) { surface('That card was deleted'); return; }
@@ -3253,6 +3353,7 @@ export default function App() {
   };
 
   const classifyTask = (taskId, update) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
     withConflict(() => {
       const cur = store.get(taskId);
       if (!cur || cur.deleted_at) { surface('That card was deleted'); return; }
@@ -3263,13 +3364,14 @@ export default function App() {
     });
   };
 
-  // Apply filters
+  // Apply filters over the active board source (local store, or the live spine
+  // model while MCP is active).
   const filteredTasks = useMemo(() => {
-    return tasks.filter((t) => {
+    return baseTasks.filter((t) => {
       if (filters.search) {
         const q = filters.search.toLowerCase();
         const tagNames = (t.tags || [])
-          .map((id) => tags.find((tag) => tag.id === id)?.name || '')
+          .map((id) => activeTags.find((tag) => tag.id === id)?.name || '')
           .join(' ');
         const checklistText = (t.checklist || []).map((c) => c.text).join(' ');
         const hay = `${t.title} ${t.description || ''} ${tagNames} ${checklistText}`.toLowerCase();
@@ -3281,7 +3383,7 @@ export default function App() {
       if (filters.overdueOnly && !isOverdue(t)) return false;
       return true;
     });
-  }, [tasks, tags, filters]);
+  }, [baseTasks, activeTags, filters]);
 
   const C = THEMES[theme];
 
@@ -3348,24 +3450,25 @@ export default function App() {
           onNewTask={openNew} onOpenSettings={() => setShowSettings(true)}
           theme={theme} setTheme={setTheme}
           syncEnabled={syncEnabled} syncStatus={syncStatus}
-          onSyncNow={handleSyncNow} onReconnect={handleReconnect} />
-        <FilterBar tags={tags} filters={filters} setFilters={setFilters} />
+          onSyncNow={handleSyncNow} onReconnect={handleReconnect}
+          spineState={spineState} />
+        <FilterBar tags={activeTags} filters={filters} setFilters={setFilters} />
         {view === 'board' && (
-          <BoardView tasks={filteredTasks} tags={tags} columns={columns}
+          <BoardView tasks={filteredTasks} tags={activeTags} columns={activeColumns}
             onTaskClick={openEdit} onMove={moveTask} onQuickAdd={quickAdd} />
         )}
         {view === 'calendar' && (
-          <CalendarView tasks={filteredTasks} events={events} columns={columns} onTaskClick={openEdit} />
+          <CalendarView tasks={filteredTasks} events={events} columns={activeColumns} onTaskClick={openEdit} />
         )}
         {view === 'gantt' && (
-          <GanttView tasks={filteredTasks} events={events} columns={columns} onTaskClick={openEdit} />
+          <GanttView tasks={filteredTasks} events={events} columns={activeColumns} onTaskClick={openEdit} />
         )}
         {view === 'matrix' && (
-          <MatrixView tasks={filteredTasks} tags={tags}
+          <MatrixView tasks={filteredTasks} tags={activeTags}
             onTaskClick={openEdit} onClassify={classifyTask} />
         )}
         {editing && (
-          <TaskModal task={editing} tags={tags} columns={columns} isNew={isNew}
+          <TaskModal task={editing} tags={activeTags} columns={activeColumns} isNew={isNew}
             onSave={saveTask} onDelete={deleteTask}
             onClose={() => setEditing(null)} onCreateTag={createTag} />
         )}

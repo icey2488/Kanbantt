@@ -1,27 +1,27 @@
 /**
- * MCP connection controller (Phase 3b) — auto-detect provider selection + the
- * polling loop that renders live spine state on the board. PURE and injectable,
- * the same shape as drive-sync.js: every ambient (provider factory, timers, the
- * board refresh path) is injected, so it runs in node against the REAL spine
- * server with zero live network.
+ * MCP connection controller — auto-detect provider selection + the polling loop
+ * that renders live spine state on the board. PURE and injectable, the same
+ * shape as drive-sync.js: every ambient (provider factory, timers, the board
+ * refresh path) is injected, so it runs in Node against a conforming in-process
+ * MCP server with zero live network.
  *
- * It is the SELECTION SEAM, not a board rewrite. Board components keep consuming
- * the active provider's data unchanged: the controller maps polled spine Tasks
- * into the board's card model and pushes them through the injected `applyModel`
- * (the existing provider-refresh path — same role drive-sync's `applyBlob` plays).
+ * It is the SELECTION SEAM, not a board rewrite. The board consumes the active
+ * provider's data unchanged: the controller polls board_get + card_list and
+ * pushes the result through the injected `applyModel` ({ columns, cards, flags })
+ * — the same role drive-sync's `applyBlob` plays.
  *
- * Connection flow (Foundation 02, authoritative):
- *   - no MCP URL                       → LocalProvider, "Local" indicator
- *   - URL + reachable + valid caps     → MCPProvider, "MCP: <name>", capability flags
- *   - URL + unreachable/invalid/timeout→ LocalProvider, "Local (MCP unavailable)"
- *                                        + retry; never a blank board
+ * Connection flow:
+ *   - no MCP URL                             → LocalProvider, "Local" indicator
+ *   - URL + reachable + required tools       → MCPProvider, "MCP: <name>", flags
+ *   - URL + unreachable/incompatible/timeout → LocalProvider, "Local (MCP
+ *                                              unavailable)" + retry; never blank
  *
- * realtime:false (the spine) → NO WebSocket. The board POLLS getProjects/getTasks
- * at a configurable interval; the server's effective column rides through
- * untouched (the provider never recomputes it — 3a guarantee).
+ * realtime:false (v1 is tools-only) → NO subscription. The board POLLS
+ * board_get/card_list at a configurable interval; the server's `column_id` rides
+ * through untouched (the provider never recomputes it).
  */
 
-import { createMCPProvider, makeHttpTransport } from './spine-mcp-provider.js';
+import { createMCPProvider } from './spine-mcp-provider.js';
 
 export const LOCAL_INDICATOR = 'Local';
 export const MCP_UNAVAILABLE_INDICATOR = 'Local (MCP unavailable)';
@@ -30,8 +30,8 @@ export const mcpIndicator = (name) => `MCP: ${name}`;
 const DEFAULT_POLL_MS = 5000;
 const DEFAULT_PING_TIMEOUT_MS = 3000;
 
-/** The board columns the spine render projection targets (todo/in_progress/blocked
- *  /done). The poll maps each Task's server-computed `column` onto these. */
+/** Defensive fallback if a server returns a board with no columns (a real board
+ *  always carries its own). Reserved semantic-state ids per spec §Reserved IDs. */
 export const SPINE_BOARD_COLUMNS = [
   { id: 'todo', label: 'To Do', accentKey: 'textDim' },
   { id: 'in_progress', label: 'In Progress', accentKey: 'ice' },
@@ -39,27 +39,31 @@ export const SPINE_BOARD_COLUMNS = [
   { id: 'done', label: 'Done', accentKey: 'mint' },
 ];
 
-/** LocalProvider feature flags — the optional MCP features don't apply; the board
- *  still works on the required projects/tasks. */
-const LOCAL_FLAGS = Object.freeze({ escalations: false, artifacts: false, corpus: false, realtime: false });
+/** LocalProvider feature flags — the optional MCP features don't apply. */
+const LOCAL_FLAGS = Object.freeze({ escalations: false, artifacts: false, columns: false, tags: false, realtime: false });
+
+/** Theme accent keys the board understands; a server column `color` naming one
+ *  is used directly, otherwise a sensible accent is derived from the column id. */
+const ACCENT_KEYS = ['textDim', 'frost', 'ice', 'amber', 'mint', 'coral'];
+const RESERVED_ACCENT = { backlog: 'textDim', todo: 'textDim', in_progress: 'ice', blocked: 'coral', done: 'mint' };
 
 /**
- * Map a spine/MCP Task (carrying the server's effective `column`) to the board's
- * card shape. column_id is the SERVER's column — never recomputed here (the board
- * aliases column_id→status at its boundary, so cards land in the right column).
+ * Map a server Board's columns ({ id, name, color, order }) onto the board's
+ * render shape ({ id, label, accentKey }), sorted by the LexoRank `order`. The
+ * `id` is preserved verbatim so polled cards (carrying `column_id`) land in the
+ * right column. This is the one site that adapts the spec board shape — flagged
+ * in the provider's divergence notes.
  */
-export function taskToCard(task) {
-  return {
-    id: task.id,
-    title: task.title,
-    column_id: task.column,
-    priority: 'med', // orchestration carries `tier`, not board priority — neutral default
-    tags: [],
-    state: task.state,
-    tier: task.tier,
-    version: task.version,
-    deleted_at: null,
-  };
+export function toBoardColumns(columns) {
+  if (!Array.isArray(columns) || columns.length === 0) return SPINE_BOARD_COLUMNS;
+  return columns
+    .slice()
+    .sort((a, b) => (a.order > b.order ? 1 : a.order < b.order ? -1 : 0))
+    .map((c, i) => ({
+      id: c.id,
+      label: c.name ?? c.label ?? c.id,
+      accentKey: ACCENT_KEYS.includes(c.color) ? c.color : (RESERVED_ACCENT[c.id] || ACCENT_KEYS[i % ACCENT_KEYS.length]),
+    }));
 }
 
 function withTimeout(promise, ms, schedule, cancel) {
@@ -120,19 +124,21 @@ export function createMcpConnection({
   }
 
   /* ---- polling (only while MCP is active; realtime:false ⇒ poll) ---- */
-  function buildModel(tasks) {
+  function buildModel(board, cards) {
     return {
-      columns: SPINE_BOARD_COLUMNS,
-      cards: tasks.filter((t) => t && t.column != null).map(taskToCard),
+      columns: toBoardColumns(board && board.columns),
+      cards: (cards || []).filter((c) => c && c.column_id != null),
       flags: state.featureFlags,
     };
   }
   async function pollOnce() {
     if (state.provider !== 'mcp' || !provider) return;
-    const projects = await provider.getProjects();
-    let tasks = [];
-    for (const p of projects) tasks = tasks.concat(await provider.getTasks(p.id));
-    applyModel(buildModel(tasks));
+    // Full snapshot each tick (sync_token incremental sync is a later
+    // optimization): board_get for columns, card_list for the live cards. The
+    // server's `column_id` is authoritative — never recomputed here.
+    const { board } = await provider.getBoard();
+    const { cards } = await provider.list({ includeDeleted: false });
+    applyModel(buildModel(board, cards));
   }
   function scheduleNext() {
     if (state.provider !== 'mcp') return;
@@ -157,8 +163,9 @@ export function createMcpConnection({
     let p;
     try {
       p = makeProvider();
+      // connect() runs the MCP initialize handshake + tools/list and rejects a
+      // server missing any REQUIRED_TOOLS (incompatible_server) before we go live.
       const res = await withTimeout(p.connect(), pingTimeoutMs, schedule, cancel);
-      // connect() already rejected projects/tasks-missing servers (incompatible_server).
       const caps = res.capabilities;
       provider = p;
       state = {
@@ -170,7 +177,8 @@ export function createMcpConnection({
         featureFlags: {
           escalations: !!caps.escalations,
           artifacts: !!caps.artifacts,
-          corpus: !!caps.corpus,
+          columns: !!caps.columns,
+          tags: !!caps.tags,
           realtime: !!caps.realtime,
         },
         error: null,
@@ -179,7 +187,7 @@ export function createMcpConnection({
       await startPolling();
       return getState();
     } catch (e) {
-      // unreachable / invalid schema / timeout → graceful degrade, never blank.
+      // unreachable / incompatible / timeout → graceful degrade, never blank.
       setLocal(true, { code: e.code || 'unreachable', message: e.message });
       return getState();
     }
@@ -193,8 +201,8 @@ export function createMcpConnection({
       setLocal(false, null);
     },
     getState,
-    /** The active MCP provider (board writes go through it; a stale-token write
-     *  surfaces the SAME code:'conflict' shape as a local conflict — 3a parity). */
+    /** The active MCP provider (board writes go through it; a stale-version write
+     *  surfaces the SAME code:'conflict' shape as a local conflict — parity). */
     getProvider: () => provider,
     supportsRealtime: () => !!(state.capabilities && state.capabilities.realtime),
     /** Manual sync affordance (board "refresh" button) — one poll cycle, no timer. */
@@ -205,18 +213,15 @@ export function createMcpConnection({
 }
 
 /**
- * Production entry: build the controller from kanbantt_config, with a real
- * fetch-based MCPProvider transport (Bearer auth from config). The board's boot
- * wiring calls this and passes its refresh path as `applyModel` — the one-line
- * victory-lap consumption; no board component changes.
+ * Production entry: build the controller from kanbantt_config with a real MCP
+ * provider (Streamable HTTP + Bearer auth from config). The board's boot wiring
+ * passes its refresh path as `applyModel` — no board component changes.
  */
 export function createMcpConnectionFromConfig({ config, applyModel, fetchFn, schedule, cancel, pollIntervalMs } = {}) {
   const makeProvider = () => createMCPProvider({
-    transport: makeHttpTransport({
-      baseUrl: config.mcp.url,
-      authToken: config.mcp && config.mcp.auth_token,
-      fetchFn,
-    }),
+    baseUrl: config.mcp.url,
+    authToken: config.mcp && config.mcp.auth_token,
+    fetchFn,
   });
   return createMcpConnection({ config, makeProvider, applyModel, schedule, cancel, pollIntervalMs });
 }

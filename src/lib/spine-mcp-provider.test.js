@@ -1,194 +1,176 @@
 /**
- * MCPProvider (Phase 3a) — the Kanbantt provider driven against the REAL spine
- * server over the wire contract, in-process. No mock server: createMCPProvider →
- * makeInProcessTransport → createSpineHttpHandler → the real createSpineServer
- * (real entity layer, real projections, real merge). A mock would prove nothing —
- * the point of Phase 3 is the two real seams meeting.
+ * MCPProvider tests — the real provider driven against a conforming in-process
+ * MCP server (spine-mcp-test-server.js: SDK Server + WebStandard StreamableHTTP
+ * bridged onto the provider's fetchFn). This exercises the ACTUAL @modelcontextprotocol
+ * round trip — initialize → tools/list → tools/call — not a hand-rolled mock, so
+ * it closes the exact gaps the rewrite introduced:
+ *   - which payload SHAPE the server emits (structuredContent vs a JSON text
+ *     block) — the provider reads both; these tests prove it against each;
+ *   - the conflict → meta.current remap (spec meta.card → board parity);
+ *   - capability gating off advertised tool names;
+ *   - LocalProvider parity (get(missing) → null, version-conflict shape).
  *
  * Run:  node --test src/lib/spine-mcp-provider.test.js
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { mergeBlobs } from './sync-merge.js';
-import { createSpineServer, createMemoryPersistence } from './spine-server.js';
-import { createSpineHttpHandler } from './spine-http.js';
-import { createMCPProvider, makeInProcessTransport, MCPProviderError } from './spine-mcp-provider.js';
+import { createMcpTestServer } from './spine-mcp-test-server.js';
+import { createMCPProvider, MCPProviderError } from './spine-mcp-provider.js';
 
-/** Stand up the real server + its wire face + a provider over the in-process transport. */
-function standUp(seed = null) {
-  const server = createSpineServer({ persistence: createMemoryPersistence(seed) });
-  const handler = createSpineHttpHandler(server);
-  const provider = createMCPProvider({ transport: makeInProcessTransport(handler) });
-  return { server, handler, provider };
+/** Connect a provider to a fresh harness; returns { provider, harness }. */
+async function connected(opts = {}) {
+  const harness = createMcpTestServer(opts);
+  const provider = createMCPProvider({ baseUrl: harness.url, fetchFn: harness.fetchFn });
+  await provider.connect();
+  return { provider, harness };
 }
-
-/* A transport over a fixed capabilities map — for connection-rejection / gating. */
-function fixedCapsTransport(capabilities) {
-  return async (req) => {
-    if (req.method === 'GET' && req.path === '/mcp/capabilities') {
-      return { status: 200, body: { server: { name: 'Fake', version: '1.0.0', schema_version: 1 }, capabilities } };
-    }
-    return { status: 200, body: [] };
-  };
-}
+const oneCard = (s) => s.create({ id: 'c1', title: 'First', column_id: 'todo', priority: 'med' });
 
 /* ================================================================== */
-/* connect() against the REAL server + connection rejection            */
+/* connect: handshake, required tools, capability gating               */
 /* ================================================================== */
 
-test('connect() returns the REAL CapabilityMap; projects:false is REJECTED', async () => {
-  const { provider } = standUp();
-  const res = await provider.connect();
-  assert.deepEqual(res.capabilities, {
-    projects: true, tasks: true, artifacts: true, escalations: true, realtime: false, corpus: false,
+test('connect → initialize + tools/list; server name and capabilities from advertised tools', async () => {
+  const { provider, harness } = await connected();
+  const { server, capabilities } = provider.getCapabilities();
+  assert.equal(server.name, 'Claunker');
+  assert.equal(server.schema_version, 1);
+  assert.deepEqual(capabilities, {
+    projects: true, tasks: true, escalations: true, artifacts: true, columns: true, tags: true, realtime: false,
   });
-  assert.equal(res.server.schema_version, 1);
-
-  // a server missing a REQUIRED capability cannot back Kanbantt
-  const bad = createMCPProvider({ transport: fixedCapsTransport({ projects: false, tasks: true, artifacts: true, escalations: true, realtime: false, corpus: false }) });
-  await assert.rejects(() => bad.connect(), (e) => e instanceof MCPProviderError && e.code === 'incompatible_server');
-
-  const bad2 = createMCPProvider({ transport: fixedCapsTransport({ projects: true, tasks: false }) });
-  await assert.rejects(() => bad2.connect(), (e) => e.code === 'incompatible_server');
+  assert.equal(provider.supportsRealtime(), false, 'v1 is tools-only → board polls');
+  assert.ok(provider.hasTool('card_move'));
+  await provider.disconnect();
+  await harness.close();
 });
 
-/* ================================================================== */
-/* Round-trip: provider → server → back, column comes FROM the server  */
-/* ================================================================== */
-
-test('round-trip: createProject/createTask render todo; a server-side ingest shows in_progress via the provider', async () => {
-  const { server, provider } = standUp();
-  await provider.connect();
-
-  const p = await provider.createProject({ name: 'Spine board' });
-  assert.equal(p.name, 'Spine board');
-
-  const t = await provider.createTask({ project_id: p.id, title: 'ship it', acceptance_criteria: 'all green' });
-  assert.equal(t.column, 'todo', 'fresh task renders todo (column from the server)');
-  assert.equal(t.state, 'created');
-
-  // Hermes feeds a running state SERVER-SIDE (the spine extension; not a board op).
-  server.ingestTaskState(t.id, 'running');
-
-  // The provider reads the column the server computed — it does NOT recompute it.
-  const tasks = await provider.getTasks(p.id);
-  assert.equal(tasks.length, 1);
-  assert.equal(tasks[0].state, 'dispatched');
-  assert.equal(tasks[0].column, 'in_progress', 'in_progress came from the server-side renderColumn');
-
-  const one = await provider.getTask(t.id);
-  assert.equal(one.column, 'in_progress');
-
-  // artifacts round-trip through the wire too
-  server.createArtifact({ task_id: t.id, kind: 'delivery', ref: 'drive:1A2b3C' });
-  const arts = await provider.getArtifacts(t.id);
-  assert.equal(arts.length, 1);
-  assert.equal(arts[0].kind, 'delivery');
+test('capability gating: a server without escalation tools fails escalationList as unsupported', async () => {
+  const { provider, harness } = await connected({ omitTools: ['escalation_list', 'escalation_resolve'] });
+  assert.equal(provider.getCapabilities().capabilities.escalations, false);
+  await assert.rejects(() => provider.escalationList(), (e) => e instanceof MCPProviderError && e.code === 'unsupported_capability');
+  await provider.disconnect();
+  await harness.close();
 });
 
-/* ================================================================== */
-/* THE LOAD-BEARING one: escalated-fork + resolved-Escalation OVER THE  */
-/* WIRE renders the ADVANCED column, not blocked.                      */
-/* ================================================================== */
-
-const TS = '2026-06-16T00:00:00.000Z';
-const taskRow = (id, state, version) => ({ id, state, version, deleted_at: null, project_id: 'P', title: 'T', tier: null, acceptance_criteria: 'x', created_at: TS });
-const escRow = (id, task_id, version, resolved_at) => ({ id, task_id, version, reason: 'r', control_diff: null, resolved_at, deleted_at: null, created_at: TS });
-const spineBlob = (over) => ({
-  schema_version: 1, seq: 0,
-  projects: [{ id: 'P', name: 'P', version: 'p', deleted_at: null, created_at: TS }],
-  tasks: [], artifacts: [], escalations: [], ...over,
-});
-
-test('LOAD-BEARING: escalated-fork + resolved-Escalation read through getTask via the provider → advanced column (done), NOT blocked', async () => {
-  // MI-3 L1 converged shape, reached by a REAL merge.
-  const a = spineBlob({ tasks: [taskRow('T', 'escalated', 'va')], escalations: [escRow('E', 'T', 'va', TS)] });
-  const b = spineBlob({ tasks: [taskRow('T', 'delivered', 'vb')], escalations: [escRow('E', 'T', 'vb', TS)] });
-  const converged = mergeBlobs(a, b);
-
-  const { provider } = standUp(converged);
-  await provider.connect();
-
-  const view = await provider.getTask('T');
-  assert.equal(view.state, 'delivered', 'effective state survives the wire (escalation is over)');
-  assert.equal(view.column, 'done', 'the ADVANCED column survives the wire — NOT the blocked tray');
-
-  // contrast over the same wire: a LIVE escalation really does render blocked
-  const live = spineBlob({ tasks: [taskRow('T', 'escalated', 'v0')], escalations: [escRow('E', 'T', 'v0', null)] });
-  const p2 = standUp(live).provider;
-  await p2.connect();
-  assert.equal((await p2.getTask('T')).column, 'blocked', 'live escalation → blocked, via the provider');
-});
-
-/* ================================================================== */
-/* Version-token conflict surfaces through the provider (no overwrite)  */
-/* ================================================================== */
-
-test('version-token: a stale token surfaces a conflict through the provider, does not silently overwrite', async () => {
-  const { server, provider } = standUp();
-  await provider.connect();
-
-  const p = await provider.createProject({ name: 'P' });
-  const t0 = await provider.createTask({ project_id: p.id, title: 'T', acceptance_criteria: 'x' });
-
-  // a SERVER-SIDE write (the Hermes seam) advances the opaque version
-  server.ingestTaskState(t0.id, 'running');
-
-  // a provider write carrying the now-STALE token surfaces a conflict (board parity)
+test('incompatible server (missing a required tool) → connect throws incompatible_server', async () => {
+  const harness = createMcpTestServer({ omitTools: ['card_move'] });
+  const provider = createMCPProvider({ baseUrl: harness.url, fetchFn: harness.fetchFn });
   await assert.rejects(
-    () => provider.cancelTask(t0.id, t0.version),
-    (e) => e instanceof MCPProviderError && e.code === 'conflict' && e.meta.current && e.meta.current.state === 'dispatched',
+    () => provider.connect(),
+    (e) => e instanceof MCPProviderError && e.code === 'incompatible_server' && e.meta.missing.includes('card_move'),
   );
-  // ...and it did NOT overwrite (the task still exists, still dispatched)
-  assert.equal((await provider.getTask(t0.id)).state, 'dispatched');
-
-  // CONTROL: the FRESH token succeeds (the gate is staleness, not the field).
-  // A cancelled Task is off-board, not erased: the spine keeps the tombstone
-  // (R4 audit ledger), so it leaves the board view but reads back as 'deleted'.
-  const current = await provider.getTask(t0.id);
-  await provider.cancelTask(t0.id, current.version);
-  assert.equal((await provider.getTasks(p.id)).length, 0, 'cancelled task leaves the board view');
-  const after = await provider.getTask(t0.id);
-  assert.equal(after.column, null, 'off-board');
-  assert.equal(after.state, 'deleted');
+  await harness.close();
 });
 
 /* ================================================================== */
-/* Optional-method discipline + no faked WebSocket                     */
+/* board + card round trips                                            */
 /* ================================================================== */
 
-test('subscribe is unsupported (realtime:false) → the board polls; no WebSocket faked', async () => {
-  const { provider } = standUp();
-  await provider.connect();
-  assert.equal(provider.supportsRealtime(), false);
-  assert.throws(() => provider.subscribe('task.updated', () => {}), (e) => e instanceof MCPProviderError && e.code === 'unsupported_capability');
+test('getBoard → { board, kanbantt_schema_version }; columns in spec shape', async () => {
+  const { provider, harness } = await connected();
+  const out = await provider.getBoard();
+  assert.equal(out.kanbantt_schema_version, 1);
+  const todo = out.board.columns.find((c) => c.id === 'todo');
+  assert.ok(todo && todo.name && todo.order, 'spec column carries name + order');
+  await provider.disconnect();
+  await harness.close();
 });
 
-test('optional-method gating: getEscalations is rejected when the server does not advertise escalations', async () => {
-  // real server DOES advertise escalations → callable
-  const { server, provider } = standUp();
-  await provider.connect();
-  const p = await provider.createProject({ name: 'P' });
-  const t = await provider.createTask({ project_id: p.id, title: 'T', acceptance_criteria: 'x' });
-  server.createEscalation({ task_id: t.id, reason: 'need human', control_diff: null });
-  const open = await provider.getEscalations({ status: 'pending' });
-  assert.equal(open.length, 1);
-  assert.equal(open[0].status, 'pending');
+test('getBoard refuses a board schema_version newer than supported', async () => {
+  const { provider, harness } = await connected({ schemaVersion: 2 });
+  await assert.rejects(() => provider.getBoard(), (e) => e.code === 'schema_unsupported' && e.meta.found === 2);
+  await provider.disconnect();
+  await harness.close();
+});
 
-  // a server that does NOT advertise escalations → the optional method is gated off
-  const gated = createMCPProvider({ transport: fixedCapsTransport({ projects: true, tasks: true, artifacts: true, escalations: false, realtime: false, corpus: false }) });
-  await gated.connect();
-  await assert.rejects(() => gated.getEscalations(), (e) => e.code === 'unsupported_capability');
+test('list → cards + sync_token; includeDeleted surfaces tombstones', async () => {
+  const { provider, harness } = await connected({ seed: oneCard });
+  const live = await provider.list({ includeDeleted: false });
+  assert.equal(live.cards.length, 1);
+  assert.ok(live.sync_token, 'server-minted sync_token returned');
+
+  await provider.delete('c1', { expected_version: live.cards[0].version });
+  assert.equal((await provider.list({ includeDeleted: false })).cards.length, 0, 'tombstone hidden by default');
+  const withDel = await provider.list({ includeDeleted: true });
+  assert.equal(withDel.cards.length, 1);
+  assert.ok(withDel.cards[0].deleted_at, 'tombstone carries deleted_at');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('create/get/update/move round trip; get(missing) → null (LocalProvider parity)', async () => {
+  const { provider, harness } = await connected();
+  const created = await provider.create({ id: 'x1', title: 'New', column_id: 'todo' });
+  assert.equal(created.id, 'x1');
+  assert.equal(created.version, 1, 'server mints the version');
+
+  const got = await provider.get('x1');
+  assert.equal(got.title, 'New');
+  assert.equal(await provider.get('does-not-exist'), null, 'not_found → null, not a throw');
+
+  const updated = await provider.update('x1', { title: 'Renamed' }, { expected_version: created.version });
+  assert.equal(updated.title, 'Renamed');
+  assert.equal(updated.version, 2);
+
+  const moved = await provider.move('x1', { column_id: 'doing', order: null }, { expected_version: updated.version });
+  assert.equal(moved.column_id, 'doing');
+  assert.equal(moved.version, 3);
+  await provider.disconnect();
+  await harness.close();
 });
 
 /* ================================================================== */
-/* updateProject divergence: spine Project inert → unsupported_operation */
+/* conflict → meta.current (board parity), against BOTH payload shapes */
 /* ================================================================== */
 
-test('updateProject surfaces unsupported_operation (spine Project is inert at v1)', async () => {
-  const { provider } = standUp();
-  await provider.connect();
-  const p = await provider.createProject({ name: 'P' });
-  await assert.rejects(() => provider.updateProject(p.id, { name: 'renamed' }), (e) => e.code === 'unsupported_operation');
+test('stale update → code "conflict" carrying the current card under meta.current (structuredContent)', async () => {
+  const { provider, harness } = await connected({ seed: oneCard });
+  await assert.rejects(
+    () => provider.update('c1', { title: 'x' }, { expected_version: 'STALE' }),
+    (e) => e instanceof MCPProviderError && e.code === 'conflict' && e.meta.current.id === 'c1' && e.meta.current.version === 1,
+  );
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('text-block payloads: provider reads a board AND remaps a conflict when the server omits structuredContent', async () => {
+  // The headline gap: a server that returns only a JSON text content block (no
+  // structuredContent). The provider's structured()/errorPayload text fallbacks
+  // must still yield the object — proven here, not assumed.
+  const { provider, harness } = await connected({ payloadStyle: 'text', seed: oneCard });
+  const out = await provider.getBoard();
+  assert.ok(out.board.columns.length > 0, 'structured() parsed the text block');
+  await assert.rejects(
+    () => provider.update('c1', { title: 'x' }, { expected_version: 'STALE' }),
+    (e) => e.code === 'conflict' && e.meta.current.id === 'c1',
+  );
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('retry_after on a domain error is preserved across the boundary (any code)', async () => {
+  const { provider, harness } = await connected({ errorOn: { card_list: { code: 'rate_limited', message: 'slow down', meta: { retry_after: 2000 } } } });
+  await assert.rejects(
+    () => provider.list(),
+    (e) => e.code === 'rate_limited' && e.meta.retry_after === 2000,
+  );
+  await provider.disconnect();
+  await harness.close();
+});
+
+/* ================================================================== */
+/* not-connected guard                                                 */
+/* ================================================================== */
+
+test('calls before connect() throw not_connected', async () => {
+  const harness = createMcpTestServer();
+  const provider = createMCPProvider({ baseUrl: harness.url, fetchFn: harness.fetchFn });
+  assert.throws(() => provider.getCapabilities(), (e) => e.code === 'not_connected');
+  await assert.rejects(() => provider.getBoard(), (e) => e.code === 'not_connected');
+  await harness.close();
+});
+
+test('createMCPProvider requires a baseUrl', () => {
+  assert.throws(() => createMCPProvider({}), (e) => e instanceof MCPProviderError && e.code === 'config');
 });
