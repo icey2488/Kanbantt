@@ -34,7 +34,7 @@ export async function onRequestPost({ request, env }) {
 
   // Refuse to act as a generic exchanger: the redirect_uri must be the one we
   // registered. Cheap guard against this route being driven by another origin.
-  if (redirect_uri !== env.OAUTH_REDIRECT_URI) {
+  if (redirect_uri !== (env.OAUTH_REDIRECT_URI || '').trim()) {
     return json({ error: 'redirect_uri_mismatch' }, 400);
   }
 
@@ -42,8 +42,10 @@ export async function onRequestPost({ request, env }) {
     grant_type: 'authorization_code',
     code,
     code_verifier,
-    client_id: env.GOOGLE_CLIENT_ID,
-    client_secret: env.GOOGLE_CLIENT_SECRET,
+    // Trim defensively: a trailing space in an env var otherwise yields Google
+    // "invalid_client / OAuth client was not found".
+    client_id: (env.GOOGLE_CLIENT_ID || '').trim(),
+    client_secret: (env.GOOGLE_CLIENT_SECRET || '').trim(),
     redirect_uri,
   });
 

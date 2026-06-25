@@ -97,7 +97,8 @@ let redirecting = false;   // module scope: at most one redirect in flight per l
  */
 export async function initAuth(id, { onChange } = {}) {
   if (!id) throw new Error('initAuth: clientId is required');
-  clientId = id;
+  // Trim so a stray space in VITE_GOOGLE_CLIENT_ID can't corrupt the auth URL.
+  clientId = String(id).trim();
   onChangeCb = onChange || null;
   initialized = true;
 
