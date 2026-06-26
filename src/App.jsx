@@ -1414,6 +1414,10 @@ function CalendarView({ tasks, events, columns, onTaskClick }) {
   const [cursor, setCursor] = useState(new Date());
   // Narrow-only: the day whose task list renders below the compact grid. Defaults to today.
   const [selectedDay, setSelectedDay] = useState(() => startOfDay(new Date()));
+  // Narrow-only month-jump picker (tap the month title): whether the popover is open and
+  // which year its 12 month buttons display (reset to the cursor's year each time it opens).
+  const [monthPickerOpen, setMonthPickerOpen] = useState(false);
+  const [pickerYear, setPickerYear] = useState(() => new Date().getFullYear());
   // Device-local view preference (NOT board data): synchronous lazy read so the first
   // paint is the saved layout; persisted via safeSet, same as theme. Only the two new
   // layouts are honored — anything else (incl. absent) falls back to Month.
@@ -1498,6 +1502,16 @@ function CalendarView({ tasks, events, columns, onTaskClick }) {
       selectInMonth(m);
     };
     const goToday = () => { const now = new Date(); setCursor(now); setSelectedDay(startOfDay(now)); };
+    // Month-jump picker: open re-seeds the displayed year from the cursor; picking a month
+    // jumps the calendar there and pins the detail day via the same rule as stepMonth.
+    const openMonthPicker = () => { setPickerYear(cursor.getFullYear()); setMonthPickerOpen(true); };
+    const jumpToMonth = (monthIndex) => {
+      const m = new Date(pickerYear, monthIndex, 1);
+      setCursor(m);
+      selectInMonth(m);
+      setMonthPickerOpen(false);
+    };
+    const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     const legendItem = {
       display: 'flex', alignItems: 'center', gap: 6,
       fontFamily: F.mono, fontSize: 10, color: C.textMuted,
@@ -1511,15 +1525,70 @@ function CalendarView({ tasks, events, columns, onTaskClick }) {
           display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between',
           gap: 12, marginBottom: 16,
         }}>
-          <div>
-            <h2 style={{
+          <div style={{ position: 'relative' }}>
+            <button onClick={openMonthPicker} aria-label="Jump to month" style={{
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              background: 'transparent', border: 'none', padding: 0, margin: 0,
+              cursor: 'pointer', textAlign: 'left',
               fontFamily: F.display, fontStyle: 'italic', fontWeight: 400,
-              fontSize: 22, margin: 0, color: C.text, letterSpacing: '-0.02em',
-            }}>{monthLabel}</h2>
+              fontSize: 22, color: C.text, letterSpacing: '-0.02em',
+            }}>
+              {monthLabel}
+              <ChevronDown size={16} strokeWidth={1.5} style={{ marginTop: 3, flexShrink: 0 }} />
+            </button>
             <div style={{ display: 'flex', gap: 14, marginTop: 6 }}>
               <div style={legendItem}><span style={legendDot(C.ice)} />Tasks</div>
               <div style={legendItem}><span style={legendDot(C.coral)} />Overdue</div>
             </div>
+            {monthPickerOpen && (
+              <>
+                {/* Backdrop: catches outside taps and dims, matching the modal overlay treatment. */}
+                <div onClick={() => setMonthPickerOpen(false)} style={{
+                  position: 'fixed', inset: 0, background: C.modalBackdrop,
+                  backdropFilter: 'blur(4px)', zIndex: 100,
+                }} />
+                {/* Card: drops just under the title (anchored to this relative wrapper). */}
+                <div style={{
+                  position: 'absolute', top: '100%', left: 0, marginTop: 8,
+                  width: 280, maxWidth: '86vw', zIndex: 101,
+                  background: C.surface, border: `1px solid ${C.borderHi}`,
+                  borderRadius: 12, padding: 14, boxShadow: C.shadow,
+                }}>
+                  <div style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    marginBottom: 12,
+                  }}>
+                    <button onClick={() => setPickerYear((y) => y - 1)} style={navBtn} aria-label="Previous year">
+                      <ChevronLeft size={16} strokeWidth={1.5} />
+                    </button>
+                    <div style={{
+                      fontFamily: F.mono, fontSize: 15, fontWeight: 600,
+                      color: C.text, letterSpacing: '0.04em',
+                    }}>{pickerYear}</div>
+                    <button onClick={() => setPickerYear((y) => y + 1)} style={navBtn} aria-label="Next year">
+                      <ChevronRight size={16} strokeWidth={1.5} />
+                    </button>
+                  </div>
+                  <div style={{
+                    display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6,
+                  }}>
+                    {MONTHS_SHORT.map((name, idx) => {
+                      const current = idx === cursor.getMonth() && pickerYear === cursor.getFullYear();
+                      return (
+                        <button key={idx} onClick={() => jumpToMonth(idx)} style={{
+                          height: 40, borderRadius: 8, cursor: 'pointer',
+                          background: current ? `${C.ice}22` : C.surfaceHi,
+                          border: current ? `1.5px solid ${C.ice}` : `1px solid ${C.border}`,
+                          color: current ? C.text : C.textMuted,
+                          fontFamily: F.mono, fontSize: 12, fontWeight: current ? 600 : 400,
+                          letterSpacing: '0.02em',
+                        }}>{name}</button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </>
+            )}
           </div>
           <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
             <button onClick={() => stepMonth(-1)} style={navBtn}>
