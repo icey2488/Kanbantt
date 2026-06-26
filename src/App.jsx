@@ -1921,9 +1921,15 @@ function Legend() {
    ============================================================ */
 function GanttView({ tasks, events, columns, onTaskClick }) {
   const C = useTheme();
+  const narrow = useNarrow();
   const DAY_W = 36;
   const ROW_H = 44;
   const LABEL_W = 220;
+  // Narrow-only: shrink the label column, day width, and page padding for a phone.
+  // On desktop these collapse to the module constants so the render is byte-for-byte.
+  const labelW = narrow ? 124 : LABEL_W;
+  const dayW = narrow ? 32 : DAY_W;
+  const pagePad = narrow ? 12 : 28;
 
   const [offset, setOffset] = useState(-7);
   const viewStart = addDays(new Date(), offset);
@@ -1933,6 +1939,18 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
 
   const sorted = [...tasks].sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
   const todayIdx = Math.round((new Date().setHours(0, 0, 0, 0) - viewStart.getTime()) / 86400000);
+
+  // On narrow, land the horizontal scroll on today: the 42-day window starts a week
+  // before today (offset -7), so today otherwise sits off-screen to the right. Nudge
+  // the day axis so today rests just past the frozen label column. Desktop: no-op.
+  const scrollRef = useRef(null);
+  useEffect(() => {
+    if (!narrow) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollLeft = Math.max(0, todayIdx * dayW - dayW);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [narrow]);
 
   const eventByDay = {};
   events.forEach((e) => {
@@ -1947,7 +1965,7 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
   };
 
   return (
-    <div style={{ padding: 28 }}>
+    <div style={{ padding: pagePad }}>
       <div style={{
         display: 'flex', alignItems: 'center',
         justifyContent: 'space-between', marginBottom: 20,
@@ -1969,20 +1987,25 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
         </div>
       </div>
 
-      <div style={{
+      <div ref={scrollRef} style={{
         border: `1px solid ${C.border}`, borderRadius: 10,
         overflow: 'auto', background: C.surface,
       }}>
-        <div style={{ minWidth: LABEL_W + numDays * DAY_W }}>
+        <div style={{ minWidth: labelW + numDays * dayW }}>
           <div style={{
             display: 'flex', borderBottom: `1px solid ${C.border}`,
-            background: C.bgGrain, position: 'sticky', top: 0, zIndex: 2,
+            background: C.bgGrain, position: 'sticky', top: 0, zIndex: narrow ? 5 : 2,
           }}>
             <div style={{
-              width: LABEL_W, padding: '10px 14px',
+              width: labelW, padding: '10px 14px',
               fontFamily: F.mono, fontSize: 10.5, color: C.textMuted,
               letterSpacing: '0.1em', textTransform: 'uppercase',
               borderRight: `1px solid ${C.border}`,
+              // Narrow: the corner cell — sticky top AND left, on top of everything.
+              ...(narrow && {
+                position: 'sticky', left: 0, zIndex: 6,
+                background: C.surface, flexShrink: 0,
+              }),
             }}>Task</div>
             <div style={{ display: 'flex', flex: 1 }}>
               {days.map((d, i) => {
@@ -1992,7 +2015,7 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
                 const evCount = eventByDay[i] || 0;
                 return (
                   <div key={i} style={{
-                    width: DAY_W, padding: '6px 0 4px', textAlign: 'center',
+                    width: dayW, padding: '6px 0 4px', textAlign: 'center',
                     fontFamily: F.mono, fontSize: 10,
                     color: isTodayD ? C.ice : isWeekend ? C.textDim : C.textMuted,
                     background: isTodayD ? `${C.ice}15` : 'transparent',
@@ -2021,7 +2044,7 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
             {todayIdx >= 0 && todayIdx < numDays && (
               <div style={{
                 position: 'absolute',
-                left: LABEL_W + todayIdx * DAY_W + DAY_W / 2,
+                left: labelW + todayIdx * dayW + dayW / 2,
                 top: 0, bottom: 0, width: 1,
                 background: C.ice, opacity: 0.4, zIndex: 1,
               }} />
@@ -2035,10 +2058,10 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
               const overdue = isOverdue(t);
               const col = columns.find((c) => c.id === t.status);
               const accent = overdue ? C.coral : C[col.accentKey];
-              const barLeft = Math.max(startIdx, 0) * DAY_W;
+              const barLeft = Math.max(startIdx, 0) * dayW;
               const clipL = startIdx < 0 ? -startIdx : 0;
               const clipR = Math.max(0, startIdx + duration - numDays);
-              const barWidth = Math.max(8, (duration - clipL - clipR) * DAY_W - 4);
+              const barWidth = Math.max(8, (duration - clipL - clipR) * dayW - 4);
 
               return (
                 <div key={t.id} style={{
@@ -2047,10 +2070,13 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
                   alignItems: 'center', position: 'relative',
                 }}>
                   <div style={{
-                    width: LABEL_W, padding: '0 14px', fontSize: 13,
+                    width: labelW, padding: '0 14px', fontSize: 13,
                     color: C.text, borderRight: `1px solid ${C.border}`,
                     height: '100%', display: 'flex', alignItems: 'center',
                     gap: 8, flexShrink: 0,
+                    // Narrow: freeze the label column — pinned left, above bars and
+                    // the today line (z:1), below the header row (z:5).
+                    ...(narrow && { position: 'sticky', left: 0, zIndex: 3, background: C.surface }),
                   }}>
                     <div style={{
                       width: 4, height: 4, borderRadius: '50%',
