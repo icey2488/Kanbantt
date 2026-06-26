@@ -2084,7 +2084,17 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
   };
 
   return (
-    <div style={{ padding: pagePad }}>
+    <div style={narrow ? {
+      // Narrow: pin the page to the viewport below the header (67px) + FilterBar
+      // (53px) — the same offset BoardView uses — and lay out as a flex column so
+      // the scroll pane below can flex-fill the remaining height. This is what
+      // moves vertical scrolling INSIDE the Gantt pane (see scroll container
+      // below). box-sizing keeps the page padding inside the height. Desktop: the
+      // root is just padded and the page scrolls normally — byte-for-byte as before.
+      padding: pagePad, boxSizing: 'border-box',
+      height: 'calc(100dvh - 67px - 53px)',
+      display: 'flex', flexDirection: 'column',
+    } : { padding: pagePad }}>
       <div style={{
         display: 'flex', alignItems: 'center',
         justifyContent: 'space-between', marginBottom: 20,
@@ -2109,6 +2119,16 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
       <div ref={scrollRef} style={{
         border: `1px solid ${C.border}`, borderRadius: 10,
         overflow: 'auto', background: C.surface,
+        // Narrow: fill the remaining viewport height (root is a viewport-tall flex
+        // column) so VERTICAL scrolling happens inside this pane. That's what makes
+        // the sticky-top date header (zIndex 5) and the sticky top-left corner
+        // (zIndex 6) engage on vertical scroll — alongside the already-frozen
+        // sticky-left label column (zIndex 3). Without a height cap the container
+        // grew to fit every row, so vertical scroll happened at the PAGE level and
+        // top:0 had nothing to stick to — the header rode up off-screen. The header
+        // (C.bgGrain) and corner (C.surface) backgrounds are solid, so body rows
+        // don't bleed through when pinned. Desktop: no height — unchanged.
+        ...(narrow && { flex: 1, minHeight: 0 }),
       }}>
         <div style={{ minWidth: labelW + numDays * dayW }}>
           <div style={{
