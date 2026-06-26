@@ -792,9 +792,12 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
           color: C.isLight ? '#fff' : C.bg,
           border: 'none', borderRadius: 8, cursor: 'pointer',
           fontFamily: F.body, fontSize: 13, fontWeight: 600,
-          // Collapse to a '+' icon button with a >=40px square tap target. 40px
-          // <= the nav's height, so the header's overall height is unchanged.
-          ...(narrow ? { padding: 0, minWidth: 40, minHeight: 40, justifyContent: 'center' } : {}),
+          // Collapse to a '+' icon button sized to the sibling header icon
+          // buttons (the Settings gear is 31px: 15px icon + 7px padding + 1px
+          // border) so the accent block doesn't tower over the row. 31px < the
+          // 40px nav height, so the header height — and the top:67 sticky
+          // FilterBar offset that depends on it — is unchanged.
+          ...(narrow ? { padding: 0, minWidth: 31, minHeight: 31, justifyContent: 'center' } : {}),
         }}>
           <Plus size={14} strokeWidth={2.5} />
           {!narrow && 'New'}
@@ -866,7 +869,7 @@ function FilterBar({ tags, filters, setFilters }) {
           type="text"
           value={filters.search}
           onChange={(e) => setFilters((f) => ({ ...f, search: e.target.value }))}
-          placeholder="Search tasks, tags..."
+          placeholder={narrow ? 'Search…' : 'Search tasks, tags...'}
           style={{
             background: 'transparent', border: 'none', outline: 'none',
             color: C.text, fontSize: 13, fontFamily: F.body,
