@@ -833,6 +833,9 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
 function FilterBar({ tags, filters, setFilters }) {
   const C = useTheme();
   const narrow = useNarrow();
+  // Narrow folds the inline tag chips into a single button + popover (see below);
+  // this drives that popover's open state. Desktop never reads it.
+  const [tagPopupOpen, setTagPopupOpen] = useState(false);
   const activeCount =
     (filters.search ? 1 : 0) +
     filters.tags.length +
@@ -844,6 +847,8 @@ function FilterBar({ tags, filters, setFilters }) {
       tags: f.tags.includes(tagId) ? f.tags.filter((t) => t !== tagId) : [...f.tags, tagId],
     }));
   };
+  const clearTags = () => setFilters((f) => ({ ...f, tags: [] }));
+  const hasTags = filters.tags.length > 0;
 
   return (
     <div style={{
@@ -884,21 +889,115 @@ function FilterBar({ tags, filters, setFilters }) {
         )}
       </div>
 
-      <div style={{
-        display: 'flex', gap: 5, flexWrap: 'nowrap', overflowX: 'auto',
-        flex: 1, alignItems: 'center',
-      }}>
-        <Hash size={12} strokeWidth={1.75} color={C.textDim} style={{ flexShrink: 0 }} />
-        {tags.map((tag) => (
-          <TagChip
-            key={tag.id}
-            tag={tag}
-            active={filters.tags.includes(tag.id)}
-            dimmed={filters.tags.length > 0 && !filters.tags.includes(tag.id)}
-            onClick={() => toggleTag(tag.id)}
-          />
-        ))}
-      </div>
+      {narrow ? (
+        /* Narrow: the inline chips overflow and don't scroll cleanly on a phone,
+           so collapse them into a single Tags button. The old '#' (Hash) label
+           folds into this button's icon. An accent state + count badge keep the
+           applied filter visible at a glance while the chips are hidden. */
+        <>
+          <button
+            onClick={() => setTagPopupOpen((o) => !o)}
+            aria-label="Filter by tag"
+            style={{
+              display: 'flex', alignItems: 'center', gap: 6,
+              padding: '5px 10px', borderRadius: 6, cursor: 'pointer',
+              fontFamily: F.mono, fontSize: 10, letterSpacing: '0.08em',
+              textTransform: 'uppercase',
+              background: hasTags ? `${C.ice}22` : 'transparent',
+              border: `1px solid ${hasTags ? `${C.ice}55` : C.border}`,
+              color: hasTags ? C.ice : C.textMuted,
+              whiteSpace: 'nowrap', flexShrink: 0,
+            }}
+          >
+            <Hash size={11} strokeWidth={1.75} />
+            Tags
+            {hasTags && (
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                minWidth: 15, height: 15, padding: '0 4px', borderRadius: 999,
+                background: C.ice, color: C.bg,
+                fontFamily: F.mono, fontSize: 9, fontWeight: 700, lineHeight: 1,
+              }}>{filters.tags.length}</span>
+            )}
+          </button>
+          {tagPopupOpen && (
+            <>
+              {/* Backdrop: catches outside taps and dims, mirroring the month picker. */}
+              <div onClick={() => setTagPopupOpen(false)} style={{
+                position: 'fixed', inset: 0, background: C.modalBackdrop,
+                backdropFilter: 'blur(4px)', zIndex: 100,
+              }} />
+              {/* Card: centered sheet. The trigger sits right-of-center in a tight
+                  row, so a dropdown anchored to it would clip off-screen on a phone;
+                  a centered fixed card stays fully on-screen at any width. */}
+              <div style={{
+                position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+                width: 'min(320px, calc(100vw - 32px))', maxHeight: '70vh', overflowY: 'auto',
+                zIndex: 101, background: C.surface, border: `1px solid ${C.borderHi}`,
+                borderRadius: 12, padding: 16, boxShadow: C.shadow,
+              }}>
+                <div style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  marginBottom: 14,
+                }}>
+                  <span style={{
+                    fontFamily: F.mono, fontSize: 11, letterSpacing: '0.08em',
+                    textTransform: 'uppercase', color: C.textMuted,
+                  }}>Filter by tag</span>
+                  {hasTags && (
+                    <button onClick={clearTags} style={{
+                      background: 'transparent', border: 'none', cursor: 'pointer', padding: 0,
+                      fontFamily: F.mono, fontSize: 10, letterSpacing: '0.08em',
+                      textTransform: 'uppercase', color: C.ice,
+                    }}>Clear</button>
+                  )}
+                </div>
+                {tags.length === 0 ? (
+                  <div style={{ fontFamily: F.body, fontSize: 13, color: C.textDim, padding: '6px 0' }}>
+                    No tags yet.
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {tags.map((tag) => (
+                      <TagChip
+                        key={tag.id}
+                        tag={tag}
+                        size="md"
+                        active={filters.tags.includes(tag.id)}
+                        onClick={() => toggleTag(tag.id)}
+                      />
+                    ))}
+                  </div>
+                )}
+                <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
+                  <button onClick={() => setTagPopupOpen(false)} style={{
+                    padding: '6px 14px', borderRadius: 6, cursor: 'pointer',
+                    fontFamily: F.mono, fontSize: 11, letterSpacing: '0.06em',
+                    textTransform: 'uppercase', background: C.surfaceHi,
+                    border: `1px solid ${C.border}`, color: C.text,
+                  }}>Done</button>
+                </div>
+              </div>
+            </>
+          )}
+        </>
+      ) : (
+        <div style={{
+          display: 'flex', gap: 5, flexWrap: 'nowrap', overflowX: 'auto',
+          flex: 1, alignItems: 'center',
+        }}>
+          <Hash size={12} strokeWidth={1.75} color={C.textDim} style={{ flexShrink: 0 }} />
+          {tags.map((tag) => (
+            <TagChip
+              key={tag.id}
+              tag={tag}
+              active={filters.tags.includes(tag.id)}
+              dimmed={filters.tags.length > 0 && !filters.tags.includes(tag.id)}
+              onClick={() => toggleTag(tag.id)}
+            />
+          ))}
+        </div>
+      )}
 
       <button
         onClick={() => setFilters((f) => ({ ...f, overdueOnly: !f.overdueOnly }))}
