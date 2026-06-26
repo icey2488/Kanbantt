@@ -25,6 +25,7 @@ import {
   Settings,
   Cloud,
   RefreshCw,
+  Palette,
 } from 'lucide-react';
 import { initAuth, signIn, signOut, isGisReady } from './lib/auth.js';
 import { driveSync } from './lib/sync-instance.js';
@@ -453,6 +454,29 @@ function TagChip({ tag, size = 'sm', active, onClick, dimmed }) {
    ============================================================ */
 function ThemePicker({ theme, setTheme }) {
   const C = useTheme();
+  const narrow = useNarrow();
+  // Narrow: collapse the three-button control to a single icon that cycles
+  // DARK -> LIGHT -> MIST, reusing the same setter. Outline left intact for
+  // a visible keyboard focus ring; >=40px tap target.
+  if (narrow) {
+    const order = Object.keys(THEMES); // dark, light, mist
+    const next = order[(order.indexOf(theme) + 1) % order.length];
+    const cur = THEMES[theme] || THEMES.dark;
+    return (
+      <button
+        onClick={() => setTheme(next)}
+        title={`Theme: ${cur.name} — tap to switch`}
+        aria-label={`Theme: ${cur.name}. Switch theme`}
+        style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          minWidth: 40, minHeight: 40, padding: 0,
+          background: C.surface, border: `1px solid ${C.border}`,
+          borderRadius: 8, cursor: 'pointer', color: C.text,
+        }}>
+        <Palette size={16} strokeWidth={1.75} />
+      </button>
+    );
+  }
   return (
     <div style={{
       display: 'flex', gap: 2, background: C.surface,
@@ -592,6 +616,7 @@ const SYNC_CHIP = {
 // signed in AND sync is enabled — signed out shows no chip at all.
 function SyncChip({ status, onSyncNow, onReconnect }) {
   const C = useTheme();
+  const narrow = useNarrow();
   const cfg = SYNC_CHIP[status] || SYNC_CHIP.synced;
   const tint = C[cfg.colorKey] || C.textMuted;
   const isReconnect = status === 'paused_reconnect';
@@ -599,15 +624,16 @@ function SyncChip({ status, onSyncNow, onReconnect }) {
   const onClick = isBlocked ? undefined : isReconnect ? onReconnect : onSyncNow;
   return (
     <button onClick={onClick} disabled={isBlocked}
+      aria-label={cfg.label}
       title={isReconnect ? 'Reconnect Google to resume sync' : isBlocked ? 'Resolve the sync conflict' : 'Sync now'}
       style={{
-        display: 'flex', alignItems: 'center', gap: 6, padding: '5px 9px',
+        display: 'flex', alignItems: 'center', gap: narrow ? 0 : 6, padding: '5px 9px',
         background: `${tint}1f`, border: `1px solid ${tint}55`, borderRadius: 8,
         color: C.text, cursor: isBlocked ? 'default' : 'pointer',
         fontFamily: F.mono, fontSize: 10, letterSpacing: '0.06em', textTransform: 'uppercase',
       }}>
       <cfg.Icon size={12} strokeWidth={2} color={tint} />
-      {cfg.label}
+      {!narrow && cfg.label}
     </button>
   );
 }
@@ -618,6 +644,7 @@ function SyncChip({ status, onSyncNow, onReconnect }) {
 // configured, so a purely-local board shows no chip at all.
 function SpineChip({ state }) {
   const C = useTheme();
+  const narrow = useNarrow();
   if (!state) return null;
   const active = state.provider === 'mcp';
   const fallback = !!state.fallback;
@@ -626,13 +653,13 @@ function SpineChip({ state }) {
   return (
     <span title={state.error ? `${state.error.code}: ${state.error.message}` : state.indicator}
       style={{
-        display: 'flex', alignItems: 'center', gap: 6, padding: '5px 9px',
+        display: 'flex', alignItems: 'center', gap: narrow ? 0 : 6, padding: '5px 9px',
         background: `${tint}1f`, border: `1px solid ${tint}55`, borderRadius: 8,
         color: C.text, fontFamily: F.mono, fontSize: 10, letterSpacing: '0.06em',
         textTransform: 'uppercase', whiteSpace: 'nowrap',
       }}>
       <Icon size={12} strokeWidth={2} color={tint} />
-      {state.indicator}
+      {!narrow && state.indicator}
     </span>
   );
 }
@@ -696,17 +723,24 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
 
   return (
     <header style={{
-      borderBottom: `1px solid ${C.border}`, padding: '18px 28px',
+      borderBottom: `1px solid ${C.border}`,
+      // Keep vertical padding (18px) UNCHANGED on narrow so the header stays ~67px
+      // tall; only the horizontal padding collapses (with safe-area insets).
+      padding: narrow
+        ? '18px max(16px, env(safe-area-inset-right)) 18px max(16px, env(safe-area-inset-left))'
+        : '18px 28px',
       display: 'flex', alignItems: 'center', justifyContent: 'space-between',
       background: C.bgGrain, position: 'sticky', top: 0, zIndex: 10,
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <Snowflake size={18} color={C.ice} strokeWidth={1.5} />
-          <span style={{
-            fontFamily: F.display, fontStyle: 'italic', fontWeight: 400,
-            fontSize: 22, color: C.text, letterSpacing: '-0.02em',
-          }}>Kanbantt</span>
+          {!narrow && (
+            <span style={{
+              fontFamily: F.display, fontStyle: 'italic', fontWeight: 400,
+              fontSize: 22, color: C.text, letterSpacing: '-0.02em',
+            }}>Kanbantt</span>
+          )}
         </div>
         {/* Events-synced badge removed with mock Calendar data; returns with
             real Google Calendar integration. */}
@@ -719,16 +753,20 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
         {tabs.map(({ id, label, Icon }) => {
           const active = view === id;
           return (
-            <button key={id} onClick={() => setView(id)} style={{
-              display: 'flex', alignItems: 'center', gap: 8,
-              padding: '8px 14px',
+            <button key={id} onClick={() => setView(id)} title={label} aria-label={label} style={{
+              display: 'flex', alignItems: 'center', gap: narrow ? 0 : 8,
+              // Vertical padding (8px) stays the same on narrow so the nav — the
+              // header's tallest element — keeps its height. Only labels drop and
+              // each tab gets a >=40px-wide tap target.
+              padding: narrow ? '8px 0' : '8px 14px',
+              ...(narrow ? { minWidth: 40, justifyContent: 'center' } : {}),
               background: active ? C.surfaceHi : 'transparent',
               color: active ? C.text : C.textMuted, border: 'none',
               borderRadius: 7, cursor: 'pointer', fontFamily: F.body,
               fontSize: 13, fontWeight: 500, transition: 'all 120ms ease',
             }}>
               <Icon size={14} strokeWidth={1.75} />
-              {label}
+              {!narrow && label}
             </button>
           );
         })}
@@ -748,15 +786,18 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
         }} title="Settings">
           <Settings size={15} strokeWidth={1.5} />
         </button>
-        <button onClick={onNewTask} style={{
-          display: 'flex', alignItems: 'center', gap: 6,
+        <button onClick={onNewTask} title="New task" aria-label="New task" style={{
+          display: 'flex', alignItems: 'center', gap: narrow ? 0 : 6,
           padding: '8px 14px', background: C.ice,
           color: C.isLight ? '#fff' : C.bg,
           border: 'none', borderRadius: 8, cursor: 'pointer',
           fontFamily: F.body, fontSize: 13, fontWeight: 600,
+          // Collapse to a '+' icon button with a >=40px square tap target. 40px
+          // <= the nav's height, so the header's overall height is unchanged.
+          ...(narrow ? { padding: 0, minWidth: 40, minHeight: 40, justifyContent: 'center' } : {}),
         }}>
           <Plus size={14} strokeWidth={2.5} />
-          New
+          {!narrow && 'New'}
         </button>
         {user ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -788,6 +829,7 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
    ============================================================ */
 function FilterBar({ tags, filters, setFilters }) {
   const C = useTheme();
+  const narrow = useNarrow();
   const activeCount =
     (filters.search ? 1 : 0) +
     filters.tags.length +
@@ -803,7 +845,9 @@ function FilterBar({ tags, filters, setFilters }) {
   return (
     <div style={{
       borderBottom: `1px solid ${C.border}`,
-      padding: '12px 28px',
+      // Keep vertical padding (12px) so the bar's ~53px height — baked into the
+      // board minHeight offset — stays valid; only horizontal padding shrinks.
+      padding: narrow ? '12px 16px' : '12px 28px',
       display: 'flex', alignItems: 'center', gap: 14,
       background: C.bg,
       position: 'sticky', top: 67, zIndex: 9,
@@ -811,7 +855,11 @@ function FilterBar({ tags, filters, setFilters }) {
       <div style={{
         display: 'flex', alignItems: 'center', gap: 8,
         background: C.surface, border: `1px solid ${C.border}`,
-        borderRadius: 7, padding: '6px 10px', minWidth: 220,
+        borderRadius: 7, padding: '6px 10px',
+        // Narrow: let search flex to fill and shrink instead of forcing 220px,
+        // so the search + '#' + OVERDUE row fits at 390px.
+        minWidth: narrow ? 0 : 220,
+        ...(narrow ? { flex: 1 } : {}),
       }}>
         <Search size={13} strokeWidth={1.75} color={C.textDim} />
         <input
@@ -1096,6 +1144,7 @@ function QuickAdd({ colId, onAdd }) {
    ============================================================ */
 function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
   const C = useTheme();
+  const narrow = useNarrow();
   const [draggedId, setDraggedId] = useState(null);
   const [dropTarget, setDropTarget] = useState(null);
 
@@ -1127,7 +1176,18 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
   };
 
   return (
-    <div style={{
+    <div style={narrow ? {
+      // Narrow: horizontal snap-scroll strip; height grows naturally so only the
+      // columns scroll sideways and the page still scrolls vertically.
+      display: 'flex', flexWrap: 'nowrap', overflowX: 'auto', overflowY: 'visible',
+      gap: 14, scrollSnapType: 'x mandatory', WebkitOverflowScrolling: 'touch',
+      scrollPaddingLeft: 16, scrollPaddingRight: 16,
+      paddingTop: 16,
+      paddingLeft: 'max(16px, env(safe-area-inset-left))',
+      paddingRight: 'max(16px, env(safe-area-inset-right))',
+      paddingBottom: 'calc(16px + env(safe-area-inset-bottom))',
+      minHeight: 'calc(100vh - 67px - 53px)',
+    } : {
       padding: '24px 28px',
       display: 'grid', gridTemplateColumns: `repeat(${columns.length}, 1fr)`, gap: 18,
       minHeight: 'calc(100vh - 67px - 53px)',
@@ -1144,20 +1204,22 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
               padding: 6, margin: -6, borderRadius: 12,
               background: isDropCol ? C.surfaceDrop : 'transparent',
               transition: 'background 120ms ease',
+              ...(narrow ? { flex: '0 0 85vw', maxWidth: '85vw', scrollSnapAlign: 'start' } : {}),
             }}>
             <div style={{
               display: 'flex', alignItems: 'center', justifyContent: 'space-between',
               paddingBottom: 12, paddingLeft: 6, paddingRight: 6,
               borderBottom: `1px solid ${C.border}`,
             }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
                 <div style={{ width: 8, height: 8, borderRadius: 2, background: C[col.accentKey] }} />
                 <span style={{
                   fontFamily: F.body, fontSize: 12, fontWeight: 500,
                   color: C.text, textTransform: 'uppercase', letterSpacing: '0.12em',
+                  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                 }}>{col.label}</span>
               </div>
-              <span style={{ fontFamily: F.mono, fontSize: 11, color: C.textDim }}>
+              <span style={{ fontFamily: F.mono, fontSize: 11, color: C.textDim, flexShrink: 0 }}>
                 {colTasks.length.toString().padStart(2, '0')}
               </span>
             </div>
