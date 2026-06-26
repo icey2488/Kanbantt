@@ -1410,7 +1410,10 @@ function DayChips({ dayTasks, dayEvents, columns, onTaskClick, max = 3 }) {
 
 function CalendarView({ tasks, events, columns, onTaskClick }) {
   const C = useTheme();
+  const narrow = useNarrow();
   const [cursor, setCursor] = useState(new Date());
+  // Narrow-only: the day whose task list renders below the compact grid. Defaults to today.
+  const [selectedDay, setSelectedDay] = useState(() => startOfDay(new Date()));
   // Device-local view preference (NOT board data): synchronous lazy read so the first
   // paint is the saved layout; persisted via safeSet, same as theme. Only the two new
   // layouts are honored — anything else (incl. absent) falls back to Month.
@@ -1446,6 +1449,7 @@ function CalendarView({ tasks, events, columns, onTaskClick }) {
   const tasksForDay = (d) => d ? tasks.filter((t) => t.dueDate === iso(d)) : [];
   const eventsForDay = (d) => d ? events.filter((e) => e.date === iso(d)) : [];
   const isToday = (d) => d && iso(d) === iso(new Date());
+  const isSelected = (d) => d && iso(d) === iso(selectedDay);
 
   const monthLabel = cursor.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   const fmtRange = (start, end) => {
@@ -1474,6 +1478,122 @@ function CalendarView({ tasks, events, columns, onTaskClick }) {
     width: 32, height: 32, borderRadius: 7, cursor: 'pointer',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
   };
+
+  // ── Narrow / mobile: a compact tappable month grid + the selected day's task list.
+  // Always month-mode here (the persisted week/work-week layout is ignored); the desktop
+  // branch below is left exactly as-is. ──
+  if (narrow) {
+    const selTasks = tasksForDay(selectedDay);
+    const selLabel = selectedDay.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+    // Step a whole month and pin the detail to the visible month: today when it lands
+    // there, otherwise the 1st of the new month.
+    const selectInMonth = (m) => {
+      const now = new Date();
+      const sameMonth = now.getFullYear() === m.getFullYear() && now.getMonth() === m.getMonth();
+      setSelectedDay(sameMonth ? startOfDay(now) : startOfDay(m));
+    };
+    const stepMonth = (delta) => {
+      const m = new Date(cursor.getFullYear(), cursor.getMonth() + delta, 1);
+      setCursor(m);
+      selectInMonth(m);
+    };
+    const goToday = () => { const now = new Date(); setCursor(now); setSelectedDay(startOfDay(now)); };
+    const legendItem = {
+      display: 'flex', alignItems: 'center', gap: 6,
+      fontFamily: F.mono, fontSize: 10, color: C.textMuted,
+      letterSpacing: '0.06em', textTransform: 'uppercase',
+    };
+    const legendDot = (color) => ({ width: 8, height: 8, borderRadius: '50%', background: color });
+
+    return (
+      <div style={{ padding: 14 }}>
+        <div style={{
+          display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between',
+          gap: 12, marginBottom: 16,
+        }}>
+          <div>
+            <h2 style={{
+              fontFamily: F.display, fontStyle: 'italic', fontWeight: 400,
+              fontSize: 22, margin: 0, color: C.text, letterSpacing: '-0.02em',
+            }}>{monthLabel}</h2>
+            <div style={{ display: 'flex', gap: 14, marginTop: 6 }}>
+              <div style={legendItem}><span style={legendDot(C.ice)} />Tasks</div>
+              <div style={legendItem}><span style={legendDot(C.coral)} />Overdue</div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+            <button onClick={() => stepMonth(-1)} style={navBtn}>
+              <ChevronLeft size={16} strokeWidth={1.5} />
+            </button>
+            <button onClick={goToday} style={{
+              ...navBtn, padding: '0 12px', width: 'auto', fontFamily: F.mono, fontSize: 11,
+            }}>TODAY</button>
+            <button onClick={() => stepMonth(1)} style={navBtn}>
+              <ChevronRight size={16} strokeWidth={1.5} />
+            </button>
+          </div>
+        </div>
+
+        <div style={{
+          display: 'grid', gridTemplateColumns: 'repeat(7, minmax(0, 1fr))', gap: 1,
+          background: C.border, border: `1px solid ${C.border}`,
+          borderRadius: 10, overflow: 'hidden',
+        }}>
+          {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((d, i) => (
+            <div key={i} style={{
+              background: C.bgGrain, padding: '6px 0', textAlign: 'center',
+              fontFamily: F.mono, fontSize: 10, color: C.textMuted, textTransform: 'uppercase',
+            }}>{d}</div>
+          ))}
+          {cells.map((d, i) => {
+            const todayCell = isToday(d);
+            const selectedCell = isSelected(d);
+            const dayTasks = tasksForDay(d);
+            const anyOverdue = dayTasks.some(isOverdue);
+            return (
+              <div key={i} onClick={d ? () => setSelectedDay(startOfDay(d)) : undefined} style={{
+                background: selectedCell ? `${C.ice}22` : C.surface,
+                minHeight: 48, padding: 4, opacity: d ? 1 : 0.3,
+                display: 'flex', flexDirection: 'column',
+                alignItems: 'center', justifyContent: 'center', gap: 3,
+                cursor: d ? 'pointer' : 'default',
+                boxShadow: selectedCell ? `inset 0 0 0 1.5px ${C.ice}` : 'none',
+              }}>
+                {d && (
+                  <>
+                    <div style={{
+                      fontFamily: F.mono, fontSize: 12, lineHeight: 1.4,
+                      color: todayCell ? (C.isLight ? '#fff' : C.bg) : C.textMuted,
+                      background: todayCell ? C.ice : 'transparent',
+                      borderRadius: 4, padding: todayCell ? '1px 5px' : '0',
+                      fontWeight: todayCell ? 600 : 400,
+                    }}>{d.getDate()}</div>
+                    <div style={{
+                      width: 6, height: 6, borderRadius: '50%',
+                      background: dayTasks.length ? (anyOverdue ? C.coral : C.ice) : 'transparent',
+                    }} />
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={{ marginTop: 18 }}>
+          <h3 style={{
+            fontFamily: F.display, fontStyle: 'italic', fontWeight: 400,
+            fontSize: 17, margin: '0 0 10px', color: C.text, letterSpacing: '-0.01em',
+          }}>{selLabel}</h3>
+          {selTasks.length ? (
+            <DayChips dayTasks={selTasks} dayEvents={[]} columns={columns}
+              onTaskClick={onTaskClick} max={Infinity} />
+          ) : (
+            <div style={{ fontFamily: F.body, fontSize: 13, color: C.textDim }}>No tasks due</div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ padding: 28 }}>
