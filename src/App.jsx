@@ -1036,7 +1036,7 @@ function FilterBar({ tags, filters, setFilters }) {
 /* ============================================================
    TASK CARD
    ============================================================ */
-function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, dropIndicator }) {
+function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, dropIndicator, onMoveRequest }) {
   const C = useTheme();
   const due = startOfDay(new Date(task.dueDate));
   const now = startOfDay(new Date());
@@ -1054,6 +1054,49 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
   const checklistDone = checklist.filter((c) => c.done).length;
   const hasChecklist = checklist.length > 0;
 
+  // Long-press → move (narrow board ONLY). These Pointer Event handlers attach only
+  // when BoardView passes onMoveRequest; Matrix and desktop omit it, so nothing is
+  // wired and tap/drag behave exactly as before. We never call preventDefault on
+  // move, so native horizontal-snap + vertical scrolling are untouched — we only
+  // watch displacement and bail if the finger is really scrolling.
+  const pressTimer = useRef(null);
+  const pressStart = useRef(null);
+  const clearPress = () => {
+    if (pressTimer.current) { clearTimeout(pressTimer.current); pressTimer.current = null; }
+  };
+  useEffect(() => () => clearPress(), []); // cancel a pending timer on unmount
+  const handlePointerDown = (e) => {
+    pressStart.current = { x: e.clientX, y: e.clientY };
+    clearPress();
+    pressTimer.current = setTimeout(() => {
+      pressTimer.current = null;
+      if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate(10);
+      // Swallow the single click the browser synthesizes from this same press so it
+      // neither re-opens the edit modal (click on the card) nor lands on the picker
+      // that's about to mount (click hit-tested onto the overlay). Capture-phase +
+      // once fires before React's handlers; the timeout removes it if, on some
+      // browser, no click is synthesized at all.
+      if (typeof document !== 'undefined') {
+        const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+        document.addEventListener('click', swallow, { capture: true, once: true });
+        setTimeout(() => document.removeEventListener('click', swallow, { capture: true }), 500);
+      }
+      onMoveRequest(task);
+    }, 450);
+  };
+  const handlePointerMove = (e) => {
+    if (!pressTimer.current || !pressStart.current) return;
+    // Past the slop → it's a scroll, not a press. Cancel; let the browser scroll.
+    if (Math.abs(e.clientX - pressStart.current.x) > 10 ||
+        Math.abs(e.clientY - pressStart.current.y) > 10) clearPress();
+  };
+  const pressHandlers = onMoveRequest ? {
+    onPointerDown: handlePointerDown,
+    onPointerMove: handlePointerMove,
+    onPointerUp: clearPress,
+    onPointerCancel: clearPress,
+  } : null;
+
   return (
     <div style={{ position: 'relative' }}>
       {dropIndicator && (
@@ -1065,6 +1108,7 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
       )}
       <div
         draggable
+        {...pressHandlers}
         onDragStart={(e) => onDragStart(e, task.id)}
         onDragOver={(e) => onDragOver(e, task.id)}
         onDrop={(e) => onDrop(e, task.id)}
@@ -1250,6 +1294,13 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
   const [draggedId, setDraggedId] = useState(null);
   const [dropTarget, setDropTarget] = useState(null);
 
+  // Long-press → column-picker move (narrow only). `moveTask` holds the card whose
+  // picker is open; selecting a column calls onMove({type:'col'}) — the SAME
+  // store.move the edit-modal Status <select> triggers (append to end of target
+  // column) — so we don't reinvent any move logic. Desktop never sets this (the
+  // long-press handler is only wired on narrow), so its native drag is untouched.
+  const [moveTask, setMoveTask] = useState(null);
+
   // --- Mobile page-indicator pips (narrow only) ---
   // Track which column is centered in the narrow snap-scroll strip so the pip row
   // can highlight it and tapping a pip can jump to it. Desktop renders every column
@@ -1382,6 +1433,7 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
                   onDrop={handleDropOnCard} onDragEnd={handleDragEnd}
                   isDragging={draggedId === t.id}
                   dropIndicator={dropTarget?.type === 'card' && dropTarget.id === t.id}
+                  onMoveRequest={narrow ? setMoveTask : undefined}
                 />
               ))}
               {isDropCol && (
@@ -1440,6 +1492,73 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
           })}
         </div>
       </div>
+    )}
+
+    {/* Column picker — narrow only. Long-pressing a board card opens this; it mirrors
+        the month/tag picker shell (backdrop + centered sheet, modal-tier z-index,
+        outside-tap + Done to dismiss). Tapping a different column calls onMove — the
+        same store.move the edit-modal Status <select> uses. */}
+    {narrow && moveTask && (
+      <>
+        <div onClick={() => setMoveTask(null)} style={{
+          position: 'fixed', inset: 0, background: C.modalBackdrop,
+          backdropFilter: 'blur(4px)', zIndex: 100,
+        }} />
+        <div style={{
+          position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+          width: 'min(340px, calc(100vw - 32px))', maxHeight: '70vh', overflowY: 'auto',
+          zIndex: 101, background: C.surface, border: `1px solid ${C.borderHi}`,
+          borderRadius: 12, padding: 16, boxShadow: C.shadow,
+        }}>
+          <div style={{ marginBottom: 14 }}>
+            <span style={{
+              fontFamily: F.mono, fontSize: 11, letterSpacing: '0.08em',
+              textTransform: 'uppercase', color: C.textMuted,
+            }}>Move to…</span>
+            <div style={{
+              fontFamily: F.body, fontSize: 14, fontWeight: 500, color: C.text,
+              marginTop: 6, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+            }}>“{moveTask.title}”</div>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {columns.map((col) => {
+              const current = col.id === moveTask.status;
+              return (
+                <button key={col.id}
+                  onClick={() => {
+                    if (!current) onMove(moveTask.id, { type: 'col', id: col.id });
+                    setMoveTask(null);
+                  }}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 10, width: '100%',
+                    padding: '12px 14px', borderRadius: 10, cursor: 'pointer', textAlign: 'left',
+                    background: current ? `${C[col.accentKey]}1a` : C.surfaceHi,
+                    border: current ? `1.5px solid ${C[col.accentKey]}` : `1px solid ${C.border}`,
+                    color: C.text,
+                  }}>
+                  <span style={{
+                    width: 9, height: 9, borderRadius: 2, flexShrink: 0,
+                    background: C[col.accentKey],
+                  }} />
+                  <span style={{
+                    flex: 1, fontFamily: F.body, fontSize: 14, fontWeight: 500,
+                    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                  }}>{col.label}</span>
+                  {current && <Check size={15} color={C[col.accentKey]} strokeWidth={2.5} />}
+                </button>
+              );
+            })}
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
+            <button onClick={() => setMoveTask(null)} style={{
+              padding: '6px 14px', borderRadius: 6, cursor: 'pointer',
+              fontFamily: F.mono, fontSize: 11, letterSpacing: '0.06em',
+              textTransform: 'uppercase', background: C.surfaceHi,
+              border: `1px solid ${C.border}`, color: C.text,
+            }}>Done</button>
+          </div>
+        </div>
+      </>
     )}
     </>
   );
