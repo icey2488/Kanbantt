@@ -2412,6 +2412,7 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
    ============================================================ */
 function MatrixView({ tasks, tags, onTaskClick, onClassify }) {
   const C = useTheme();
+  const narrow = useNarrow();
   const [draggedId, setDraggedId] = useState(null);
   const [dropTarget, setDropTarget] = useState(null);
 
@@ -2420,6 +2421,12 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify }) {
     tasks.forEach((t) => g[getQuadrant(t)].push(t));
     return g;
   }, [tasks]);
+
+  // Narrow-only: which bucket's card list renders below the compact map. Defaults to the
+  // first non-empty bucket in priority order, falling back to 'do'.
+  const [selectedQuadrant, setSelectedQuadrant] = useState(
+    () => ['do', 'plan', 'deprioritize', 'avoid', 'unsorted'].find((k) => groups[k].length > 0) || 'do',
+  );
 
   const handleDragStart = (e, taskId) => {
     setDraggedId(taskId);
@@ -2560,6 +2567,146 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify }) {
       </div>
     );
   };
+
+  // ── Narrow / mobile: a compact 2x2 quadrant map + the selected quadrant's card list,
+  // mirroring the Calendar's overview+detail pattern. Summary-only tiles (no cards inside),
+  // an Unsorted row below the grid, and the selected bucket's full-width TaskCards beneath.
+  // No drag here — HTML5 DnD is dead on touch, so reclassification happens via the edit
+  // modal (which exposes Effort/Impact selects). The desktop branch below is untouched. ──
+  if (narrow) {
+    const placeholderFor = (k) =>
+      k === 'avoid' ? 'nothing here, good' : k === 'unsorted' ? 'all classified' : '—';
+
+    // A tappable quadrant summary tile — icon, label, tagline, and zero-padded count in the
+    // quadrant's accent; selection gets an accent tint + inset ring (like the calendar day).
+    const tile = (k) => {
+      const def = QUADRANT_DEFS[k];
+      const accent = C[def.accentKey];
+      const Icon = def.Icon;
+      const active = selectedQuadrant === k;
+      return (
+        <button
+          key={k}
+          onClick={() => setSelectedQuadrant(k)}
+          style={{
+            textAlign: 'left', cursor: 'pointer',
+            background: active ? `${accent}28` : `${accent}${def.tintAlpha}`,
+            border: `1px solid ${active ? accent : C.border}`,
+            boxShadow: active ? `inset 0 0 0 1.5px ${accent}` : 'none',
+            borderRadius: 12, padding: 12, minHeight: 76,
+            display: 'flex', flexDirection: 'column', gap: 6,
+            transition: 'background 120ms ease, border-color 120ms ease, box-shadow 120ms ease',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Icon size={14} color={accent} strokeWidth={1.75} />
+            <span style={{
+              fontFamily: F.mono, fontSize: 11, color: accent,
+              letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 600,
+            }}>{def.label}</span>
+            <span style={{
+              marginLeft: 'auto', fontFamily: F.mono, fontSize: 13, fontWeight: 600,
+              color: accent, letterSpacing: '0.04em',
+            }}>{groups[k].length.toString().padStart(2, '0')}</span>
+          </div>
+          <span style={{
+            fontFamily: F.display, fontStyle: 'italic', fontSize: 12, color: C.textDim,
+          }}>{def.tagline}</span>
+        </button>
+      );
+    };
+
+    const selDef = selectedQuadrant === 'unsorted'
+      ? { label: 'Unsorted', tagline: 'not yet classified', accent: C.textMuted }
+      : {
+          label: QUADRANT_DEFS[selectedQuadrant].label,
+          tagline: QUADRANT_DEFS[selectedQuadrant].tagline,
+          accent: C[QUADRANT_DEFS[selectedQuadrant].accentKey],
+        };
+    const selCards = groups[selectedQuadrant];
+    const unsortedActive = selectedQuadrant === 'unsorted';
+
+    return (
+      <div style={{ padding: 14 }}>
+        <div style={{ marginBottom: 16 }}>
+          <h2 style={{
+            fontFamily: F.display, fontStyle: 'italic', fontWeight: 400, fontSize: 22,
+            margin: 0, color: C.text, letterSpacing: '-0.02em',
+          }}>Matrix</h2>
+          {/* Axis gutters would crush the tiles on a phone, so the axes live here as a hint;
+              the tiles' fixed positions + taglines carry the Effort×Impact meaning. */}
+          <div style={{
+            fontFamily: F.mono, fontSize: 10, color: C.textMuted,
+            letterSpacing: '0.18em', textTransform: 'uppercase', marginTop: 6,
+          }}>Effort ↑ × Impact →</div>
+        </div>
+
+        {/* Compact 2x2 map — spatial: top-left Avoid, top-right Plan, bottom-left
+            Deprioritize, bottom-right Do (same positions as the desktop grid). */}
+        <div style={{
+          display: 'grid', gridTemplateColumns: '1fr 1fr', gridTemplateRows: '1fr 1fr', gap: 8,
+        }}>
+          {tile('avoid')}
+          {tile('plan')}
+          {tile('deprioritize')}
+          {tile('do')}
+        </div>
+
+        {/* Unsorted — a separate tappable row below the 2x2 map (not part of the grid). */}
+        <button
+          onClick={() => setSelectedQuadrant('unsorted')}
+          style={{
+            marginTop: 8, width: '100%', textAlign: 'left', cursor: 'pointer',
+            display: 'flex', alignItems: 'center', gap: 10,
+            background: unsortedActive ? `${C.textMuted}22` : 'transparent',
+            border: `1px ${unsortedActive ? 'solid' : 'dashed'} ${unsortedActive ? C.textMuted : C.border}`,
+            boxShadow: unsortedActive ? `inset 0 0 0 1.5px ${C.textMuted}` : 'none',
+            borderRadius: 12, padding: '12px 14px', minHeight: 52,
+            transition: 'background 120ms ease, border-color 120ms ease, box-shadow 120ms ease',
+          }}
+        >
+          <span style={{
+            fontFamily: F.mono, fontSize: 11, color: C.text,
+            letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 600,
+          }}>Unsorted</span>
+          <span style={{
+            fontFamily: F.display, fontStyle: 'italic', fontSize: 12, color: C.textDim,
+          }}>not yet classified</span>
+          <span style={{
+            marginLeft: 'auto', fontFamily: F.mono, fontSize: 13, fontWeight: 600,
+            color: C.textMuted, letterSpacing: '0.04em',
+          }}>{groups.unsorted.length.toString().padStart(2, '0')}</span>
+        </button>
+
+        {/* Selected-quadrant detail: header (label · tagline · count) + full-width cards. */}
+        <div style={{ marginTop: 20 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 12 }}>
+            <span style={{
+              fontFamily: F.mono, fontSize: 11, color: selDef.accent,
+              letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 600,
+            }}>{selDef.label}</span>
+            <span style={{
+              fontFamily: F.display, fontStyle: 'italic', fontSize: 12, color: C.textDim,
+            }}>{selDef.tagline}</span>
+            <span style={{
+              marginLeft: 'auto', fontFamily: F.mono, fontSize: 10, color: C.textDim,
+              letterSpacing: '0.05em',
+            }}>{selCards.length.toString().padStart(2, '0')}</span>
+          </div>
+          {selCards.length > 0 ? (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 10 }}>
+              {renderCards(selCards)}
+            </div>
+          ) : (
+            <div style={{
+              padding: '24px 0', textAlign: 'center', fontFamily: F.display,
+              fontStyle: 'italic', fontSize: 13, color: C.textDim, opacity: 0.7,
+            }}>{placeholderFor(selectedQuadrant)}</div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   const unsortedDrop = dropTarget === 'unsorted';
 
