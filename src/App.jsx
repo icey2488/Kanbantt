@@ -1151,6 +1151,51 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
   const [draggedId, setDraggedId] = useState(null);
   const [dropTarget, setDropTarget] = useState(null);
 
+  // --- Mobile page-indicator pips (narrow only) ---
+  // Track which column is centered in the narrow snap-scroll strip so the pip row
+  // can highlight it and tapping a pip can jump to it. Desktop renders every column
+  // in a grid, so none of this affects it.
+  const scrollRef = useRef(null);
+  const rafRef = useRef(0);
+  const [activeCol, setActiveCol] = useState(0);
+  const showPips = narrow && columns.length >= 2;
+
+  // Column stride = first column's measured width + the 14px flex gap. Measured
+  // (not recomputed from 85vw) so it survives orientation / safe-area changes.
+  const colStride = () => {
+    const first = scrollRef.current?.firstElementChild;
+    return first ? first.offsetWidth + 14 : 0;
+  };
+
+  // Throttle scroll work with rAF; active index = scrollLeft / stride, clamped.
+  const handleBoardScroll = () => {
+    if (rafRef.current) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = 0;
+      const el = scrollRef.current;
+      const stride = colStride();
+      if (!el || !stride) return;
+      const idx = Math.max(0, Math.min(columns.length - 1, Math.round(el.scrollLeft / stride)));
+      setActiveCol((prev) => (prev === idx ? prev : idx));
+    });
+  };
+
+  const scrollToCol = (i) => {
+    const el = scrollRef.current;
+    const stride = colStride();
+    if (!el || !stride) return;
+    const reduce = typeof window !== 'undefined' && window.matchMedia
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    el.scrollTo({ left: i * stride, behavior: reduce ? 'auto' : 'smooth' });
+  };
+
+  // Keep the active index in range when the column count shrinks (e.g. filtering),
+  // and cancel any pending rAF on unmount.
+  useEffect(() => {
+    setActiveCol((prev) => Math.min(prev, Math.max(0, columns.length - 1)));
+  }, [columns.length]);
+  useEffect(() => () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); }, []);
+
   const handleDragStart = (e, taskId) => {
     setDraggedId(taskId);
     e.dataTransfer.effectAllowed = 'move';
@@ -1179,7 +1224,8 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
   };
 
   return (
-    <div style={narrow ? {
+    <>
+    <div ref={scrollRef} onScroll={narrow ? handleBoardScroll : undefined} style={narrow ? {
       // Narrow: horizontal snap-scroll strip; height grows naturally so only the
       // columns scroll sideways and the page still scrolls vertically.
       display: 'flex', flexWrap: 'nowrap', overflowX: 'auto', overflowY: 'visible',
@@ -1188,7 +1234,11 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
       paddingTop: 16,
       paddingLeft: 'max(16px, env(safe-area-inset-left))',
       paddingRight: 'max(16px, env(safe-area-inset-right))',
-      paddingBottom: 'calc(16px + env(safe-area-inset-bottom))',
+      // Extra bottom clearance (~40px pip-bar height) so the last card / QuickAdd
+      // is not hidden behind the fixed pip row — only when the pips are shown.
+      paddingBottom: showPips
+        ? 'calc(56px + env(safe-area-inset-bottom))'
+        : 'calc(16px + env(safe-area-inset-bottom))',
       minHeight: 'calc(100vh - 67px - 53px)',
     } : {
       padding: '24px 28px',
@@ -1249,6 +1299,50 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
         );
       })}
     </div>
+
+    {/* Page-indicator pips — narrow only, ≥2 columns. Fixed at the viewport bottom
+        (z:5: above board cards, below the header z:10 and modals z:100). One dot per
+        column; the active dot tracks the snap-scroll position and is tappable to jump. */}
+    {showPips && (
+      <div style={{
+        position: 'fixed', left: 0, right: 0,
+        bottom: 'calc(12px + env(safe-area-inset-bottom))',
+        display: 'flex', justifyContent: 'center',
+        zIndex: 5, pointerEvents: 'none',
+      }}>
+        <div style={{
+          display: 'flex', alignItems: 'center',
+          padding: '0 6px', borderRadius: 999,
+          // Faint pill + blur keeps the dots legible over cards; kept light.
+          background: `${C.surface}b3`,
+          backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)',
+          border: `1px solid ${C.border}`,
+          boxShadow: C.shadow, pointerEvents: 'auto',
+        }}>
+          {columns.map((col, i) => {
+            const active = i === activeCol;
+            return (
+              <button key={col.id} onClick={() => scrollToCol(i)}
+                aria-label={`Go to ${col.label}`}
+                style={{
+                  border: 'none', background: 'transparent', cursor: 'pointer',
+                  padding: 0, margin: 0, width: 40, height: 40,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  WebkitTapHighlightColor: 'transparent',
+                }}>
+                <span style={{
+                  width: 7, height: 7, borderRadius: 999,
+                  background: active ? C.ice : C.textDim,
+                  opacity: active ? 1 : 0.45,
+                  transition: 'background 160ms ease, opacity 160ms ease',
+                }} />
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    )}
+    </>
   );
 }
 
