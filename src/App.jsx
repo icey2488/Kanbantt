@@ -4057,17 +4057,25 @@ export default function App() {
   // delete). The app no longer computes replacement columns/tags arrays itself;
   // it only mints ids and picks the next accent/hue (UI palette concerns) before
   // handing the change to the store.
-  const createTag = (tag) => store.tagCreate(tag);
+  const createTag = (tag) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
+    store.tagCreate(tag);
+  };
 
   const addColumn = (label) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
     const trimmed = label.trim();
     if (!trimmed) return;
     const id = `col-${uid('').slice(2, 8)}`;
     const accentKey = COLUMN_ACCENTS[columns.length % COLUMN_ACCENTS.length];
     store.columnCreate({ id, label: trimmed, accentKey });
   };
-  const renameColumn = (id, label) => store.columnUpdate(id, { label });
+  const renameColumn = (id, label) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
+    store.columnUpdate(id, { label });
+  };
   const recolorColumn = (id, accentKey) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
     // Explicit accent from the palette picker; fall back to cycling when omitted.
     let next = accentKey;
     if (!next || !COLUMN_ACCENTS.includes(next)) {
@@ -4078,12 +4086,14 @@ export default function App() {
     store.columnUpdate(id, { accentKey: next });
   };
   const reorderColumn = (id, direction) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
     const idx = columns.findIndex((c) => c.id === id);
     const target = idx + direction;
     if (idx < 0 || target < 0 || target >= columns.length) return;
     store.columnReorder(id, target);
   };
   const deleteColumn = (id) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
     // Guard mirrors the disabled delete control: the last column can't be deleted,
     // and we never call with a null destination. The store moves orphaned cards.
     if (columns.length <= 1) return;
@@ -4091,8 +4101,12 @@ export default function App() {
     store.columnDelete(id, fallback);
   };
 
-  const renameTag = (id, name) => store.tagUpdate(id, { name });
+  const renameTag = (id, name) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
+    store.tagUpdate(id, { name });
+  };
   const recolorTag = (id, color) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
     // Explicit hue from the palette picker; fall back to cycling when omitted.
     let next = color;
     if (!next || !TAG_PALETTE[next]) {
@@ -4102,8 +4116,12 @@ export default function App() {
     }
     store.tagUpdate(id, { color: next });
   };
-  const deleteTag = (id) => store.tagDelete(id); // store strips refs (live + tombstoned)
+  const deleteTag = (id) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
+    store.tagDelete(id); // store strips refs (live + tombstoned)
+  };
   const addTag = (name) => {
+    if (mcpActive) { surface(READONLY_MSG); return; }
     const trimmed = name.trim();
     if (!trimmed) return;
     const id = `tag-${uid('').slice(2, 8)}`;
