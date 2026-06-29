@@ -1056,6 +1056,10 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
   const checklist = task.checklist || [];
   const checklistDone = checklist.filter((c) => c.done).length;
   const hasChecklist = checklist.length > 0;
+  // E1: a live unresolved escalation on this card (from card_list's per-card
+  // badge). Gated PURELY on the badge data — NOT featureFlags.escalations (display
+  // is decoupled from the list/resolve tools). Display only; nothing acts on it.
+  const escalated = task.badge && task.badge.kind === 'escalation';
 
   // Long-press → move (narrow board ONLY). These Pointer Event handlers attach only
   // when BoardView passes onMoveRequest; Matrix and desktop omit it, so nothing is
@@ -1139,13 +1143,36 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
           e.currentTarget.style.transform = 'translateY(0)';
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 8 }}>
-          <div style={{
-            width: 6, height: 6, borderRadius: '50%',
-            background: priorityColor, marginTop: 7, flexShrink: 0,
-          }} />
-          <div style={{ fontSize: 14, fontWeight: 500, color: C.text, lineHeight: 1.4 }}>
-            {task.title}
+        <div style={{ marginBottom: 8 }}>
+          {escalated && (
+            // Escalation badge (E1, display-only): an active block that needs a
+            // human. Amber AlertTriangle pill — deliberately NOT the `◆` diamond
+            // used for overdue/tier, so "needs human" never reads as a tier marker.
+            // Sits on its own row above the title, left-aligned, so the title can
+            // use the full card width below it.
+            <span
+              title={`Escalation — ${task.badge.reason || 'needs human review'}`}
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 4,
+                marginBottom: 6,
+                padding: '2px 6px', borderRadius: 5,
+                background: `${C.amber}1f`, border: `1px solid ${C.amber}66`,
+                color: C.amber, fontFamily: F.mono, fontSize: 9, fontWeight: 700,
+                letterSpacing: '0.08em', textTransform: 'uppercase',
+              }}
+            >
+              <AlertTriangle size={10} strokeWidth={2.25} />
+              Escalated
+            </span>
+          )}
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+            <div style={{
+              width: 6, height: 6, borderRadius: '50%',
+              background: priorityColor, marginTop: 7, flexShrink: 0,
+            }} />
+            <div style={{ fontSize: 14, fontWeight: 500, color: C.text, lineHeight: 1.4 }}>
+              {task.title}
+            </div>
           </div>
         </div>
         {task.description && (
@@ -2294,6 +2321,14 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
     fontFamily: F.body, fontSize: 14, boxSizing: 'border-box', outline: 'none',
   };
 
+  // E1 escalation detail (display-only). Gated PURELY on the badge's presence in
+  // the card data (card_list always supplies it) — NOT on featureFlags.escalations
+  // (that gates the list+resolve tools, which we deliberately don't require for
+  // display) and NOT on readOnly. Read from the `task` prop, never the editable
+  // `draft`: it's a read-only authorization artifact, not a task field. There is
+  // no resolve affordance here — acting on the block is a later slice.
+  const escalation = task.badge && task.badge.kind === 'escalation' ? task.badge : null;
+
   const toggleTag = (tagId) => {
     const has = (draft.tags || []).includes(tagId);
     setDraft({
@@ -2359,6 +2394,63 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
             <X size={18} strokeWidth={1.5} />
           </button>
         </div>
+
+        {/* Escalation detail (E1, display-only). Rendered OUTSIDE the fieldset
+            below — it carries no controls, so it must never be inerted, and it is
+            never a write path. No resolve affordance: surfacing the block is this
+            slice; acting on it is a later one. */}
+        {escalation && (
+          <div style={{
+            marginBottom: 22, padding: 14,
+            background: `${C.amber}12`, border: `1px solid ${C.amber}55`,
+            borderRadius: 10,
+          }}>
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 7, marginBottom: 12,
+              fontFamily: F.mono, fontSize: 10, color: C.amber, fontWeight: 700,
+              letterSpacing: '0.12em', textTransform: 'uppercase',
+            }}>
+              <AlertTriangle size={13} strokeWidth={2} />
+              Escalation — needs human review
+            </div>
+            <div style={fieldLabel}>Reason</div>
+            <div style={{
+              fontFamily: F.body, fontSize: 13, color: C.text,
+              lineHeight: 1.5, marginBottom: 16,
+            }}>
+              {escalation.reason || '—'}
+            </div>
+            <div style={fieldLabel}>Control diff (authorization artifact)</div>
+            {/*
+              control_diff is the authorization artifact and MUST be shown verbatim:
+              the literal unified-diff text, line for line. We only colorize whole
+              lines (added / removed / context) — we never parse it into a key/value
+              or side-by-side view. A parsed view is a lossy, derived layer, and on
+              an approval surface a lossy view of what is being authorized is unsafe.
+            */}
+            <pre style={{
+              margin: 0, marginTop: 4, padding: 12,
+              background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7,
+              fontFamily: F.mono, fontSize: 12, lineHeight: 1.5,
+              whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+              maxHeight: 280, overflowY: 'auto',
+            }}>
+              {String(escalation.control_diff || '').split('\n').map((line, i) => {
+                // Whole-line classification only; the literal text is rendered as-is.
+                // `+++`/`---` file headers stay neutral (they aren't content edits).
+                const added = line.startsWith('+') && !line.startsWith('+++');
+                const removed = line.startsWith('-') && !line.startsWith('---');
+                const color = added ? C.mint : removed ? C.coral : C.textMuted;
+                const bg = added ? `${C.mint}14` : removed ? `${C.coral}14` : 'transparent';
+                return (
+                  <span key={i} style={{ display: 'block', minHeight: '1.5em', color, background: bg }}>
+                    {line}
+                  </span>
+                );
+              })}
+            </pre>
+          </div>
+        )}
 
         {/* Read-only viewer: a disabled fieldset natively inerts every control in
             the body (inputs, selects, tag/checklist toggles, the create-tag flow);
@@ -3834,6 +3926,13 @@ export default function App() {
         priority: c.priority || 'med',
         tags: c.tags || [],
         checklist: c.checklist || [],
+        // E1 escalation display: card_list attaches a per-card escalation badge
+        // ({ kind:'escalation', id, reason, control_diff }) or null. The `...c`
+        // spread above already carries it, but enumerate it explicitly — the card
+        // and modal now consume `task.badge`, so this keeps the contract legible
+        // (and robust if the spread is ever narrowed). Display only; the board
+        // never resolves or clears it here.
+        badge: c.badge || null,
       }));
   }, [spineModel]);
   const activeColumns = mcpActive ? spineModel.columns : columns;
