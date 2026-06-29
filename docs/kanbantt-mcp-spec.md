@@ -152,6 +152,16 @@ There is no custom capabilities endpoint. Standard MCP mechanisms only:
 
 Connection flow and indicators (`Local`, `MCP: <name>`, `Local (MCP unavailable)` with retry) carry over from v0.1.0 unchanged.
 
+### Read-Only Servers (a first-class connection state)
+
+A server advertising the read surface (`board_get` + `card_list`) but **not** the four `card_*` write tools is a valid, fully supported backend — not a failed connection. Kanbantt connects, polls, and renders a **read-only mirror**; the connection indicator reads `MCP: <name> (read-only)`.
+
+- **Required for a viable connection:** `board_get` + `card_list`. A server missing either is genuinely unusable (no board to render) and connection fails as incompatible.
+- **Write affordances are feature-gated on the four `card_*` write tools** — `card_create`, `card_update`, `card_move`, `card_delete`, treated as a set. All four advertised ⇒ writes enabled (`canWrite`); any absent ⇒ the board is read-only: drag is disabled at the source (`draggable=false`), and add/edit/delete controls are suppressed. This is the same rule the column-mutation and escalation tools already follow above.
+- **Capability is detected from `tools/list`, never assumed.** A client MUST gate writes on advertised tool names, not on connection success.
+
+(The Required Tools table below lists the `card_*` tools because a *fully writable* backend needs them; their absence gates writes off per the rule here, it does not block the connection. This is Design Principle 5 — degrade by capability, never silently — applied to the card surface.)
+
 ---
 
 ## Tool Contract (v1)

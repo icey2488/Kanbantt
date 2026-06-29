@@ -711,7 +711,7 @@ function CollisionDialog({ onResolve, busy }) {
   );
 }
 
-function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTask, onOpenSettings, theme, setTheme, syncEnabled, syncStatus, onSyncNow, onReconnect, spineState }) {
+function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTask, onOpenSettings, theme, setTheme, syncEnabled, syncStatus, onSyncNow, onReconnect, spineState, readOnly }) {
   const C = useTheme();
   const narrow = useNarrow();
   const tabs = [
@@ -786,6 +786,8 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
         }} title="Settings">
           <Settings size={15} strokeWidth={1.5} />
         </button>
+        {/* New task is a write — hidden on a read-only spine mirror (canWrite false). */}
+        {!readOnly && (
         <button onClick={onNewTask} title="New task" aria-label="New task" style={{
           display: 'flex', alignItems: 'center', gap: narrow ? 0 : 6,
           padding: '8px 14px', background: C.ice,
@@ -802,6 +804,7 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
           <Plus size={14} strokeWidth={2.5} />
           {!narrow && 'New'}
         </button>
+        )}
         {user ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <div style={{
@@ -1036,7 +1039,7 @@ function FilterBar({ tags, filters, setFilters }) {
 /* ============================================================
    TASK CARD
    ============================================================ */
-function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, dropIndicator, onMoveRequest }) {
+function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, dropIndicator, onMoveRequest, readOnly }) {
   const C = useTheme();
   const due = startOfDay(new Date(task.dueDate));
   const now = startOfDay(new Date());
@@ -1090,7 +1093,7 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
     if (Math.abs(e.clientX - pressStart.current.x) > 10 ||
         Math.abs(e.clientY - pressStart.current.y) > 10) clearPress();
   };
-  const pressHandlers = onMoveRequest ? {
+  const pressHandlers = (onMoveRequest && !readOnly) ? {
     onPointerDown: handlePointerDown,
     onPointerMove: handlePointerMove,
     onPointerUp: clearPress,
@@ -1107,17 +1110,22 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
         }} />
       )}
       <div
-        draggable
+        // Read-only mirror: kill native drag at the ATTRIBUTE level — a dragstart
+        // fires off draggable="true" regardless of whether any drop target exists,
+        // so leaving it on would still kick the drag machinery (ghost/throw) on a
+        // card-whitespace drag or a rubber-banded text selection. Handlers are also
+        // no-op'd as belt-and-suspenders. onClick stays (opens the read-only viewer).
+        draggable={!readOnly}
         {...pressHandlers}
-        onDragStart={(e) => onDragStart(e, task.id)}
-        onDragOver={(e) => onDragOver(e, task.id)}
-        onDrop={(e) => onDrop(e, task.id)}
-        onDragEnd={onDragEnd}
+        onDragStart={readOnly ? undefined : (e) => onDragStart(e, task.id)}
+        onDragOver={readOnly ? undefined : (e) => onDragOver(e, task.id)}
+        onDrop={readOnly ? undefined : (e) => onDrop(e, task.id)}
+        onDragEnd={readOnly ? undefined : onDragEnd}
         onClick={() => onClick(task)}
         style={{
           background: C.surface,
           border: `${overdue ? '1.5px' : '1px'} solid ${overdue ? C.coral : C.border}`,
-          borderRadius: 10, padding: 14, cursor: 'grab',
+          borderRadius: 10, padding: 14, cursor: readOnly ? 'pointer' : 'grab',
           transition: 'all 140ms ease',
           opacity: isDragging ? 0.35 : 1,
           boxShadow: overdue ? `0 0 0 1px ${C.coral}20, 0 4px 12px -4px ${C.coral}30` : 'none',
@@ -1288,7 +1296,7 @@ function QuickAdd({ colId, onAdd }) {
 /* ============================================================
    BOARD VIEW
    ============================================================ */
-function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
+function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, readOnly }) {
   const C = useTheme();
   const narrow = useNarrow();
   const [draggedId, setDraggedId] = useState(null);
@@ -1361,10 +1369,12 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
     setDraggedId(null); setDropTarget(null);
   };
   const handleDragOverColumn = (e, colId) => {
+    if (readOnly) return;
     e.preventDefault();
     setDropTarget({ type: 'col', id: colId });
   };
   const handleDropOnColumn = (e, colId) => {
+    if (readOnly) return;
     e.preventDefault();
     if (draggedId) onMove(draggedId, { type: 'col', id: colId });
     setDraggedId(null); setDropTarget(null);
@@ -1433,7 +1443,8 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
                   onDrop={handleDropOnCard} onDragEnd={handleDragEnd}
                   isDragging={draggedId === t.id}
                   dropIndicator={dropTarget?.type === 'card' && dropTarget.id === t.id}
-                  onMoveRequest={narrow ? setMoveTask : undefined}
+                  onMoveRequest={(narrow && !readOnly) ? setMoveTask : undefined}
+                  readOnly={readOnly}
                 />
               ))}
               {isDropCol && (
@@ -1444,7 +1455,7 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
                   boxShadow: `0 0 8px ${C.ice}`,
                 }} />
               )}
-              <QuickAdd colId={col.id} onAdd={onQuickAdd} />
+              {!readOnly && <QuickAdd colId={col.id} onAdd={onQuickAdd} />}
             </div>
           </div>
         );
@@ -1498,7 +1509,7 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd }) {
         the month/tag picker shell (backdrop + centered sheet, modal-tier z-index,
         outside-tap + Done to dismiss). Tapping a different column calls onMove — the
         same store.move the edit-modal Status <select> uses. */}
-    {narrow && moveTask && (
+    {narrow && !readOnly && moveTask && (
       <>
         <div onClick={() => setMoveTask(null)} style={{
           position: 'fixed', inset: 0, background: C.modalBackdrop,
@@ -2264,7 +2275,7 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
 /* ============================================================
    TASK MODAL
    ============================================================ */
-function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCreateTag }) {
+function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCreateTag, readOnly }) {
   const C = useTheme();
   const [draft, setDraft] = useState(task);
   const [newTagInput, setNewTagInput] = useState(false);
@@ -2340,7 +2351,7 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
           <div style={{
             fontFamily: F.mono, fontSize: 11, color: C.textMuted,
             letterSpacing: '0.15em', textTransform: 'uppercase',
-          }}>{isNew ? 'New task' : 'Edit task'}</div>
+          }}>{isNew ? 'New task' : (readOnly ? 'View task' : 'Edit task')}</div>
           <button onClick={onClose} style={{
             background: 'transparent', border: 'none', color: C.textMuted,
             cursor: 'pointer', padding: 4,
@@ -2349,7 +2360,14 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
           </button>
         </div>
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+        {/* Read-only viewer: a disabled fieldset natively inerts every control in
+            the body (inputs, selects, tag/checklist toggles, the create-tag flow);
+            the footer Save/Delete are hidden below so there is no commit path. */}
+        <fieldset disabled={readOnly} style={{
+          display: 'flex', flexDirection: 'column', gap: 18,
+          border: 'none', margin: 0, padding: 0, minInlineSize: 0,
+          opacity: readOnly ? 0.85 : 1,
+        }}>
           <div>
             <label style={fieldLabel}>Title</label>
             <input autoFocus type="text" value={draft.title}
@@ -2535,14 +2553,14 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
               </div>
             </div>
           </div>
-        </div>
+        </fieldset>
 
         <div style={{
           display: 'flex', justifyContent: 'space-between',
           alignItems: 'center', marginTop: 24,
           paddingTop: 18, borderTop: `1px solid ${C.border}`,
         }}>
-          {!isNew ? (
+          {(!isNew && !readOnly) ? (
             <button onClick={() => onDelete(draft.id)} style={{
               background: 'transparent', border: `1px solid ${C.border}`,
               color: C.coral, padding: '9px 12px', borderRadius: 7,
@@ -2558,13 +2576,15 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
               background: 'transparent', border: `1px solid ${C.border}`,
               color: C.textMuted, padding: '9px 16px', borderRadius: 7,
               cursor: 'pointer', fontFamily: F.body, fontSize: 13,
-            }}>Cancel</button>
+            }}>{readOnly ? 'Close' : 'Cancel'}</button>
+            {!readOnly && (
             <button onClick={() => onSave(draft)} style={{
               background: C.ice, border: 'none',
               color: C.isLight ? '#fff' : C.bg,
               padding: '9px 18px', borderRadius: 7, cursor: 'pointer',
               fontFamily: F.body, fontSize: 13, fontWeight: 600,
             }}>Save</button>
+            )}
           </div>
         </div>
       </div>
@@ -2575,7 +2595,7 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
 /* ============================================================
    MATRIX VIEW (2x2 effort/impact prioritization)
    ============================================================ */
-function MatrixView({ tasks, tags, onTaskClick, onClassify }) {
+function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly }) {
   const C = useTheme();
   const narrow = useNarrow();
   const [draggedId, setDraggedId] = useState(null);
@@ -2594,16 +2614,19 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify }) {
   );
 
   const handleDragStart = (e, taskId) => {
+    if (readOnly) return;
     setDraggedId(taskId);
     e.dataTransfer.effectAllowed = 'move';
   };
 
   const handleDragOver = (e, target) => {
+    if (readOnly) return;
     e.preventDefault();
     if (dropTarget !== target) setDropTarget(target);
   };
 
   const handleDrop = (e, target) => {
+    if (readOnly) return;
     e.preventDefault();
     if (!draggedId) return;
     if (target === 'unsorted') {
@@ -2634,6 +2657,7 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify }) {
         onDragEnd={handleDragEnd}
         isDragging={draggedId === t.id}
         dropIndicator={false}
+        readOnly={readOnly}
       />
     ));
 
@@ -3158,7 +3182,7 @@ function SettingsModal({
   columns, tags, tasks, user, onSignOut, onConnect, gisStatus, lastSync, onClose,
   syncEnabled, onToggleSync, syncStatus, onSyncNow,
   onAddColumn, onRenameColumn, onRecolorColumn, onReorderColumn, onDeleteColumn,
-  onAddTag, onRenameTag, onRecolorTag, onDeleteTag,
+  onAddTag, onRenameTag, onRecolorTag, onDeleteTag, readOnly,
 }) {
   const C = useTheme();
   const [tab, setTab] = useState('columns');
@@ -3209,6 +3233,15 @@ function SettingsModal({
   const helperText = {
     fontFamily: F.mono, fontSize: 10, color: C.textDim,
     letterSpacing: '0.05em', lineHeight: 1.6, marginTop: 2,
+  };
+  // Read-only spine mirror (canWrite false): a disabled fieldset inerts the whole
+  // columns/tags editor (inputs, swatch-picker buttons, reorder/delete, the add
+  // row) in one wrap while preserving the section's flex layout. The Account tab
+  // (sync / sign-out — device-local, not a board write) stays interactive.
+  const fieldsetReset = {
+    border: 'none', margin: 0, padding: 0, minInlineSize: 0,
+    display: 'flex', flexDirection: 'column', gap: 14,
+    opacity: readOnly ? 0.55 : 1,
   };
 
   return (
@@ -3287,7 +3320,7 @@ function SettingsModal({
           display: 'flex', flexDirection: 'column', gap: 14,
         }}>
           {tab === 'columns' && (
-            <>
+            <fieldset disabled={readOnly} style={fieldsetReset}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {columns.map((col, idx) => {
                   const count = columnCardCount(col.id);
@@ -3343,11 +3376,11 @@ function SettingsModal({
               <div style={helperText}>
                 Deleting a column moves its cards to the first remaining column. Last column can't be deleted.
               </div>
-            </>
+            </fieldset>
           )}
 
           {tab === 'tags' && (
-            <>
+            <fieldset disabled={readOnly} style={fieldsetReset}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {tags.map((tag) => {
                   const count = tagCardCount(tag.id);
@@ -3397,7 +3430,7 @@ function SettingsModal({
               <div style={helperText}>
                 Deleting a tag removes it from all cards. Renames apply instantly.
               </div>
-            </>
+            </fieldset>
           )}
 
           {tab === 'account' && (user ? (
@@ -3776,6 +3809,15 @@ export default function App() {
   // carry no board tags or dates, so map them to the view's task shape with
   // neutral display defaults (today's date keeps cards out of a false "overdue").
   const mcpActive = !!(spineState && spineState.provider === 'mcp' && spineModel);
+  // canWrite is capability-detected by the provider (all four card_* write tools
+  // advertised) and threaded through the connection state. A read-only spine
+  // (board_get + card_list only) connects fine but renders a read-only mirror:
+  // mcpReadOnly drives every write affordance below (drag, add/edit/delete). The
+  // store-mutating handlers stay gated on mcpActive (no MCP write-through path
+  // exists yet, so ANY live spine is read-only at the data layer — this also keeps
+  // a polled mirror from ever writing the local canonical store; see STEP 4).
+  const mcpCanWrite = !!(spineState && spineState.capabilities && spineState.capabilities.canWrite);
+  const mcpReadOnly = mcpActive && !mcpCanWrite;
   const spineTasks = useMemo(() => {
     if (!spineModel) return null;
     const today = iso(new Date());
@@ -3892,6 +3934,13 @@ export default function App() {
     import('./lib/mcp-connection.js')
       .then(({ createMcpConnectionFromConfig }) => {
         if (disposed) return;
+        // SPLIT-BRAIN GUARD: applyModel is setSpineModel — polled board_get/card_list
+        // snapshots land ONLY in transient React state, NEVER in the card store (the
+        // Local canonical in localStorage). Combined with every store-mutating handler
+        // short-circuiting on mcpActive, the local board is left byte-for-byte untouched
+        // while a spine is connected, so a later disconnected boot (or a boot with a
+        // writable token) can never mistake a stale read-only mirror for local truth.
+        // Do NOT route spineModel into the store.
         conn = createMcpConnectionFromConfig({ config, applyModel: setSpineModel });
         unsub = conn.subscribe((st) => {
           setSpineState(st);
@@ -4228,11 +4277,11 @@ export default function App() {
           theme={theme} setTheme={setTheme}
           syncEnabled={syncEnabled} syncStatus={syncStatus}
           onSyncNow={handleSyncNow} onReconnect={handleReconnect}
-          spineState={spineState} />
+          spineState={spineState} readOnly={mcpReadOnly} />
         <FilterBar tags={activeTags} filters={filters} setFilters={setFilters} />
         {view === 'board' && (
           <BoardView tasks={filteredTasks} tags={activeTags} columns={activeColumns}
-            onTaskClick={openEdit} onMove={moveTask} onQuickAdd={quickAdd} />
+            onTaskClick={openEdit} onMove={moveTask} onQuickAdd={quickAdd} readOnly={mcpReadOnly} />
         )}
         {view === 'calendar' && (
           <CalendarView tasks={filteredTasks} events={events} columns={activeColumns} onTaskClick={openEdit} />
@@ -4242,12 +4291,12 @@ export default function App() {
         )}
         {view === 'matrix' && (
           <MatrixView tasks={filteredTasks} tags={activeTags}
-            onTaskClick={openEdit} onClassify={classifyTask} />
+            onTaskClick={openEdit} onClassify={classifyTask} readOnly={mcpReadOnly} />
         )}
         {editing && (
           <TaskModal task={editing} tags={activeTags} columns={activeColumns} isNew={isNew}
             onSave={saveTask} onDelete={deleteTask}
-            onClose={() => setEditing(null)} onCreateTag={createTag} />
+            onClose={() => setEditing(null)} onCreateTag={createTag} readOnly={mcpReadOnly} />
         )}
         {showSettings && (
           <SettingsModal columns={columns} tags={tags} tasks={tasks}
@@ -4261,7 +4310,7 @@ export default function App() {
             onAddTag={addTag} onRenameTag={renameTag}
             onRecolorTag={recolorTag} onDeleteTag={deleteTag}
             syncEnabled={syncEnabled} onToggleSync={setSyncEnabled}
-            syncStatus={syncStatus} onSyncNow={handleSyncNow} />
+            syncStatus={syncStatus} onSyncNow={handleSyncNow} readOnly={mcpReadOnly} />
         )}
         {driveSync && syncStatus === 'collision_pending' && (
           <CollisionDialog onResolve={handleResolveCollision} busy={collisionBusy} />

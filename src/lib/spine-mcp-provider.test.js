@@ -37,7 +37,9 @@ test('connect → initialize + tools/list; server name and capabilities from adv
   assert.equal(server.name, 'Claunker');
   assert.equal(server.schema_version, 1);
   assert.deepEqual(capabilities, {
-    projects: true, tasks: true, escalations: true, artifacts: true, columns: true, tags: true, realtime: false,
+    projects: true, tasks: true,
+    hasCardCreate: true, hasCardUpdate: true, hasCardMove: true, hasCardDelete: true, canWrite: true,
+    escalations: true, artifacts: true, columns: true, tags: true, realtime: false,
   });
   assert.equal(provider.supportsRealtime(), false, 'v1 is tools-only → board polls');
   assert.ok(provider.hasTool('card_move'));
@@ -53,12 +55,25 @@ test('capability gating: a server without escalation tools fails escalationList 
   await harness.close();
 });
 
-test('incompatible server (missing a required tool) → connect throws incompatible_server', async () => {
-  const harness = createMcpTestServer({ omitTools: ['card_move'] });
+test('a server missing a card_* write tool connects read-only (canWrite false), not incompatible', async () => {
+  // Option A: write tools are feature-gated, not connect blockers. A server with the
+  // read pair but only some card_* tools connects fine and renders a read-only mirror.
+  const { provider, harness } = await connected({ omitTools: ['card_move'] });
+  const { capabilities } = provider.getCapabilities();
+  assert.equal(capabilities.canWrite, false, 'missing card_move ⇒ writes gated off');
+  assert.equal(capabilities.hasCardMove, false);
+  assert.equal(capabilities.hasCardCreate, true, 'the other write tools are still detected');
+  assert.ok((await provider.list({ includeDeleted: false })).cards, 'the read surface still works');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('incompatible server (missing a REQUIRED read tool) → connect throws incompatible_server', async () => {
+  const harness = createMcpTestServer({ omitTools: ['card_list'] });
   const provider = createMCPProvider({ baseUrl: harness.url, fetchFn: harness.fetchFn });
   await assert.rejects(
     () => provider.connect(),
-    (e) => e instanceof MCPProviderError && e.code === 'incompatible_server' && e.meta.missing.includes('card_move'),
+    (e) => e instanceof MCPProviderError && e.code === 'incompatible_server' && e.meta.missing.includes('card_list'),
   );
   await harness.close();
 });

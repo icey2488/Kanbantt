@@ -48,9 +48,18 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
  *  server's; a major mismatch is refused, mirroring card-store.validateBlob). */
 const SUPPORTED_SCHEMA_VERSION = 1;
 
-/** Required tool set (spec §Tool Contract → Required Tools). A server missing
- *  any of these cannot back Kanbantt and fails connect() as incompatible. */
-const REQUIRED_TOOLS = ['board_get', 'card_list', 'card_create', 'card_update', 'card_move', 'card_delete'];
+/** Required tool set — the READ surface a server MUST advertise to back Kanbantt
+ *  at all (spec §Discovery → Required Tools). A server missing either is genuinely
+ *  unusable (no board to render) and fails connect() as incompatible. The card_*
+ *  WRITE tools are NOT required: a server advertising only the read pair is a valid,
+ *  first-class read-only backend — the board renders a read-only mirror and write
+ *  affordances are feature-gated on `capabilities.canWrite` (see WRITE_TOOLS). */
+const REQUIRED_TOOLS = ['board_get', 'card_list'];
+
+/** The four card-mutation tools. All four advertised ⇒ capabilities.canWrite is
+ *  true; any absent ⇒ the board is read-only against this server (writes gated off,
+ *  spec §Discovery: gate features on advertised tool NAMES, never assume). */
+const WRITE_TOOLS = ['card_create', 'card_update', 'card_move', 'card_delete'];
 
 /**
  * Provider-level error. `code` mirrors the board's contract: a stale write
@@ -209,10 +218,18 @@ export function createMCPProvider({
       // and tag tools gate as a set; absent ⇒ those edits stay local.
       capabilities = {
         // projects/tasks retained as `true` for the board's required-features
-        // check parity with the old indicator contract; cards+board are the
-        // real required surface and are guaranteed by REQUIRED_TOOLS above.
+        // check parity with the old indicator contract; board_get + card_list
+        // are the real required surface, enforced by REQUIRED_TOOLS above.
         projects: true,
         tasks: true,
+        // Per-tool write capability + the derived gate the board reads. canWrite
+        // is true ONLY when all four card_* mutation tools are advertised; any
+        // missing ⇒ read-only mirror (write affordances feature-gated off).
+        hasCardCreate: toolNames.has('card_create'),
+        hasCardUpdate: toolNames.has('card_update'),
+        hasCardMove: toolNames.has('card_move'),
+        hasCardDelete: toolNames.has('card_delete'),
+        canWrite: WRITE_TOOLS.every((t) => toolNames.has(t)),
         escalations: toolNames.has('escalation_list') && toolNames.has('escalation_resolve'),
         artifacts: toolNames.has('artifact_list'),
         columns: toolNames.has('column_create') && toolNames.has('column_update') && toolNames.has('column_delete'),

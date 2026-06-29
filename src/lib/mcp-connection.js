@@ -168,9 +168,16 @@ export function createMcpConnection({
       const res = await withTimeout(p.connect(), pingTimeoutMs, schedule, cancel);
       const caps = res.capabilities;
       provider = p;
+      // A server advertising the read pair but not all four card_* write tools is
+      // a valid read-only backend (caps.canWrite === false). Signal it in the
+      // indicator so the board chip reads "MCP: <name> (read-only)"; the board
+      // reads caps.canWrite (threaded via state.capabilities) to gate writes.
+      const indicator = caps.canWrite
+        ? mcpIndicator(res.server.name)
+        : `${mcpIndicator(res.server.name)} (read-only)`;
       state = {
         provider: 'mcp',
-        indicator: mcpIndicator(res.server.name),
+        indicator,
         fallback: false,
         server: res.server,
         capabilities: caps,
@@ -187,6 +194,7 @@ export function createMcpConnection({
       await startPolling();
       return getState();
     } catch (e) {
+      console.warn('MCP connect failed; degrading to Local:', (e && e.message) || e, e);
       // unreachable / incompatible / timeout → graceful degrade, never blank.
       setLocal(true, { code: e.code || 'unreachable', message: e.message });
       return getState();
