@@ -1454,10 +1454,19 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, read
               transition: 'background 120ms ease',
               ...(narrow ? { flex: '0 0 85vw', maxWidth: '85vw', scrollSnapAlign: 'start' } : {}),
             }}>
+            {/* Sticky column header: the board scrolls on the WINDOW (App root only
+                sets min-height; the grid/columns have no overflow), and Header (top:0,
+                ~67px) + FilterBar (top:67, ~53px) are window-sticky above it — so the
+                header pins at top:120, flush under the FilterBar, while its cards scroll
+                underneath. Solid C.bg (the board's own background, same token the
+                FilterBar uses, so the two blend when pinned) masks the scrolling cards;
+                z-index lifts it over the position:relative TaskCards, which as later DOM
+                siblings would otherwise paint on top. */}
             <div style={{
               display: 'flex', alignItems: 'center', justifyContent: 'space-between',
               paddingBottom: 12, paddingLeft: 6, paddingRight: 6,
               borderBottom: `1px solid ${C.border}`,
+              position: 'sticky', top: 120, zIndex: 2, background: C.bg,
             }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
                 <div style={{ width: 8, height: 8, borderRadius: 2, background: C[col.accentKey] }} />
