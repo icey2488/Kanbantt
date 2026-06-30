@@ -204,6 +204,149 @@ test('retry_after on a domain error is preserved across the boundary (any code)'
 });
 
 /* ================================================================== */
+/* Pass 2b: card write-through (cardUpdate / cardMove / cardDelete)     */
+/* ------------------------------------------------------------------- */
+/* The board-facing mutation surface, gated on canWrite. Mirrors        */
+/* escalationResolve's structure; per spec §Concurrency expected_version */
+/* is REQUIRED, and a stale write surfaces code 'conflict' (meta.current)*/
+/* through the SAME boundary as update()/move()/delete() above.          */
+/* ================================================================== */
+
+test('cardUpdate sends a field-scoped patch + expected_version; returns the projected Card (Pass 2b)', async () => {
+  const { provider, harness } = await connected({ seed: oneCard });
+  const updated = await provider.cardUpdate('c1', { title: 'Renamed', acceptance_criteria: 'ship it', expected_version: 1 });
+  assert.equal(updated.title, 'Renamed');
+  assert.equal(updated.acceptance_criteria, 'ship it', 'acceptance_criteria round-trips in the Card');
+  assert.equal(updated.version, 2, 'server bumps the version');
+  assert.equal(updated.priority, 'med', 'a field NOT in the patch is untouched (field-scoped, no clobber)');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardMove sends column_id + order + expected_version; returns the repositioned Card (Pass 2b)', async () => {
+  const { provider, harness } = await connected({ seed: oneCard });
+  const moved = await provider.cardMove('c1', 'in_progress', { order: 'm', expected_version: 1 });
+  assert.equal(moved.column_id, 'in_progress', 'toState maps to the wire column_id');
+  assert.equal(moved.order, 'm', 'the client-minted LexoRank is forwarded verbatim');
+  assert.equal(moved.version, 2);
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardDelete sends expected_version and returns the id, not the tombstone Card (Pass 2b)', async () => {
+  const { provider, harness } = await connected({ seed: oneCard });
+  const result = await provider.cardDelete('c1', { expected_version: 1 });
+  assert.equal(result, 'c1', 'returns the id (the board only needs removal confirmation)');
+  assert.equal((await provider.list({ includeDeleted: false })).cards.length, 0, 'live list drops the card');
+  assert.equal((await provider.list({ includeDeleted: true })).cards.length, 1, 'tombstone retained');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('card write-through is gated on canWrite: a server missing a card_* tool rejects all three (Pass 2b)', async () => {
+  const { provider, harness } = await connected({ omitTools: ['card_move'], seed: oneCard });
+  assert.equal(provider.getCapabilities().capabilities.canWrite, false, 'missing card_move ⇒ canWrite false');
+  const unsupported = (e) => e instanceof MCPProviderError && e.code === 'unsupported_capability';
+  await assert.rejects(() => provider.cardUpdate('c1', { title: 'x', expected_version: 1 }), unsupported);
+  await assert.rejects(() => provider.cardMove('c1', 'in_progress', { order: 'm', expected_version: 1 }), unsupported);
+  await assert.rejects(() => provider.cardDelete('c1', { expected_version: 1 }), unsupported);
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('a stale card write surfaces code "conflict" with meta.current across all three (Pass 2b)', async () => {
+  const { provider, harness } = await connected({ seed: oneCard });
+  const conflict = (e) => e instanceof MCPProviderError && e.code === 'conflict'
+    && e.meta.current.id === 'c1' && e.meta.current.version === 1;
+  await assert.rejects(() => provider.cardUpdate('c1', { title: 'x', expected_version: 'STALE' }), conflict);
+  await assert.rejects(() => provider.cardMove('c1', 'in_progress', { order: 'm', expected_version: 'STALE' }), conflict);
+  await assert.rejects(() => provider.cardDelete('c1', { expected_version: 'STALE' }), conflict);
+  await provider.disconnect();
+  await harness.close();
+});
+
+/* ================================================================== */
+/* Pass 2b refinement: tier read-from-TAGS + write-to-TAGS at the seam  */
+/* ------------------------------------------------------------------- */
+/* The REAL spine has NO native `card.tier`: tier lives ONLY in `tags`   */
+/* as "tier:N" (projection.py). Kanbantt's internal model is the HYPHEN  */
+/* "tier-N". The provider is the ONLY translator: WRITE maps hyphen→colon*/
+/* (the spine folds it into tags); READ DERIVES the internal tier from   */
+/* the card's tags. The harness now MIRRORS the spine — tier in tags, no */
+/* native field — so these tests exercise the FULL realistic path and    */
+/* FAIL if toInternalCard ever reads a native field instead of tags.     */
+/* ================================================================== */
+
+/** Seed a tiered card the way the real spine stores it: tier as a "tier:N" TAG,
+ *  with NO native tier field (the field projection.py never emits). */
+const tieredCard = (s) => s.create({ id: 'c1', title: 'First', column_id: 'todo', priority: 'med', tags: ['tier:2'] });
+
+test('WRITE round-trip: cardUpdate "tier-N" → wire "tier:N" → stored as a tier TAG (no native field) → reads back "tier-N" (Pass 2b)', async () => {
+  const { provider, harness } = await connected({ seed: oneCard }); // starts untiered
+  const updated = await provider.cardUpdate('c1', { tier: 'tier-3', expected_version: 1 });
+  // The returned Card presents the internal hyphen form, DERIVED from its tags.
+  assert.equal(updated.tier, 'tier-3', 'returned Card presents internal hyphen tier');
+  assert.ok((updated.tags || []).includes('tier:3'), 'the colon tier tag rides in tags');
+  // What actually persisted on the spine: a "tier:3" TAG and NO native tier field.
+  const stored = harness.store.get('c1');
+  assert.ok((stored.tags || []).includes('tier:3'), 'persisted as a "tier:3" tag');
+  assert.equal(stored.tier, undefined, 'the spine has NO native tier field (tier rides in tags)');
+  // A fresh read over the wire confirms toInternalCard derives "tier-3" from the tag.
+  assert.equal((await provider.get('c1')).tier, 'tier-3', 'a fresh read derives tier from the tag');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('READ derives internal hyphen tier FROM TAGS across get + list; tags/native field untouched (Pass 2b)', async () => {
+  const { provider, harness } = await connected({ seed: tieredCard });
+  assert.equal((await provider.get('c1')).tier, 'tier-2', 'get() derives tier-2 from the tier:2 tag');
+  const listed = (await provider.list({ includeDeleted: false })).cards.find((c) => c.id === 'c1');
+  assert.equal(listed.tier, 'tier-2', 'list() derives tier-2 from the tier:2 tag');
+  assert.ok((listed.tags || []).includes('tier:2'), 'tags keep the colon tag (the badge renders off it)');
+  // The stored form is untouched: tag stays colon, no native tier field invented.
+  const stored = harness.store.get('c1');
+  assert.ok((stored.tags || []).includes('tier:2'), 'the stored tag stays colon');
+  assert.equal(stored.tier, undefined, 'no native tier field on the spine');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('untiered (no tier tag) reads back tier null — the value that engages tierLock (Pass 2b)', async () => {
+  const { provider, harness } = await connected({ seed: oneCard }); // no tier tag
+  assert.equal((await provider.get('c1')).tier, null, 'no tier tag ⇒ internal tier is null');
+  const listed = (await provider.list({ includeDeleted: false })).cards.find((c) => c.id === 'c1');
+  assert.equal(listed.tier, null, 'list() also presents null for an untiered card');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('a conflict carries meta.current with tier DERIVED FROM TAGS (snap-back parity, Pass 2b)', async () => {
+  const { provider, harness } = await connected({ seed: tieredCard });
+  await assert.rejects(
+    () => provider.cardUpdate('c1', { title: 'x', expected_version: 'STALE' }),
+    (e) => e instanceof MCPProviderError && e.code === 'conflict' && e.meta.current.tier === 'tier-2',
+  );
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('tier write is conservative: a non-tier update never invents a tier, and a null tier is OMITTED (Pass 2b)', async () => {
+  const { provider, harness } = await connected({ seed: oneCard }); // untiered
+  // An update that does not touch tier never adds a tier tag — derived tier stays null.
+  const renamed = await provider.cardUpdate('c1', { title: 'Renamed', expected_version: 1 });
+  assert.equal(renamed.tier, null, 'no tier tag added ⇒ derived tier null');
+  assert.ok(!(renamed.tags || []).some((t) => /^tier:/.test(t)), 'no tier tag on the card');
+  // A null tier is OMITTED from the wire patch (never sent as tier:null, which the
+  // spine's _patch_tier_to_int(None) would reject): it is a no-op, not an untier.
+  const nulled = await provider.cardUpdate('c1', { tier: null, expected_version: 2 });
+  assert.equal(nulled.tier, null, 'null tier ⇒ still untiered (null omitted, not sent)');
+  assert.ok(!(nulled.tags || []).some((t) => /^tier:/.test(t)), 'no tier tag minted from a null tier');
+  assert.equal(harness.store.get('c1').tier, undefined, 'no native tier field ever minted');
+  await provider.disconnect();
+  await harness.close();
+});
+
+/* ================================================================== */
 /* not-connected guard                                                 */
 /* ================================================================== */
 

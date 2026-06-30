@@ -711,7 +711,7 @@ function CollisionDialog({ onResolve, busy }) {
   );
 }
 
-function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTask, onOpenSettings, theme, setTheme, syncEnabled, syncStatus, onSyncNow, onReconnect, spineState, readOnly }) {
+function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTask, onOpenSettings, theme, setTheme, syncEnabled, syncStatus, onSyncNow, onReconnect, spineState, canCreate }) {
   const C = useTheme();
   const narrow = useNarrow();
   const tabs = [
@@ -786,8 +786,10 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
         }} title="Settings">
           <Settings size={15} strokeWidth={1.5} />
         </button>
-        {/* New task is a write — hidden on a read-only spine mirror (canWrite false). */}
-        {!readOnly && (
+        {/* New task is a create — shown only in local mode (canCreate). Hidden on
+            ANY live spine: a read-only mirror can't write, and MCP card_create is
+            deferred to the next slice (project-targeting). */}
+        {canCreate && (
         <button onClick={onNewTask} title="New task" aria-label="New task" style={{
           display: 'flex', alignItems: 'center', gap: narrow ? 0 : 6,
           padding: '8px 14px', background: C.ice,
@@ -1331,7 +1333,7 @@ function QuickAdd({ colId, onAdd }) {
 /* ============================================================
    BOARD VIEW
    ============================================================ */
-function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, readOnly }) {
+function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, readOnly, canCreate }) {
   const C = useTheme();
   const narrow = useNarrow();
   const [draggedId, setDraggedId] = useState(null);
@@ -1499,7 +1501,11 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, read
                   boxShadow: `0 0 8px ${C.ice}`,
                 }} />
               )}
-              {!readOnly && <QuickAdd colId={col.id} onAdd={onQuickAdd} />}
+              {/* Quick-add is a create — shown only in local mode (canCreate). On a
+                  writable spine, drag/edit/delete work but card_create is deferred,
+                  so the affordance is hidden (STEP 6), distinct from the readOnly
+                  drag gate above. */}
+              {canCreate && <QuickAdd colId={col.id} onAdd={onQuickAdd} />}
             </div>
           </div>
         );
@@ -2319,13 +2325,19 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
 /* ============================================================
    TASK MODAL
    ============================================================ */
-function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCreateTag, readOnly, canResolve, onResolveEscalation }) {
+function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCreateTag, readOnly, mcpWritable, canResolve, onResolveEscalation }) {
   const C = useTheme();
   const [draft, setDraft] = useState(task);
   const [newTagInput, setNewTagInput] = useState(false);
   const [newTagName, setNewTagName] = useState('');
   const [newChecklistText, setNewChecklistText] = useState('');
   const [notesPreview, setNotesPreview] = useState(false);
+  // Two-step delete confirm — the MCP-writable tombstone guard (a stray click must
+  // not delete a card). Only the MCP path arms it; local delete stays immediate.
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  // tier is WRITE-ONCE on the spine (settable while null; a non-null tier can't be
+  // changed). Lock the control once set so the user can't queue a doomed write.
+  const tierLocked = task.tier != null;
 
   const fieldLabel = {
     fontFamily: F.mono, fontSize: 10, color: C.textMuted,
@@ -2666,9 +2678,53 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
           </div>
         )}
 
-        {/* Read-only viewer: a disabled fieldset natively inerts every control in
-            the body (inputs, selects, tag/checklist toggles, the create-tag flow);
-            the footer Save/Delete are hidden below so there is no commit path. */}
+        {/* Body form, two shapes:
+            • MCP-writable (Pass 2b): ONLY the spine-Card fields that round-trip —
+              title, acceptance_criteria, write-once tier. No Status control (a
+              column change is a move via drag/long-press, never an update). Not
+              wrapped in `disabled` — this mode is writable.
+            • local / read-only mirror: the full task form inside a fieldset whose
+              disabled={readOnly} natively inerts every control for the read-only
+              viewer; the footer Save/Delete are hidden below so there's no commit. */}
+        {mcpWritable ? (
+          <fieldset style={{
+            display: 'flex', flexDirection: 'column', gap: 18,
+            border: 'none', margin: 0, padding: 0, minInlineSize: 0,
+          }}>
+            <div>
+              <label style={fieldLabel}>Title</label>
+              <input autoFocus type="text" value={draft.title}
+                onChange={(e) => setDraft({ ...draft, title: e.target.value })} style={input} />
+            </div>
+            <div>
+              <label style={fieldLabel}>Acceptance criteria</label>
+              <textarea value={draft.acceptance_criteria || ''}
+                onChange={(e) => setDraft({ ...draft, acceptance_criteria: e.target.value })}
+                placeholder="What must be true for this card to be done?"
+                style={{ ...input, minHeight: 80, resize: 'vertical', fontFamily: F.body, fontSize: 13 }} />
+            </div>
+            <div>
+              <label style={fieldLabel}>Tier{tierLocked ? ' · write-once (set)' : ''}</label>
+              {tierLocked ? (
+                // Already tiered → render the value read-only; the spine rejects a
+                // change (tier_write_once), so don't offer one.
+                <div style={{ ...input, color: C.textMuted, fontFamily: F.mono, display: 'flex', alignItems: 'center' }}>
+                  {draft.tier}
+                </div>
+              ) : (
+                <select value={draft.tier || ''}
+                  onChange={(e) => setDraft({ ...draft, tier: e.target.value || null })}
+                  style={{ ...input, cursor: 'pointer' }}>
+                  <option value="">— untiered</option>
+                  <option value="tier-1">tier-1</option>
+                  <option value="tier-2">tier-2</option>
+                  <option value="tier-3">tier-3</option>
+                  <option value="tier-4">tier-4</option>
+                </select>
+              )}
+            </div>
+          </fieldset>
+        ) : (
         <fieldset disabled={readOnly} style={{
           display: 'flex', flexDirection: 'column', gap: 18,
           border: 'none', margin: 0, padding: 0, minInlineSize: 0,
@@ -2860,6 +2916,7 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
             </div>
           </div>
         </fieldset>
+        )}
 
         <div style={{
           display: 'flex', justifyContent: 'space-between',
@@ -2867,15 +2924,34 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
           paddingTop: 18, borderTop: `1px solid ${C.border}`,
         }}>
           {(!isNew && !readOnly) ? (
-            <button onClick={() => onDelete(draft.id)} style={{
-              background: 'transparent', border: `1px solid ${C.border}`,
-              color: C.coral, padding: '9px 12px', borderRadius: 7,
-              cursor: 'pointer', display: 'flex', alignItems: 'center',
-              gap: 6, fontFamily: F.body, fontSize: 13,
-            }}>
-              <Trash2 size={14} strokeWidth={1.5} />
-              Delete
-            </button>
+            confirmDelete ? (
+              // Armed confirm (MCP-writable only): a stray click can't tombstone.
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ fontFamily: F.body, fontSize: 13, color: C.text }}>Delete this card?</span>
+                <button onClick={() => onDelete(draft.id)} style={{
+                  background: C.coral, border: 'none', color: C.isLight ? '#fff' : C.bg,
+                  padding: '9px 12px', borderRadius: 7, cursor: 'pointer',
+                  fontFamily: F.body, fontSize: 13, fontWeight: 600,
+                }}>Delete</button>
+                <button onClick={() => setConfirmDelete(false)} style={{
+                  background: 'transparent', border: `1px solid ${C.border}`, color: C.textMuted,
+                  padding: '9px 12px', borderRadius: 7, cursor: 'pointer',
+                  fontFamily: F.body, fontSize: 13,
+                }}>Keep</button>
+              </div>
+            ) : (
+              // First click: arm the confirm on the MCP path; delete immediately in
+              // local mode (existing behavior — local delete is unchanged).
+              <button onClick={() => (mcpWritable ? setConfirmDelete(true) : onDelete(draft.id))} style={{
+                background: 'transparent', border: `1px solid ${C.border}`,
+                color: C.coral, padding: '9px 12px', borderRadius: 7,
+                cursor: 'pointer', display: 'flex', alignItems: 'center',
+                gap: 6, fontFamily: F.body, fontSize: 13,
+              }}>
+                <Trash2 size={14} strokeWidth={1.5} />
+                Delete
+              </button>
+            )
           ) : <div />}
           <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={onClose} style={{
@@ -4119,14 +4195,19 @@ export default function App() {
   // neutral display defaults (today's date keeps cards out of a false "overdue").
   const mcpActive = !!(spineState && spineState.provider === 'mcp' && spineModel);
   // canWrite is capability-detected by the provider (all four card_* write tools
-  // advertised) and threaded through the connection state. A read-only spine
-  // (board_get + card_list only) connects fine but renders a read-only mirror:
-  // mcpReadOnly drives every write affordance below (drag, add/edit/delete). The
-  // store-mutating handlers stay gated on mcpActive (no MCP write-through path
-  // exists yet, so ANY live spine is read-only at the data layer — this also keeps
-  // a polled mirror from ever writing the local canonical store; see STEP 4).
+  // advertised) and threaded through the connection state. It splits a live spine
+  // into two modes that the write handlers below branch on:
+  //   mcpWritable (Pass 2b) — board writes (move/update/delete) route through the
+  //     provider and reconcile from the spine; they NEVER touch the local store.
+  //   mcpReadOnly — a read pair only (board_get + card_list); the board is a
+  //     read-only mirror and every write affordance is gated off (drag/edit/delete).
+  // SPLIT-BRAIN: in BOTH MCP modes the local canonical store is left untouched — a
+  // writable spine reconciles into transient React state (spineModel), so a later
+  // disconnected boot can never mistake a stale mirror for local truth (see the
+  // connection effect's guard). card_create stays deferred — see canCreate below.
   const mcpCanWrite = !!(spineState && spineState.capabilities && spineState.capabilities.canWrite);
   const mcpReadOnly = mcpActive && !mcpCanWrite;
+  const mcpWritable = mcpActive && mcpCanWrite;
   // canResolve gates the ONE permitted mutation in MCP mode (escalation approve/deny),
   // threaded via state.capabilities exactly like canWrite. It is INDEPENDENT of
   // mcpReadOnly: a read-only board mirror can still resolve escalations.
@@ -4147,6 +4228,13 @@ export default function App() {
         priority: c.priority || 'med',
         tags: c.tags || [],
         checklist: c.checklist || [],
+        // Pass 2b write-through fields. The Card lens echoes acceptance_criteria
+        // and the write-once tier; the `...c` spread already carries them, but
+        // enumerate them explicitly (like badge) so the MCP-writable modal can edit
+        // them legibly and robustly — acceptance_criteria defaults to '' so the
+        // textarea is always controlled; tier stays null when untiered.
+        acceptance_criteria: c.acceptance_criteria || '',
+        tier: c.tier ?? null,
         // E1 escalation display: card_list attaches a per-card escalation badge
         // ({ kind:'escalation', id, reason, control_diff }) or null. The `...c`
         // spread above already carries it, but enumerate it explicitly — the card
@@ -4331,6 +4419,57 @@ export default function App() {
     return inCol.length ? inCol[inCol.length - 1].order : null;
   };
 
+  // ── Pass 2b write-through helpers (used only on the MCP-writable path) ────
+  // The active spine provider (board writes go through it). null if the
+  // connection dropped between render and the write — handlers bail loudly.
+  const spineProvider = () => {
+    const conn = spineConnRef.current;
+    return (conn && conn.getProvider && conn.getProvider()) || null;
+  };
+  // Secondary reconciliation backstop: nudge ONE poll after a successful write so
+  // any server-side side effect (a neighbor re-rank, a cleared badge) reconciles
+  // without waiting up to 5s. The returned Card is the PRIMARY reconcile; this is
+  // belt-and-suspenders. Fire-and-forget — the optimistic state stands until it lands.
+  const reconcileSpine = () => {
+    const conn = spineConnRef.current;
+    if (conn && conn.pollNow) Promise.resolve(conn.pollNow()).catch(() => {});
+  };
+  // Persistent-banner copy for a failed spine write. A stale write (code
+  // 'conflict') and a deleted target get clearer lines; everything else carries
+  // the provider's message/code so a failure is never silent. (surface() does NOT
+  // auto-dismiss — the banner stays until the user closes it.)
+  const writeError = (verb, e) => {
+    if (e?.code === 'conflict') {
+      return e.meta?.current?.deleted_at
+        ? `That card was deleted on the spine — your ${verb} was reverted.`
+        : `Card changed on the spine — your ${verb} was reverted. Try again.`;
+    }
+    return `Couldn't ${verb} — reverted. (${e?.message || e?.code || 'error'})`;
+  };
+  // Mint the destination column + LexoRank from the drop neighbors, reading from
+  // the given cards source ({ cards }). SHARED by the local-store and MCP-writable
+  // drag paths — the only thing that differs between them is the destination (store
+  // vs provider), never the ordering math. Returns null if the target vanished.
+  const computeDropOrder = (source, draggedId, target) => {
+    let columnId;
+    let order;
+    if (target.type === 'card') {
+      const targetCard = source.cards.find((c) => c.id === target.id && !c.deleted_at);
+      if (!targetCard) return null;
+      columnId = targetCard.column_id;
+      const colCards = liveColumnCards(source, columnId, draggedId);
+      const tIdx = colCards.findIndex((c) => c.id === target.id);
+      const prev = tIdx > 0 ? colCards[tIdx - 1] : null; // insert before target
+      order = orderBetween(prev ? prev.order : null, targetCard.order);
+    } else {
+      columnId = target.id;
+      const colCards = liveColumnCards(source, columnId, draggedId);
+      const last = colCards.length ? colCards[colCards.length - 1] : null;
+      order = orderBetween(last ? last.order : null, null); // append to end
+    }
+    return { columnId, order };
+  };
+
   // Spec conflict protocol: try the op; on `conflict`, inspect meta.current —
   // a tombstone drops the change with a notice, otherwise reapply ONCE onto the
   // fresh version; a second conflict surfaces. Never recreate a card.
@@ -4347,7 +4486,109 @@ export default function App() {
     }
   };
 
+  // ── MCP-writable write-through core (Pass 2b) ───────────────────────────
+  // Each mutates ONLY transient React state (spineModel), NEVER the local store
+  // (preserving the read-only build's split-brain guard). Shape, every one:
+  // CAPTURE prior state (incl. the spec-required version) → OPTIMISTIC apply →
+  // call the provider → on SUCCESS reconcile with the returned Card (merge) and
+  // nudge a backstop poll → on FAILURE snap the prior state back SYNCHRONOUSLY
+  // (not waiting for the 5s poll) and surface a persistent error banner.
+  const moveTaskMcp = async (draggedId, target) => {
+    const provider = spineProvider();
+    const model = spineModel;
+    if (!provider || !model) { surface('No live spine connection — move not sent.'); return; }
+    const dragged = model.cards.find((c) => c.id === draggedId && !c.deleted_at);
+    if (!dragged) return;
+    const computed = computeDropOrder(model, draggedId, target);
+    if (!computed) return;
+    const { columnId, order } = computed;
+    const prior = { column_id: dragged.column_id, order: dragged.order }; // CAPTURE
+    const expected_version = dragged.version;
+    setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
+      c.id === draggedId ? { ...c, column_id: columnId, order } : c) } : m));
+    try {
+      const card = await provider.cardMove(draggedId, columnId, { order, expected_version });
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // RECONCILE (merge)
+        c.id === draggedId ? { ...c, ...card } : c) } : m));
+      reconcileSpine();
+    } catch (e) {
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // REVERT (synchronous)
+        c.id === draggedId ? { ...c, column_id: prior.column_id, order: prior.order } : c) } : m));
+      surface(writeError('move', e));
+    }
+  };
+
+  const saveTaskMcp = async (task) => {
+    if (!task.title.trim()) return;
+    const provider = spineProvider();
+    const model = spineModel;
+    if (!provider || !model) { surface('No live spine connection — changes not sent.'); return; }
+    const cur = model.cards.find((c) => c.id === task.id && !c.deleted_at);
+    if (!cur) { surface('That card was deleted'); setEditing(null); return; }
+    // Patch only the spine-Card fields the modal edits (title, acceptance_criteria,
+    // tier) and only those that actually changed. A column change is a move, not an
+    // update — it never travels through here.
+    const patch = {};
+    if (task.title !== cur.title) patch.title = task.title;
+    if ((task.acceptance_criteria || '') !== (cur.acceptance_criteria || '')) patch.acceptance_criteria = task.acceptance_criteria || '';
+    if ((task.tier ?? null) !== (cur.tier ?? null)) patch.tier = task.tier ?? null;
+    setEditing(null); // close immediately; the edit shows optimistically behind it
+    if (Object.keys(patch).length === 0) return; // nothing changed → no write
+    const prior = { title: cur.title, acceptance_criteria: cur.acceptance_criteria, tier: cur.tier }; // CAPTURE
+    const expected_version = cur.version;
+    setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
+      c.id === task.id ? { ...c, ...patch } : c) } : m));
+    try {
+      const card = await provider.cardUpdate(task.id, { ...patch, expected_version });
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // RECONCILE (merge)
+        c.id === task.id ? { ...c, ...card } : c) } : m));
+      reconcileSpine();
+    } catch (e) {
+      // CONFLICT vs TRANSPORT divergence. A `conflict` means the server already
+      // moved on and carries its fresh card under meta.current — restoring our
+      // captured `prior` would paint a SECOND stale state over a stale one, so we
+      // snap the card TO the server's truth (its values + fresh version, so the
+      // next edit retries with the right expected_version). Any other error
+      // (network/transport) means the write never landed → restore prior.
+      const fresh = e?.code === 'conflict' && e.meta?.current;
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // RECONCILE-or-REVERT (synchronous)
+        c.id === task.id
+          ? (fresh
+            ? { ...c, ...e.meta.current } // SNAP-BACK to server truth
+            : { ...c, title: prior.title, acceptance_criteria: prior.acceptance_criteria, tier: prior.tier }) // REVERT prior
+          : c) } : m));
+      surface(writeError('save', e));
+    }
+  };
+
+  const deleteTaskMcp = async (id) => {
+    const provider = spineProvider();
+    const model = spineModel;
+    if (!provider || !model) { surface('No live spine connection — delete not sent.'); return; }
+    const cur = model.cards.find((c) => c.id === id && !c.deleted_at);
+    setEditing(null);
+    if (!cur) { surface('That card was deleted'); return; }
+    const expected_version = cur.version;
+    const priorCard = cur; // CAPTURE: its `order` encodes the board position → restore = re-insert
+    setSpineModel((m) => (m ? { ...m, cards: m.cards.filter((c) => c.id !== id) } : m)); // OPTIMISTIC removal
+    try {
+      await provider.cardDelete(id, { expected_version });
+      reconcileSpine(); // confirm removal against the authoritative card_list
+    } catch (e) {
+      setSpineModel((m) => { // REVERT: restore at its order-driven position (unless a poll re-added it)
+        if (!m) return m;
+        if (m.cards.some((c) => c.id === id)) return m;
+        return { ...m, cards: [...m.cards, priorCard] };
+      });
+      surface(writeError('delete', e));
+    }
+  };
+
+  // ── Public write handlers — the split-brain routing (Pass 2b STEP f) ─────
+  // Each branches on mode: mcpWritable → provider write-through; mcpActive but
+  // read-only → blocked (the mirror stays read-only); else local → the card store.
   const saveTask = (task) => {
+    if (mcpWritable) { saveTaskMcp(task); return; }
     if (mcpActive) { surface(READONLY_MSG); return; }
     if (!task.title.trim()) return;
     if (isNew) {
@@ -4373,6 +4614,7 @@ export default function App() {
   };
 
   const deleteTask = (id) => {
+    if (mcpWritable) { deleteTaskMcp(id); return; }
     if (mcpActive) { surface(READONLY_MSG); return; }
     withConflict(() => {
       const cur = store.get(id);
@@ -4411,6 +4653,10 @@ export default function App() {
     if (conn && conn.pollNow) Promise.resolve(conn.pollNow()).catch(() => {});
   };
 
+  // card_create is DEFERRED in MCP mode (it needs project-targeting plumbing that
+  // is the NEXT slice); the board's quick-add / "New" affordances are hidden while
+  // a spine is connected (canCreate below), so this only ever runs in local mode.
+  // The mcpActive backstop keeps a stray call inert. Local behavior is unchanged.
   const quickAdd = (colId, title) => {
     if (mcpActive) { surface(READONLY_MSG); return; }
     const t = new Date();
@@ -4421,31 +4667,18 @@ export default function App() {
     });
   };
 
-  // Drag-and-drop. Mint the order from the drop neighbors (with null-neighbor
-  // cases: empty column, drop-before-first, append-to-end) and move().
+  // Drag-and-drop. Mint the order from the drop neighbors (computeDropOrder handles
+  // the null-neighbor cases: empty column, drop-before-first, append-to-end) then
+  // route by mode — the destination is the only thing that changes (Pass 2b STEP b).
   const moveTask = (draggedId, target) => {
+    if (mcpWritable) { moveTaskMcp(draggedId, target); return; }
     if (mcpActive) { surface(READONLY_MSG); return; }
     withConflict(() => {
       const dragged = store.get(draggedId);
       if (!dragged || dragged.deleted_at) { surface('That card was deleted'); return; }
-      const snap = getSnapshot();
-      let columnId;
-      let order;
-      if (target.type === 'card') {
-        const targetCard = snap.cards.find((c) => c.id === target.id && !c.deleted_at);
-        if (!targetCard) return;
-        columnId = targetCard.column_id;
-        const colCards = liveColumnCards(snap, columnId, draggedId);
-        const tIdx = colCards.findIndex((c) => c.id === target.id);
-        const prev = tIdx > 0 ? colCards[tIdx - 1] : null; // insert before target
-        order = orderBetween(prev ? prev.order : null, targetCard.order);
-      } else {
-        columnId = target.id;
-        const colCards = liveColumnCards(snap, columnId, draggedId);
-        const last = colCards.length ? colCards[colCards.length - 1] : null;
-        order = orderBetween(last ? last.order : null, null); // append to end
-      }
-      store.move(draggedId, { column_id: columnId, order }, { expected_version: dragged.version });
+      const computed = computeDropOrder(getSnapshot(), draggedId, target);
+      if (!computed) return;
+      store.move(draggedId, { column_id: computed.columnId, order: computed.order }, { expected_version: dragged.version });
     });
   };
 
@@ -4626,11 +4859,12 @@ export default function App() {
           theme={theme} setTheme={setTheme}
           syncEnabled={syncEnabled} syncStatus={syncStatus}
           onSyncNow={handleSyncNow} onReconnect={handleReconnect}
-          spineState={spineState} readOnly={mcpReadOnly} />
+          spineState={spineState} canCreate={!mcpActive} />
         <FilterBar tags={activeTags} filters={filters} setFilters={setFilters} />
         {view === 'board' && (
           <BoardView tasks={filteredTasks} tags={activeTags} columns={activeColumns}
-            onTaskClick={openEdit} onMove={moveTask} onQuickAdd={quickAdd} readOnly={mcpReadOnly} />
+            onTaskClick={openEdit} onMove={moveTask} onQuickAdd={quickAdd}
+            readOnly={mcpReadOnly} canCreate={!mcpActive} />
         )}
         {view === 'calendar' && (
           <CalendarView tasks={filteredTasks} events={events} columns={activeColumns} onTaskClick={openEdit} />
@@ -4639,15 +4873,23 @@ export default function App() {
           <GanttView tasks={filteredTasks} events={events} columns={activeColumns} onTaskClick={openEdit} />
         )}
         {view === 'matrix' && (
+          // readOnly=mcpActive (NOT mcpReadOnly): matrix drag = classify (effort/
+          // impact), which is NOT part of the Pass 2b card write-through, so it stays
+          // read-only on ANY live spine — a writable spine still can't classify here.
           <MatrixView tasks={filteredTasks} tags={activeTags}
-            onTaskClick={openEdit} onClassify={classifyTask} readOnly={mcpReadOnly} />
+            onTaskClick={openEdit} onClassify={classifyTask} readOnly={mcpActive} />
         )}
         {editing && (
           <TaskModal task={editing} tags={activeTags} columns={activeColumns} isNew={isNew}
             onSave={saveTask} onDelete={deleteTask}
             onClose={() => setEditing(null)} onCreateTag={createTag} readOnly={mcpReadOnly}
+            mcpWritable={mcpWritable}
             canResolve={mcpCanResolve} onResolveEscalation={handleResolveEscalation} />
         )}
+        {/* SettingsModal readOnly=mcpActive (NOT mcpReadOnly): board-config
+            (columns/tags) is NOT part of the Pass 2b card write-through, so it stays
+            read-only on ANY live spine. (Settings reads columns/tags from the local
+            store, which is intentionally untouched while a spine is connected.) */}
         {showSettings && (
           <SettingsModal columns={columns} tags={tags} tasks={tasks}
             user={user} onSignOut={() => { setShowSettings(false); handleSignOut(); }}
@@ -4660,7 +4902,7 @@ export default function App() {
             onAddTag={addTag} onRenameTag={renameTag}
             onRecolorTag={recolorTag} onDeleteTag={deleteTag}
             syncEnabled={syncEnabled} onToggleSync={setSyncEnabled}
-            syncStatus={syncStatus} onSyncNow={handleSyncNow} readOnly={mcpReadOnly} />
+            syncStatus={syncStatus} onSyncNow={handleSyncNow} readOnly={mcpActive} />
         )}
         {driveSync && syncStatus === 'collision_pending' && (
           <CollisionDialog onResolve={handleResolveCollision} busy={collisionBusy} />

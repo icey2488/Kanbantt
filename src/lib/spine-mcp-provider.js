@@ -114,8 +114,11 @@ function mapDomainError(payload) {
   const meta = (payload && payload.meta) || {};
   const out = { retry_after: meta.retry_after };
   if (code === 'conflict') {
-    // spec meta.card → board-parity meta.current
-    return new MCPProviderError('conflict', message, { ...out, current: meta.card });
+    // spec meta.card → board-parity meta.current. Normalize tier to internal
+    // (hyphen) form like every other Card crossing this boundary — the board's
+    // conflict snap-back reconciles directly to this card, so it must not carry a
+    // colon tier back into the internal model.
+    return new MCPProviderError('conflict', message, { ...out, current: toInternalCard(meta.card) });
   }
   return new MCPProviderError(code, message, { ...out, ...meta });
 }
@@ -132,6 +135,84 @@ function errorPayload(result) {
     try { return JSON.parse(text.text); } catch { return { code: 'request_failed', message: text.text }; }
   }
   return { code: 'request_failed', message: 'tool reported isError with no payload' };
+}
+
+/* ------------------------------------------------------------------------ */
+/* Tier wire ⇄ internal mapping (Pass 2b refinement)                        */
+/* ------------------------------------------------------------------------ */
+/**
+ * Kanbantt's native/internal tier tag format is the HYPHEN form "tier-N"; the
+ * spec wire contract + the spine require the COLON form "tier:N". This provider
+ * is the SINGLE boundary that translates: the wire stays single-valued ("tier:N"
+ * only), the board's internal logic stays uniformly hyphen. WRITE maps internal →
+ * wire just before the MCP call (the fix for the failing edit, which sent
+ * "tier-3" and was rejected validation_failed); READ DERIVES the internal tier
+ * from the card's `tags` — the spine has NO native `card.tier`, tier lives ONLY
+ * as a "tier:N" tag (projection.py) — setting `card.tier` to "tier-N", or null
+ * when untiered, so the modal/tierLock and everything downstream see a real tier.
+ *
+ * Both directions are conservative and idempotent: WRITE rewrites only a string
+ * matching the source form (null/undefined and unrecognized strings pass through
+ * untouched); READ scans `tags` for the first "tier:N" and never mutates `tags`
+ * itself (the badge renders off the colon tag) — so a re-projected card is
+ * unchanged and we never invent, duplicate, or drop a tier.
+ */
+const TIER_INTERNAL_RE = /^tier-([1-9][0-9]*)$/; // "tier-3"
+const TIER_WIRE_RE = /^tier:([1-9][0-9]*)$/;     // "tier:3"
+
+/** internal "tier-N" → wire "tier:N" (write side). */
+function tierInternalToWire(tier) {
+  if (typeof tier !== 'string') return tier;
+  const m = TIER_INTERNAL_RE.exec(tier);
+  return m ? `tier:${m[1]}` : tier;
+}
+/** wire "tier:N" → internal "tier-N" (read side). */
+function tierWireToInternal(tier) {
+  if (typeof tier !== 'string') return tier;
+  const m = TIER_WIRE_RE.exec(tier);
+  return m ? `tier-${m[1]}` : tier;
+}
+
+/** Scan a wire card's `tags` for the tier and return its internal hyphen form
+ *  "tier-N", or null when untiered. The spine carries tier ONLY as a "tier:N"
+ *  tag (there is no native `card.tier`), so this is THE read seam: the first tier
+ *  tag wins (single-valued by contract); `tierWireToInternal` does the per-tag
+ *  colon→hyphen rewrite. */
+function tierFromTags(tags) {
+  if (!Array.isArray(tags)) return null;
+  for (const t of tags) {
+    const internal = tierWireToInternal(t);
+    if (internal !== t) return internal; // a "tier:N" tag was rewritten to "tier-N"
+  }
+  return null;
+}
+
+/** Project a Card coming off the wire into the internal model: set its `tier`
+ *  field (hyphen "tier-N", or null when untiered) DERIVED from `tags`. `tags`
+ *  itself is left untouched — the board's tier badge renders off the colon tag,
+ *  and we never duplicate or strip it. Returns the SAME object only when `tier`
+ *  already equals the derived value (idempotent: a re-projected card is
+ *  unchanged; a fresh wire card with no `tier` field is cloned once to carry the
+ *  derived value, including the explicit null that drives tierLock). */
+function toInternalCard(card) {
+  if (!card || typeof card !== 'object') return card;
+  const tier = tierFromTags(card.tags);
+  return card.tier === tier ? card : { ...card, tier };
+}
+
+/** Project a write patch/input into wire form: its `tier` field in colon form.
+ *  A null `tier` is OMITTED entirely (not forwarded as null): the spine treats
+ *  tier=None as "leave unchanged" and _patch_tier_to_int(None) → validation_failed,
+ *  so a null must never reach the wire. Returns the SAME object when there's no
+ *  `tier` key to translate. */
+function toWirePatch(patch) {
+  if (!patch || typeof patch !== 'object' || !('tier' in patch)) return patch;
+  if (patch.tier === null) {
+    const rest = { ...patch };
+    delete rest.tier; // null = "no tier change"; drop the key rather than send null
+    return rest;
+  }
+  return { ...patch, tier: tierInternalToWire(patch.tier) };
 }
 
 export function createMCPProvider({
@@ -301,14 +382,14 @@ export function createMCPProvider({
         include_deleted: includeDeleted,
         column_id: columnId,
         tag,
-      }).then((out) => ({ cards: out.cards || [], sync_token: out.sync_token }));
+      }).then((out) => ({ cards: (out.cards || []).map(toInternalCard), sync_token: out.sync_token }));
     },
 
     async get(id) {
       requireConnected();
       try {
         const out = await call('card_get', { id });
-        return out.card || null;
+        return out.card ? toInternalCard(out.card) : null;
       } catch (e) {
         if (e instanceof MCPProviderError && e.code === 'not_found') return null; // LocalProvider parity
         throw e;
@@ -319,19 +400,19 @@ export function createMCPProvider({
      *  wholesale (including server-minted version), replacing local state. */
     async create(input = {}) {
       requireConnected();
-      const out = await call('card_create', { card: input });
-      return out.card;
+      const out = await call('card_create', { card: toWirePatch(input) });
+      return toInternalCard(out.card);
     },
 
     async update(id, patch = {}, { expected_version, force } = {}) {
       requireConnected();
       const out = await call('card_update', {
         id,
-        patch,
+        patch: toWirePatch(patch),
         expected_version,
         ...(force ? { force: true } : {}),
       });
-      return out.card;
+      return toInternalCard(out.card);
     },
 
     async move(id, target = {}, { expected_version, force } = {}) {
@@ -343,14 +424,61 @@ export function createMCPProvider({
         expected_version,
         ...(force ? { force: true } : {}),
       });
-      return out.card;
+      return toInternalCard(out.card);
     },
 
     /** card_delete — soft delete, returns the tombstone. No `force` by spec. */
     async delete(id, { expected_version } = {}) {
       requireConnected();
       const out = await call('card_delete', { id, expected_version });
-      return out.card; // the tombstone
+      return toInternalCard(out.card); // the tombstone
+    },
+
+    /* ---- card write-through (Pass 2b) — board-facing mutations on EXISTING cards.
+     *  These are the board's vocabulary for the live-spine write path; they mirror
+     *  escalationResolve's STRUCTURE exactly — capability-gate → single call() →
+     *  return the projected entity — with domain errors surfacing through
+     *  call()/mapDomainError identically (a stale write → code 'conflict' carrying
+     *  the current card under meta.current; a tombstoned target → conflict too).
+     *  Gated on `canWrite` (all four card_* tools advertised), the SAME way
+     *  escalationResolve gates on `canResolve` — independent of the read pair.
+     *
+     *  expected_version: per spec §Concurrency it is REQUIRED on all three (the
+     *  store rejects any other value with a conflict), so the caller supplies the
+     *  card's captured prior version — it rides in the options object alongside the
+     *  patch fields rather than being threaded separately. The board captures it as
+     *  part of the optimistic prior-state snapshot (see App's write handlers).
+     *
+     *  card_create is DEFERRED (it needs project-targeting plumbing that does not
+     *  exist yet) — intentionally NOT added here; the next slice wires it. */
+    async cardUpdate(id, { title, acceptance_criteria, tier, expected_version } = {}) {
+      requireCapability('canWrite');
+      // Field-scoped patch: only the keys actually supplied, so an unset field is
+      // never clobbered with `undefined`. column_id/order are NOT update fields — a
+      // reposition is cardMove (update never repositions, mirroring card-store).
+      const patch = {};
+      if (title !== undefined) patch.title = title;
+      if (acceptance_criteria !== undefined) patch.acceptance_criteria = acceptance_criteria;
+      // Tier crosses the wire in COLON form; the board edits it in internal HYPHEN
+      // form. Map internal → wire HERE so the spine's strict validator accepts it —
+      // the failing edit sent patch.tier="tier-3" and was rejected validation_failed.
+      // A null tier is OMITTED (not forwarded): tier=None means "leave unchanged" on
+      // the spine and _patch_tier_to_int(None) → validation_failed. With read-from-tags
+      // restoring write-once tierLock, untier is unreachable by design anyway — this is
+      // belt-and-suspenders, and keeps the patch consistent with toWirePatch.
+      if (tier !== undefined && tier !== null) patch.tier = tierInternalToWire(tier);
+      return toInternalCard((await call('card_update', { id, patch, expected_version })).card);
+    },
+    async cardMove(id, toState, { order, expected_version } = {}) {
+      requireCapability('canWrite');
+      return toInternalCard((await call('card_move', { id, column_id: toState, order, expected_version })).card);
+    },
+    /** card_delete returns the spec tombstone Card; the board only needs the id to
+     *  confirm removal (the Pass 2b id-for-delete contract), so surface that. */
+    async cardDelete(id, { expected_version } = {}) {
+      requireCapability('canWrite');
+      const out = await call('card_delete', { id, expected_version });
+      return (out.card && out.card.id) || id;
     },
 
     /* ---- board config writes (optional capability sets) ---- */

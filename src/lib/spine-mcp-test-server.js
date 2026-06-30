@@ -49,6 +49,40 @@ function memStorage() {
 /** Local column { id, label, accentKey, rank } → spec Board column { id, name, color, order }. */
 const toWireColumn = (c) => ({ id: c.id, name: c.label, color: c.accentKey, order: c.rank });
 
+/* ---- tier fidelity: match the REAL spine, which has NO native `card.tier` ----
+ *  projection.py never emits a native tier field — tier lives ONLY in `tags` as
+ *  "tier:N". So the harness folds an incoming colon `tier` (card_create's card /
+ *  card_update's patch) INTO tags and persists no native tier field, exactly as
+ *  the real wire does. (A pure mock fabricating a native tier is what made the
+ *  tier tests falsely green against a field the real projection never produces.) */
+const TIER_TAG_RE = /^tier:([1-9][0-9]*)$/;          // colon wire form "tier:3"
+/** Replace any prior tier tag with the new one (single-valued); a non-"tier:N"
+ *  value (e.g. null) just strips the existing tier tag — no native field minted. */
+function foldTierIntoTags(tier, tags) {
+  const base = (Array.isArray(tags) ? tags : []).filter((t) => !TIER_TAG_RE.test(t));
+  return typeof tier === 'string' && TIER_TAG_RE.test(tier) ? [...base, tier] : base;
+}
+/** card_create: fold a native `tier` on the input card into its tags, dropping
+ *  the native field so the stored/emitted card carries tier only as a tag. */
+function tierFoldCreate(card) {
+  if (!card || typeof card !== 'object' || !('tier' in card)) return card;
+  const rest = { ...card };
+  delete rest.tier;
+  rest.tags = foldTierIntoTags(card.tier, rest.tags);
+  return rest;
+}
+/** card_update: fold a patch `tier` into tags. The patch usually omits `tags`, so
+ *  merge onto the card's CURRENT tags (passed in) — other tags survive the tier
+ *  edit — and never persist a native tier field. */
+function tierFoldPatch(patch, current) {
+  if (!patch || typeof patch !== 'object' || !('tier' in patch)) return patch;
+  const rest = { ...patch };
+  delete rest.tier;
+  const baseTags = Array.isArray(rest.tags) ? rest.tags : (current && current.tags) || [];
+  rest.tags = foldTierIntoTags(patch.tier, baseTags);
+  return rest;
+}
+
 /**
  * @param {object}  [opts]
  * @param {(store)=>void} [opts.seed]   populate the backing store after load
@@ -111,8 +145,8 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
           const card = store.get(a.id);
           return card ? ok({ card }) : domainError('not_found', `no card ${a.id}`, { id: a.id });
         }
-        case 'card_create': return ok({ card: store.create(a.card || {}) });
-        case 'card_update': return ok({ card: store.update(a.id, a.patch || {}, { expected_version: a.expected_version, force: a.force }) });
+        case 'card_create': return ok({ card: store.create(tierFoldCreate(a.card || {})) });
+        case 'card_update': return ok({ card: store.update(a.id, tierFoldPatch(a.patch || {}, store.get(a.id)), { expected_version: a.expected_version, force: a.force }) });
         case 'card_move': return ok({ card: store.move(a.id, { column_id: a.column_id, order: a.order }, { expected_version: a.expected_version, force: a.force }) });
         case 'card_delete': return ok({ card: store.delete(a.id, { expected_version: a.expected_version }) });
         case 'column_create': store.columnCreate(a); return ok(board());
