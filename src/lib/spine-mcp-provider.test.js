@@ -15,6 +15,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+
 import { createMcpTestServer } from './spine-mcp-test-server.js';
 import { createMCPProvider, MCPProviderError } from './spine-mcp-provider.js';
 
@@ -26,6 +29,24 @@ async function connected(opts = {}) {
   return { provider, harness };
 }
 const oneCard = (s) => s.create({ id: 'c1', title: 'First', column_id: 'todo', priority: 'med' });
+
+/** A RAW MCP client on the harness — bypasses the provider's hyphen↔colon translation
+ *  AND its null-omission, so a test can drive the mock's TOOL handlers with EXACT wire
+ *  arguments (e.g. patch.tier = null, new_tier = "tier:0") and assert WIRE-LEVEL parity
+ *  with the real spine, not just provider-shaped happy paths. */
+async function rawWire(opts = {}) {
+  const harness = createMcpTestServer(opts);
+  const transport = new StreamableHTTPClientTransport(new URL(harness.url), { fetch: harness.fetchFn });
+  const client = new Client({ name: 'wire-probe', version: '0' }, { capabilities: {} });
+  await client.connect(transport);
+  const callRaw = (name, args) => client.callTool({ name, arguments: args });
+  return {
+    harness, callRaw,
+    async close() { try { await client.close(); } catch { /* best effort */ } await harness.close(); },
+  };
+}
+/** The tool result's object payload — structuredContent, or the JSON text-block fallback. */
+const payloadOf = (r) => (r.structuredContent ?? JSON.parse(r.content[0].text));
 
 /* ================================================================== */
 /* connect: handshake, required tools, capability gating               */
@@ -39,6 +60,7 @@ test('connect → initialize + tools/list; server name and capabilities from adv
   assert.deepEqual(capabilities, {
     projects: true, tasks: true,
     hasCardCreate: true, hasCardUpdate: true, hasCardMove: true, hasCardDelete: true, canWrite: true,
+    canRetier: true,
     escalations: true, canResolve: true, artifacts: true, columns: true, tags: true, realtime: false,
   });
   assert.equal(provider.supportsRealtime(), false, 'v1 is tools-only → board polls');
@@ -347,6 +369,192 @@ test('tier write is conservative: a non-tier update never invents a tier, and a 
 });
 
 /* ================================================================== */
+/* Pass 3: card_retier (governed/audited) + card_update write-once tier */
+/* ------------------------------------------------------------------- */
+/* card_retier changes a SET tier through an audited path: the harness   */
+/* writes a tier_audit row (exposed via tierAudit()) with EXACTLY the    */
+/* spine's semantics, and card_update REFUSES to change a set tier. The  */
+/* tier seam is exercised end to end: internal "tier-N" → wire "tier:N"  */
+/* → stored as a tag → read back "tier-N". reduces_control is a JS       */
+/* boolean here (the spine records the same fact as int 0/1 — an internal */
+/* field that never crosses the wire, so the two never need to agree on   */
+/* its encoding, only its truth).                                        */
+/* ================================================================== */
+
+/** Connect against a harness seeded with one card carrying `tags` (e.g. ['tier:4']). */
+async function retierFixture(tags) {
+  return connected({ seed: (s) => s.create({ id: 'c1', title: 'First', column_id: 'todo', tags }) });
+}
+
+test('cardRetier DOWNGRADE: "tier-4"→wire "tier:4" seam, tag rewritten, audit row reduces_control TRUE (Pass 3)', async () => {
+  const { provider, harness } = await retierFixture(['tier:4']);
+  const card = await provider.cardRetier('c1', 'tier-2', 1, 'tighten review after a near-miss');
+  // The returned Card presents the internal hyphen tier, DERIVED from the rewritten tag.
+  assert.equal(card.tier, 'tier-2', 'returned Card presents internal hyphen tier');
+  assert.ok((card.tags || []).includes('tier:2'), 'the new colon tier tag rides in tags');
+  assert.ok(!(card.tags || []).includes('tier:4'), 'the old tier tag was replaced, not duplicated');
+  const rows = harness.tierAudit();
+  assert.equal(rows.length, 1, 'exactly one audit row recorded');
+  assert.deepEqual(
+    { card_id: rows[0].card_id, old_tier: rows[0].old_tier, new_tier: rows[0].new_tier,
+      reduces_control: rows[0].reduces_control, actor: rows[0].actor, reason: rows[0].reason },
+    { card_id: 'c1', old_tier: 4, new_tier: 2, reduces_control: true, actor: 'client:bearer',
+      reason: 'tighten review after a near-miss' },
+  );
+  assert.ok(typeof rows[0].ts === 'string' && rows[0].ts.includes('T'), 'ISO-8601 UTC ts');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardRetier UPGRADE: audit row reduces_control FALSE (a higher tier strengthens oversight) (Pass 3)', async () => {
+  const { provider, harness } = await retierFixture(['tier:2']);
+  const card = await provider.cardRetier('c1', 'tier-4', 1, 'promote to human sign-off');
+  assert.equal(card.tier, 'tier-4');
+  const row = harness.tierAudit()[0];
+  assert.deepEqual([row.old_tier, row.new_tier, row.reduces_control], [2, 4, false]);
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardRetier rejects an UNTIERED card → validation_failed, no audit row (Pass 3)', async () => {
+  const { provider, harness } = await connected({ seed: oneCard }); // no tier tag
+  await assert.rejects(
+    () => provider.cardRetier('c1', 'tier-3', 1, 'classify it'),
+    (e) => e instanceof MCPProviderError && e.code === 'validation_failed',
+  );
+  assert.equal(harness.tierAudit().length, 0, 'no audit row on rejection');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardRetier rejects an OUT-OF-RANGE tier → validation_failed, no audit row (Pass 3)', async () => {
+  const { provider, harness } = await retierFixture(['tier:2']);
+  await assert.rejects(
+    () => provider.cardRetier('c1', 'tier-9', 1, 'too far'),
+    (e) => e.code === 'validation_failed',
+  );
+  assert.equal(harness.tierAudit().length, 0);
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardRetier rejects a NO-OP same-tier change → validation_failed, no audit row (Pass 3)', async () => {
+  const { provider, harness } = await retierFixture(['tier:3']);
+  await assert.rejects(
+    () => provider.cardRetier('c1', 'tier-3', 1, 'no real change'),
+    (e) => e.code === 'validation_failed',
+  );
+  assert.equal(harness.tierAudit().length, 0, 'a no-op writes NO audit row');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardRetier rejects an EMPTY/whitespace reason → validation_failed, no audit row (Pass 3)', async () => {
+  const { provider, harness } = await retierFixture(['tier:2']);
+  for (const reason of ['', '   ']) {
+    await assert.rejects(
+      () => provider.cardRetier('c1', 'tier-4', 1, reason),
+      (e) => e.code === 'validation_failed',
+    );
+  }
+  assert.equal(harness.tierAudit().length, 0);
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardRetier with a STALE expected_version → conflict (meta.current, tier from tags); NO force, no audit row (Pass 3)', async () => {
+  const { provider, harness } = await retierFixture(['tier:2']);
+  // There is no force on cardRetier — a stale version can NEVER be bypassed; it snaps
+  // back to meta.current (whose tier is DERIVED from tags, board-parity), and writes
+  // no audit row.
+  await assert.rejects(
+    () => provider.cardRetier('c1', 'tier-4', 'STALE', 'racing write'),
+    (e) => e instanceof MCPProviderError && e.code === 'conflict'
+      && e.meta.current.id === 'c1' && e.meta.current.tier === 'tier-2',
+  );
+  assert.equal(harness.tierAudit().length, 0, 'a conflict writes no audit row');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('canRetier gating: a server without card_retier ⇒ canRetier false and cardRetier is unsupported (Pass 3)', async () => {
+  const { provider, harness } = await connected({ omitTools: ['card_retier'], seed: tieredCard });
+  assert.equal(provider.getCapabilities().capabilities.canRetier, false, 'no card_retier ⇒ canRetier false');
+  await assert.rejects(
+    () => provider.cardRetier('c1', 'tier-4', 1, 'nope'),
+    (e) => e instanceof MCPProviderError && e.code === 'unsupported_capability',
+  );
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('canRetier is INDEPENDENT of canWrite: card_retier present but card_move absent ⇒ canRetier true, canWrite false (Pass 3)', async () => {
+  const { provider, harness } = await connected({ omitTools: ['card_move'] });
+  const caps = provider.getCapabilities().capabilities;
+  assert.equal(caps.canWrite, false, 'missing card_move ⇒ canWrite false');
+  assert.equal(caps.canRetier, true, 'card_retier still advertised ⇒ canRetier true');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('card_update WRITE-ONCE: changing a SET tier via cardUpdate → validation_failed, tier untouched, no audit row (Pass 3)', async () => {
+  // THE fidelity guard: card_update must be as strict as the spine. If a set-tier change
+  // ever slips through the free update path (instead of being forced onto card_retier),
+  // this test FAILS. The board edits tier internally as "tier-4"; cardUpdate maps it to
+  // wire "tier:4".
+  const { provider, harness } = await retierFixture(['tier:2']);
+  await assert.rejects(
+    () => provider.cardUpdate('c1', { tier: 'tier-4', expected_version: 1 }),
+    (e) => e instanceof MCPProviderError && e.code === 'validation_failed' && /write-once/.test(e.message),
+  );
+  assert.equal((await provider.get('c1')).tier, 'tier-2', 'the set tier was NOT mutated');
+  assert.equal(harness.tierAudit().length, 0, 'card_update never writes the audit ledger');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('card_update RANGE: tier:9 as an INITIAL classification (untiered) → validation_failed, no audit row (Pass 3)', async () => {
+  // The 1..4 range is input hygiene: an out-of-range INITIAL tier is rejected before any
+  // write, exactly as the spine's `tier must be an int in 1..4` guard fires for an untiered
+  // card. Closes the mock/spine divergence where the mock folded any tier:N tag unchecked.
+  const { provider, harness } = await connected({ seed: oneCard }); // no tier tag → untiered
+  await assert.rejects(
+    () => provider.cardUpdate('c1', { tier: 'tier-9', expected_version: 1 }),
+    (e) => e instanceof MCPProviderError && e.code === 'validation_failed' && /1\.\.4/.test(e.message),
+  );
+  assert.equal((await provider.get('c1')).tier, null, 'the untiered card was NOT classified');
+  assert.equal(harness.tierAudit().length, 0);
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('card_update RANGE beats WRITE-ONCE: tier:9 CHANGE on a set tier → validation_failed with the RANGE message (Pass 3)', async () => {
+  // Ordering parity: the spine range-checks BEFORE the write-once guard, so an out-of-range
+  // change on a SET tier reports RANGE, not "write-once". expected_version is fresh, so this
+  // is NOT a conflict — it isolates the range error specifically.
+  const { provider, harness } = await retierFixture(['tier:2']);
+  await assert.rejects(
+    () => provider.cardUpdate('c1', { tier: 'tier-9', expected_version: 1 }),
+    (e) => e instanceof MCPProviderError && e.code === 'validation_failed'
+      && /1\.\.4/.test(e.message) && !/write-once/.test(e.message),
+  );
+  assert.equal((await provider.get('c1')).tier, 'tier-2', 'the set tier was NOT mutated');
+  assert.equal(harness.tierAudit().length, 0);
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('card_update on a tiered card: a NON-tier edit still succeeds (write-once is tier-scoped) (Pass 3)', async () => {
+  const { provider, harness } = await retierFixture(['tier:2']);
+  const updated = await provider.cardUpdate('c1', { title: 'Renamed', expected_version: 1 });
+  assert.equal(updated.title, 'Renamed');
+  assert.equal(updated.tier, 'tier-2', 'tier preserved (still derived from its untouched tag)');
+  assert.equal(harness.tierAudit().length, 0);
+  await provider.disconnect();
+  await harness.close();
+});
+
+/* ================================================================== */
 /* not-connected guard                                                 */
 /* ================================================================== */
 
@@ -360,4 +568,111 @@ test('calls before connect() throw not_connected', async () => {
 
 test('createMCPProvider requires a baseUrl', () => {
   assert.throws(() => createMCPProvider({}), (e) => e instanceof MCPProviderError && e.code === 'config');
+});
+
+/* ================================================================== */
+/* Pass 4: WIRE-LEVEL tier parity with the real spine                  */
+/* ------------------------------------------------------------------- */
+/* The provider always sends a canonical "tier:N" (or omits a null), so */
+/* these drive the mock's tool handlers DIRECTLY (rawWire) with the     */
+/* out-of-range / malformed / literal-null wire values the spine itself */
+/* classifies, and assert byte-for-byte parity with the empirically-    */
+/* observed spine. Spine truth (card seeded tier=2), confirmed against  */
+/* spine_server.server over the SDK in-memory client:                   */
+/*   card_update patch.tier  →  spine result                            */
+/*     "tier:0"  → validation_failed  "tier must be an int in 1..4, got 0"            (RANGE)  */
+/*     "tier:9"  → validation_failed  "tier must be an int in 1..4, got 9"            (RANGE)  */
+/*     "tier:-1" → validation_failed  "...'tier:N' or an int 1..4, got 'tier:-1'"     (MALFORMED) */
+/*     "banana"  → validation_failed  "...'tier:N' or an int 1..4, got 'banana'"      (MALFORMED) */
+/*     null      → validation_failed  "...'tier:N' or an int 1..4, got None"          (MALFORMED) */
+/*     (no tier key) → leave-as-is                                                              */
+/*   card_retier new_tier mirrors this, but range is checked AFTER the gate+untiered  */
+/*   (malformed is checked BEFORE the gate, in the tool layer).                        */
+/* ================================================================== */
+
+const MALFORMED = "tier must be the tag-id string 'tier:N' or an int 1..4, got ";
+
+test('WIRE card_update tier:0 → validation_failed RANGE message; does NOT silently untier (parity)', async () => {
+  const { harness, callRaw, close } = await rawWire({ seed: tieredCard }); // tags ['tier:2'], version 1
+  const r = await callRaw('card_update', { id: 'c1', patch: { tier: 'tier:0' }, expected_version: 1 });
+  assert.equal(r.isError, true);
+  const p = payloadOf(r);
+  assert.equal(p.code, 'validation_failed');
+  assert.equal(p.message, 'tier must be an int in 1..4, got 0', 'spine RANGE message verbatim');
+  assert.ok((harness.store.get('c1').tags || []).includes('tier:2'), 'tier:0 did NOT strip the tier (no false-green untier)');
+  await close();
+});
+
+test('WIRE card_update negative "tier:-1" → validation_failed MALFORMED message; no untier (parity)', async () => {
+  const { harness, callRaw, close } = await rawWire({ seed: tieredCard });
+  const r = await callRaw('card_update', { id: 'c1', patch: { tier: 'tier:-1' }, expected_version: 1 });
+  assert.equal(r.isError, true);
+  const p = payloadOf(r);
+  assert.equal(p.code, 'validation_failed');
+  assert.equal(p.message, `${MALFORMED}'tier:-1'`, 'spine _patch_tier_to_int MALFORMED message verbatim');
+  assert.ok((harness.store.get('c1').tags || []).includes('tier:2'), 'negative tier did NOT strip the tier');
+  await close();
+});
+
+test('WIRE card_update malformed junk "banana" → validation_failed MALFORMED message; no untier (parity)', async () => {
+  const { harness, callRaw, close } = await rawWire({ seed: tieredCard });
+  const r = await callRaw('card_update', { id: 'c1', patch: { tier: 'banana' }, expected_version: 1 });
+  assert.equal(r.isError, true);
+  const p = payloadOf(r);
+  assert.equal(p.code, 'validation_failed');
+  assert.equal(p.message, `${MALFORMED}'banana'`, 'spine MALFORMED message verbatim');
+  assert.ok((harness.store.get('c1').tags || []).includes('tier:2'), 'junk tier did NOT strip the tier');
+  await close();
+});
+
+test('WIRE card_update literal "tier":null PRESENT → validation_failed (NOT untier) — kills the false-green (parity)', async () => {
+  // THE residual: a literal null in the patch. The OLD mock folded null → strip = a SILENT
+  // untier (a false-green the real spine never does: _patch_tier_to_int(None) → validation_failed
+  // "got None"). The patch.tier KEY is present with value null, so it reaches the parser.
+  const { harness, callRaw, close } = await rawWire({ seed: tieredCard });
+  const r = await callRaw('card_update', { id: 'c1', patch: { tier: null }, expected_version: 1 });
+  assert.equal(r.isError, true);
+  const p = payloadOf(r);
+  assert.equal(p.code, 'validation_failed');
+  assert.equal(p.message, `${MALFORMED}None`, 'spine null → "...got None" verbatim');
+  assert.ok((harness.store.get('c1').tags || []).includes('tier:2'), 'null tier did NOT untier the card');
+  await close();
+});
+
+test('WIRE card_update tier KEY ABSENT → tier left as-is (a non-tier patch never touches tier) (parity)', async () => {
+  const { harness, callRaw, close } = await rawWire({ seed: tieredCard });
+  const r = await callRaw('card_update', { id: 'c1', patch: { title: 'Renamed' }, expected_version: 1 });
+  assert.equal(r.isError ?? false, false);
+  const card = payloadOf(r).card;
+  assert.equal(card.title, 'Renamed');
+  assert.ok((card.tags || []).includes('tier:2'), 'absent tier key ⇒ tier unchanged');
+  assert.ok((harness.store.get('c1').tags || []).includes('tier:2'));
+  await close();
+});
+
+test('WIRE card_retier new_tier "tier:0" → validation_failed RANGE message; no audit row, tier unchanged (parity)', async () => {
+  const { harness, callRaw, close } = await rawWire({ seed: tieredCard }); // tier:2, version 1
+  const r = await callRaw('card_retier', { id: 'c1', new_tier: 'tier:0', expected_version: 1, reason: 'probe' });
+  assert.equal(r.isError, true);
+  const p = payloadOf(r);
+  assert.equal(p.code, 'validation_failed');
+  assert.equal(p.message, 'new_tier must be an int in 1..4, got 0', 'retier RANGE message verbatim');
+  assert.equal(harness.tierAudit().length, 0, 'a rejected retier writes NO audit row');
+  assert.ok((harness.store.get('c1').tags || []).includes('tier:2'), 'tier unchanged');
+  await close();
+});
+
+test('WIRE card_retier new_tier null → REJECTED, no audit row, tier unchanged (spine-parity invariant) (parity)', async () => {
+  // Parity invariant: a null new_tier is REJECTED (no mutation, no audit row) — exactly what
+  // the spine does. ENVELOPE NUANCE: the real spine types new_tier as a REQUIRED string, so it
+  // rejects null at FastMCP's schema layer (isError, no domain code/message). The mock's
+  // permissive {type:object} schema admits null, so it surfaces a clean validation_failed via
+  // the SAME _patch_tier_to_int malformed path. Both reject; the reject-and-don't-audit
+  // invariant is what parity requires here.
+  const { harness, callRaw, close } = await rawWire({ seed: tieredCard });
+  const r = await callRaw('card_retier', { id: 'c1', new_tier: null, expected_version: 1, reason: 'probe' });
+  assert.equal(r.isError, true, 'null new_tier is rejected (matches the spine: never applied)');
+  assert.equal(harness.tierAudit().length, 0, 'no audit row on the rejected retier');
+  assert.ok((harness.store.get('c1').tags || []).includes('tier:2'), 'tier unchanged');
+  await close();
 });

@@ -1,6 +1,6 @@
 /**
  * MCPProvider — Kanbantt's data provider backed by a real MCP server (the
- * Claunker spine, or any server conforming to kanbantt-mcp-spec.md v0.2.4).
+ * Claunker spine, or any server conforming to kanbantt-mcp-spec.md v0.3.0).
  *
  * REWRITE NOTE (supersedes the v0.1.0 REST provider): the old implementation
  * spoke a bespoke REST contract — `GET /mcp/capabilities`, REST resources, a
@@ -311,6 +311,12 @@ export function createMCPProvider({
         hasCardMove: toolNames.has('card_move'),
         hasCardDelete: toolNames.has('card_delete'),
         canWrite: WRITE_TOOLS.every((t) => toolNames.has(t)),
+        // canRetier gates the GOVERNED tier-change control (card_retier) — the audited
+        // path that re-tiers a SET tier and writes a tier_audit row. It derives from
+        // card_retier ALONE, INDEPENDENT of canWrite: a server may advertise the audited
+        // re-tier without the full card_* write set (exactly as canResolve is independent
+        // of canWrite/escalations). Gate the re-tier affordance on this — never on canWrite.
+        canRetier: toolNames.has('card_retier'),
         escalations: toolNames.has('escalation_list') && toolNames.has('escalation_resolve'),
         // canResolve gates the SINGLE mutating control (escalation approve/deny)
         // independently of `escalations` (which also needs escalation_list — this slice
@@ -479,6 +485,22 @@ export function createMCPProvider({
       requireCapability('canWrite');
       const out = await call('card_delete', { id, expected_version });
       return (out.card && out.card.id) || id;
+    },
+
+    /** card_retier — the GOVERNED, audited tier change (spec v0.3.0 §Re-tier). Changes
+     *  an ALREADY-SET tier to a different valid tier (1..4); the server records an
+     *  append-only tier_audit row and enforces every invariant (currently-tiered,
+     *  in-range, differs-from-current, non-empty reason) — each surfaces as code
+     *  'validation_failed'. Gated on `canRetier` (card_retier advertised), INDEPENDENT of
+     *  canWrite. There is NO force: a re-tier re-decides against fresh state, so a stale
+     *  expected_version is code 'conflict' carrying meta.current — the SAME boundary as
+     *  the other writes. `new_tier` crosses the wire in COLON form, mapped from the
+     *  board's internal HYPHEN form HERE (the single tier-translation seam); the returned
+     *  Card is re-projected to internal (tier DERIVED from its tags). */
+    async cardRetier(id, new_tier, expected_version, reason) {
+      requireCapability('canRetier');
+      const out = await call('card_retier', { id, new_tier: tierInternalToWire(new_tier), expected_version, reason });
+      return toInternalCard(out.card);
     },
 
     /* ---- board config writes (optional capability sets) ---- */
