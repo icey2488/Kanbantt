@@ -147,7 +147,7 @@ export function createMCPProvider({
   let client = null;
   let transport = null;
   let server = null;        // { name, version, schema_version }
-  let capabilities = null;  // { projects, tasks, escalations, artifacts, columns, tags, realtime }
+  let capabilities = null;  // { projects, tasks, canWrite, canResolve, escalations, artifacts, columns, tags, realtime }
   let toolNames = new Set();
   let connected = false;
 
@@ -231,6 +231,14 @@ export function createMCPProvider({
         hasCardDelete: toolNames.has('card_delete'),
         canWrite: WRITE_TOOLS.every((t) => toolNames.has(t)),
         escalations: toolNames.has('escalation_list') && toolNames.has('escalation_resolve'),
+        // canResolve gates the SINGLE mutating control (escalation approve/deny)
+        // independently of `escalations` (which also needs escalation_list — this slice
+        // deliberately advertises escalation_resolve WITHOUT it) and of canWrite (the
+        // card_* board writes). The Claunker spine advertises escalation_resolve alone,
+        // so canResolve is true while escalations stays false; that asymmetry is the whole
+        // reason for a distinct flag. Gate the resolve affordance on this — never on
+        // canWrite or escalations.
+        canResolve: toolNames.has('escalation_resolve'),
         artifacts: toolNames.has('artifact_list'),
         columns: toolNames.has('column_create') && toolNames.has('column_update') && toolNames.has('column_delete'),
         tags: toolNames.has('tag_create') && toolNames.has('tag_update') && toolNames.has('tag_delete'),
@@ -376,9 +384,14 @@ export function createMCPProvider({
       requireCapability('escalations');
       return (await call('escalation_list', { status })).escalations || [];
     },
-    async escalationResolve(id, resolution) {
-      requireCapability('escalations');
-      return (await call('escalation_resolve', { id, resolution })).escalation;
+    /** escalation_resolve — the ONE mutating control. Sends BOTH the decision and
+     *  its rationale; the server enforces the >=10-char rationale floor and the
+     *  operator-only actor invariant. The actor is NEVER sent — the server derives it
+     *  from the authenticated credential. Gated on `canResolve` (escalation_resolve
+     *  advertised), INDEPENDENT of `escalations`/`canWrite`. */
+    async escalationResolve(id, { resolution, resolution_rationale } = {}) {
+      requireCapability('canResolve');
+      return (await call('escalation_resolve', { id, resolution, resolution_rationale })).escalation;
     },
 
     /* ---- artifacts (optional capability) ---- */

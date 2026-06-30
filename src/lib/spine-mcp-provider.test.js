@@ -39,7 +39,7 @@ test('connect → initialize + tools/list; server name and capabilities from adv
   assert.deepEqual(capabilities, {
     projects: true, tasks: true,
     hasCardCreate: true, hasCardUpdate: true, hasCardMove: true, hasCardDelete: true, canWrite: true,
-    escalations: true, artifacts: true, columns: true, tags: true, realtime: false,
+    escalations: true, canResolve: true, artifacts: true, columns: true, tags: true, realtime: false,
   });
   assert.equal(provider.supportsRealtime(), false, 'v1 is tools-only → board polls');
   assert.ok(provider.hasTool('card_move'));
@@ -50,7 +50,36 @@ test('connect → initialize + tools/list; server name and capabilities from adv
 test('capability gating: a server without escalation tools fails escalationList as unsupported', async () => {
   const { provider, harness } = await connected({ omitTools: ['escalation_list', 'escalation_resolve'] });
   assert.equal(provider.getCapabilities().capabilities.escalations, false);
+  assert.equal(provider.getCapabilities().capabilities.canResolve, false, 'no escalation_resolve ⇒ canResolve false');
   await assert.rejects(() => provider.escalationList(), (e) => e instanceof MCPProviderError && e.code === 'unsupported_capability');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('escalationResolve sends id + resolution + resolution_rationale, gated on canResolve (not escalations)', async () => {
+  // Asymmetric advertising: a spine advertising escalation_resolve but NOT
+  // escalation_list ⇒ escalations:false yet canResolve:true. The resolve control
+  // gates on canResolve, so it stays usable on that read-only-board spine.
+  const { provider, harness } = await connected({ omitTools: ['escalation_list'] });
+  const caps = provider.getCapabilities().capabilities;
+  assert.equal(caps.escalations, false, 'escalations needs escalation_list too');
+  assert.equal(caps.canResolve, true, 'canResolve needs only escalation_resolve');
+
+  const out = await provider.escalationResolve('e1', { resolution: 'deny', resolution_rationale: 'rejecting on review' });
+  // the harness echoes the wire args back → proves BOTH fields were forwarded.
+  assert.equal(out.resolution, 'deny');
+  assert.equal(out.resolution_rationale, 'rejecting on review');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('escalationResolve is unsupported when escalation_resolve is not advertised (canResolve false)', async () => {
+  const { provider, harness } = await connected({ omitTools: ['escalation_resolve'] });
+  assert.equal(provider.getCapabilities().capabilities.canResolve, false);
+  await assert.rejects(
+    () => provider.escalationResolve('e1', { resolution: 'approve', resolution_rationale: 'approved after review' }),
+    (e) => e instanceof MCPProviderError && e.code === 'unsupported_capability',
+  );
   await provider.disconnect();
   await harness.close();
 });

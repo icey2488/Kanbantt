@@ -1056,10 +1056,14 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
   const checklist = task.checklist || [];
   const checklistDone = checklist.filter((c) => c.done).length;
   const hasChecklist = checklist.length > 0;
-  // E1: a live unresolved escalation on this card (from card_list's per-card
-  // badge). Gated PURELY on the badge data — NOT featureFlags.escalations (display
-  // is decoupled from the list/resolve tools). Display only; nothing acts on it.
-  const escalated = task.badge && task.badge.kind === 'escalation';
+  // E1/E2: a per-card escalation badge from card_list. Gated PURELY on the badge
+  // data — NOT featureFlags.escalations (display is decoupled from the list/resolve
+  // tools). Three states drive the pill: 'unresolved' → amber "Escalated" (needs a
+  // human); 'denied' → RED "Denied" (the ghost-worker kill-signal); approved → no
+  // badge at all (the card carries none). Display only here; the modal acts on it.
+  const badge = task.badge && task.badge.kind === 'escalation' ? task.badge : null;
+  const escalated = !!badge;
+  const denied = !!badge && badge.status === 'denied';
 
   // Long-press → move (narrow board ONLY). These Pointer Event handlers attach only
   // when BoardView passes onMoveRequest; Matrix and desktop omit it, so nothing is
@@ -1145,24 +1149,28 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
       >
         <div style={{ marginBottom: 8 }}>
           {escalated && (
-            // Escalation badge (E1, display-only): an active block that needs a
-            // human. Amber AlertTriangle pill — deliberately NOT the `◆` diamond
-            // used for overdue/tier, so "needs human" never reads as a tier marker.
-            // Sits on its own row above the title, left-aligned, so the title can
-            // use the full card width below it.
+            // Escalation badge (display-only). Unresolved → amber "Escalated" (an
+            // active block that needs a human); denied → RED "Denied" (theme coral,
+            // the immediately-visible ghost-worker kill-signal). AlertTriangle pill —
+            // deliberately NOT the `◆` diamond used for overdue/tier, so it never
+            // reads as a tier marker. Its own row above the title, left-aligned, so
+            // the title can use the full card width below it.
             <span
-              title={`Escalation — ${task.badge.reason || 'needs human review'}`}
+              title={denied
+                ? `Denied — ${badge.reason || 'control change rejected'}`
+                : `Escalation — ${badge.reason || 'needs human review'}`}
               style={{
                 display: 'inline-flex', alignItems: 'center', gap: 4,
                 marginBottom: 6,
                 padding: '2px 6px', borderRadius: 5,
-                background: `${C.amber}1f`, border: `1px solid ${C.amber}66`,
-                color: C.amber, fontFamily: F.mono, fontSize: 9, fontWeight: 700,
+                background: `${denied ? C.coral : C.amber}1f`,
+                border: `1px solid ${denied ? C.coral : C.amber}66`,
+                color: denied ? C.coral : C.amber, fontFamily: F.mono, fontSize: 9, fontWeight: 700,
                 letterSpacing: '0.08em', textTransform: 'uppercase',
               }}
             >
               <AlertTriangle size={10} strokeWidth={2.25} />
-              Escalated
+              {denied ? 'Denied' : 'Escalated'}
             </span>
           )}
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
@@ -2302,7 +2310,7 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
 /* ============================================================
    TASK MODAL
    ============================================================ */
-function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCreateTag, readOnly }) {
+function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCreateTag, readOnly, canResolve, onResolveEscalation }) {
   const C = useTheme();
   const [draft, setDraft] = useState(task);
   const [newTagInput, setNewTagInput] = useState(false);
@@ -2321,13 +2329,44 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
     fontFamily: F.body, fontSize: 14, boxSizing: 'border-box', outline: 'none',
   };
 
-  // E1 escalation detail (display-only). Gated PURELY on the badge's presence in
-  // the card data (card_list always supplies it) — NOT on featureFlags.escalations
-  // (that gates the list+resolve tools, which we deliberately don't require for
-  // display) and NOT on readOnly. Read from the `task` prop, never the editable
-  // `draft`: it's a read-only authorization artifact, not a task field. There is
-  // no resolve affordance here — acting on the block is a later slice.
-  const escalation = task.badge && task.badge.kind === 'escalation' ? task.badge : null;
+  // E1/E2 escalation. Read from the `task` prop, never the editable `draft`: it is a
+  // read-only authorization artifact, not a task field. `resolvedLocally` is an
+  // optimistic override so the section reflects a resolve the INSTANT it succeeds,
+  // before the parent's next poll re-renders this modal: approve → the badge clears
+  // (section closes); deny → the badge flips to the denied receipt.
+  const [decision, setDecision] = useState(null);       // 'approve' | 'deny' | null
+  const [rationale, setRationale] = useState('');
+  const [resolving, setResolving] = useState(false);
+  const [resolveError, setResolveError] = useState(null);
+  const [resolvedLocally, setResolvedLocally] = useState(null); // null | { resolution, resolution_rationale }
+
+  const rawBadge = task.badge && task.badge.kind === 'escalation' ? task.badge : null;
+  const badge = resolvedLocally
+    ? (resolvedLocally.resolution === 'approve'
+        ? null
+        : { ...rawBadge, status: 'denied', resolution_rationale: resolvedLocally.resolution_rationale })
+    : rawBadge;
+  const escalationDenied = !!badge && badge.status === 'denied';
+  // The resolve control shows ONLY for an unresolved badge on a canResolve server. It
+  // is INDEPENDENT of readOnly: the section sits OUTSIDE the disabled fieldset, so it
+  // is never inerted — the board's card-writes stay hidden, this one mutation does not.
+  const showResolveControl = !!badge && badge.status === 'unresolved' && !!canResolve;
+  const rationaleOk = rationale.trim().length >= 10;   // mirror the server's >=10 floor
+  const canSubmitResolve = showResolveControl && decision != null && rationaleOk && !resolving;
+
+  const submitResolve = async () => {
+    if (!canSubmitResolve) return;
+    setResolving(true);
+    setResolveError(null);
+    try {
+      await onResolveEscalation(badge.id, { resolution: decision, resolution_rationale: rationale.trim() });
+      setResolvedLocally({ resolution: decision, resolution_rationale: rationale.trim() });
+    } catch (e) {
+      setResolveError((e && e.message) || 'resolve failed');
+    } finally {
+      setResolving(false);
+    }
+  };
 
   const toggleTag = (tagId) => {
     const has = (draft.tags || []).includes(tagId);
@@ -2395,30 +2434,31 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
           </button>
         </div>
 
-        {/* Escalation detail (E1, display-only). Rendered OUTSIDE the fieldset
-            below — it carries no controls, so it must never be inerted, and it is
-            never a write path. No resolve affordance: surfacing the block is this
-            slice; acting on it is a later one. */}
-        {escalation && (
+        {/* Escalation (E1 display + E2 resolve). Rendered OUTSIDE the fieldset below,
+            so it is NEVER inerted by read-only mode — the ONE permitted mutation
+            (operator approve/deny) stays usable on a read-only board mirror. Header
+            and frame go coral once denied, amber while it needs a human. */}
+        {badge && (
           <div style={{
             marginBottom: 22, padding: 14,
-            background: `${C.amber}12`, border: `1px solid ${C.amber}55`,
+            background: `${escalationDenied ? C.coral : C.amber}12`,
+            border: `1px solid ${escalationDenied ? C.coral : C.amber}55`,
             borderRadius: 10,
           }}>
             <div style={{
               display: 'flex', alignItems: 'center', gap: 7, marginBottom: 12,
-              fontFamily: F.mono, fontSize: 10, color: C.amber, fontWeight: 700,
+              fontFamily: F.mono, fontSize: 10, color: escalationDenied ? C.coral : C.amber, fontWeight: 700,
               letterSpacing: '0.12em', textTransform: 'uppercase',
             }}>
               <AlertTriangle size={13} strokeWidth={2} />
-              Escalation — needs human review
+              {escalationDenied ? 'Escalation — denied' : 'Escalation — needs human review'}
             </div>
             <div style={fieldLabel}>Reason</div>
             <div style={{
               fontFamily: F.body, fontSize: 13, color: C.text,
               lineHeight: 1.5, marginBottom: 16,
             }}>
-              {escalation.reason || '—'}
+              {badge.reason || '—'}
             </div>
             <div style={fieldLabel}>Control diff (authorization artifact)</div>
             {/*
@@ -2435,7 +2475,7 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
               whiteSpace: 'pre-wrap', wordBreak: 'break-word',
               maxHeight: 280, overflowY: 'auto',
             }}>
-              {String(escalation.control_diff || '').split('\n').map((line, i) => {
+              {String(badge.control_diff || '').split('\n').map((line, i) => {
                 // Whole-line classification only; the literal text is rendered as-is.
                 // `+++`/`---` file headers stay neutral (they aren't content edits).
                 const added = line.startsWith('+') && !line.startsWith('+++');
@@ -2449,6 +2489,89 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
                 );
               })}
             </pre>
+
+            {/* DENIED → the receipt (K4): the decision + its rationale, shown in place
+                of any control. A denied control change is a persistent kill-signal. */}
+            {escalationDenied && (
+              <div style={{ marginTop: 16 }}>
+                <div style={fieldLabel}>Resolution</div>
+                <div style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  padding: '3px 9px', borderRadius: 6, marginBottom: badge.resolution_rationale ? 12 : 0,
+                  background: `${C.coral}1f`, border: `1px solid ${C.coral}66`,
+                  color: C.coral, fontFamily: F.mono, fontSize: 11, fontWeight: 700,
+                  letterSpacing: '0.08em', textTransform: 'uppercase',
+                }}>
+                  <AlertTriangle size={11} strokeWidth={2.25} /> Denied
+                </div>
+                {badge.resolution_rationale && (
+                  <>
+                    <div style={fieldLabel}>Rationale</div>
+                    <div style={{ fontFamily: F.body, fontSize: 13, color: C.text, lineHeight: 1.5 }}>
+                      {badge.resolution_rationale}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* UNRESOLVED + canResolve → the resolve control (K3): an approve/deny
+                choice, a rationale, and a submit gated at the server's >=10-char floor.
+                The ONE permitted mutation in MCP mode — gated on canResolve, NOT on
+                read-only (the board's card-writes stay hidden; this does not). */}
+            {showResolveControl && (
+              <div style={{ marginTop: 16, borderTop: `1px solid ${C.amber}33`, paddingTop: 16 }}>
+                <div style={fieldLabel}>Decision</div>
+                <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+                  {['approve', 'deny'].map((d) => {
+                    const active = decision === d;
+                    const accent = d === 'deny' ? C.coral : C.mint;
+                    return (
+                      <button key={d} type="button" onClick={() => setDecision(d)} style={{
+                        flex: 1, padding: '9px 12px', borderRadius: 7, cursor: 'pointer',
+                        background: active ? `${accent}1f` : 'transparent',
+                        border: `1px solid ${active ? accent : C.border}`,
+                        color: active ? accent : C.textMuted,
+                        fontFamily: F.mono, fontSize: 12, fontWeight: 700,
+                        letterSpacing: '0.06em', textTransform: 'uppercase',
+                      }}>
+                        {d}
+                      </button>
+                    );
+                  })}
+                </div>
+                <label style={fieldLabel}>Rationale (required, min 10 chars)</label>
+                <textarea
+                  value={rationale}
+                  onChange={(e) => setRationale(e.target.value)}
+                  rows={3}
+                  placeholder="Why approve or deny? Recorded as the override receipt."
+                  style={{ ...input, resize: 'vertical', minHeight: 64, fontFamily: F.body }}
+                />
+                {resolveError && (
+                  <div style={{ marginTop: 8, color: C.coral, fontFamily: F.mono, fontSize: 11 }}>
+                    {resolveError}
+                  </div>
+                )}
+                <button
+                  type="button"
+                  onClick={submitResolve}
+                  disabled={!canSubmitResolve}
+                  style={{
+                    marginTop: 12, width: '100%', padding: '10px 12px', borderRadius: 7,
+                    background: canSubmitResolve ? C.ice : C.surface,
+                    border: `1px solid ${canSubmitResolve ? C.ice : C.border}`,
+                    color: canSubmitResolve ? C.bg : C.textMuted,
+                    cursor: canSubmitResolve ? 'pointer' : 'not-allowed',
+                    fontFamily: F.mono, fontSize: 12, fontWeight: 700,
+                    letterSpacing: '0.06em', textTransform: 'uppercase',
+                    opacity: resolving ? 0.7 : 1,
+                  }}
+                >
+                  {resolving ? 'Resolving…' : 'Submit decision'}
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -3880,6 +4003,9 @@ export default function App() {
   // kanbantt_config MCP target is set.
   const [spineModel, setSpineModel] = useState(null);
   const [spineState, setSpineState] = useState(null);
+  // The active MCP connection (provider + pollNow), captured so the escalation-resolve
+  // handler can reach the provider without re-deriving it. Set in the connection effect.
+  const spineConnRef = useRef(null);
   // MOCK_EVENTS no longer renders; the Calendar/Timeline overlay plumbing stays
   // wired to this empty list as an attachment point for real Google Calendar
   // integration (see MOCK_EVENTS above).
@@ -3910,6 +4036,10 @@ export default function App() {
   // a polled mirror from ever writing the local canonical store; see STEP 4).
   const mcpCanWrite = !!(spineState && spineState.capabilities && spineState.capabilities.canWrite);
   const mcpReadOnly = mcpActive && !mcpCanWrite;
+  // canResolve gates the ONE permitted mutation in MCP mode (escalation approve/deny),
+  // threaded via state.capabilities exactly like canWrite. It is INDEPENDENT of
+  // mcpReadOnly: a read-only board mirror can still resolve escalations.
+  const mcpCanResolve = !!(spineState && spineState.capabilities && spineState.capabilities.canResolve);
   const spineTasks = useMemo(() => {
     if (!spineModel) return null;
     const today = iso(new Date());
@@ -4041,6 +4171,7 @@ export default function App() {
         // writable token) can never mistake a stale read-only mirror for local truth.
         // Do NOT route spineModel into the store.
         conn = createMcpConnectionFromConfig({ config, applyModel: setSpineModel });
+        spineConnRef.current = conn; // expose to the escalation-resolve handler
         unsub = conn.subscribe((st) => {
           setSpineState(st);
           if (st.provider !== 'mcp') setSpineModel(null); // degrade → revert to local
@@ -4048,7 +4179,7 @@ export default function App() {
         conn.connect();
       })
       .catch((e) => { console.error('MCP connection load failed:', e); });
-    return () => { disposed = true; unsub(); if (conn) conn.disconnect(); };
+    return () => { disposed = true; unsub(); if (conn) conn.disconnect(); spineConnRef.current = null; };
   }, []);
 
   // Connect: loads GIS on demand (first Google traffic, inside the click), then
@@ -4159,6 +4290,34 @@ export default function App() {
       store.delete(id, { expected_version: cur.version });
     });
     setEditing(null);
+  };
+
+  // The ONE permitted mutation in MCP mode: resolve an escalation (operator approve/
+  // deny). Distinct from the board's card-writes — those are gated OFF on a read-only
+  // spine; this is gated on mcpCanResolve, INDEPENDENT of mcpReadOnly. Sends the
+  // decision + rationale; the server derives the actor from the credential (never
+  // sent). On success: optimistically reflect it in the polled model (approve clears
+  // the badge; deny flips it to the red 'denied' receipt), then poll to reconcile from
+  // card_list (the authoritative source).
+  const handleResolveEscalation = async (escalationId, { resolution, resolution_rationale }) => {
+    const conn = spineConnRef.current;
+    const provider = conn && conn.getProvider && conn.getProvider();
+    if (!provider) throw new Error('no active spine connection');
+    await provider.escalationResolve(escalationId, { resolution, resolution_rationale });
+    setSpineModel((m) => {
+      if (!m) return m;
+      return {
+        ...m,
+        cards: m.cards.map((c) => {
+          if (!(c.badge && c.badge.id === escalationId)) return c;
+          if (resolution === 'approve') return { ...c, badge: null };
+          return { ...c, badge: { ...c.badge, status: 'denied', resolution_rationale } };
+        }),
+      };
+    });
+    // Reconcile from card_list (the source of truth); the optimistic state stands until
+    // it lands. Fire-and-forget so the modal can close immediately.
+    if (conn && conn.pollNow) Promise.resolve(conn.pollNow()).catch(() => {});
   };
 
   const quickAdd = (colId, title) => {
@@ -4395,7 +4554,8 @@ export default function App() {
         {editing && (
           <TaskModal task={editing} tags={activeTags} columns={activeColumns} isNew={isNew}
             onSave={saveTask} onDelete={deleteTask}
-            onClose={() => setEditing(null)} onCreateTag={createTag} readOnly={mcpReadOnly} />
+            onClose={() => setEditing(null)} onCreateTag={createTag} readOnly={mcpReadOnly}
+            canResolve={mcpCanResolve} onResolveEscalation={handleResolveEscalation} />
         )}
         {showSettings && (
           <SettingsModal columns={columns} tags={tags} tasks={tasks}

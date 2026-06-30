@@ -122,7 +122,7 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
         case 'tag_update': store.tagUpdate(a.id, a.patch || {}); return ok(board());
         case 'tag_delete': store.tagDelete(a.id); return ok(board());
         case 'escalation_list': return ok({ escalations: [] });
-        case 'escalation_resolve': return ok({ escalation: { id: a.id, status: 'resolved', resolution: a.resolution } });
+        case 'escalation_resolve': return ok({ escalation: { id: a.id, status: 'resolved', resolution: a.resolution, resolution_rationale: a.resolution_rationale } });
         case 'artifact_list': return ok({ artifacts: [] });
         default: return domainError('not_found', `no tool ${toolName}`);
       }

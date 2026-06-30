@@ -172,6 +172,10 @@ export function createMcpConnection({
       // a valid read-only backend (caps.canWrite === false). Signal it in the
       // indicator so the board chip reads "MCP: <name> (read-only)"; the board
       // reads caps.canWrite (threaded via state.capabilities) to gate writes.
+      // caps.canResolve rides through the SAME state.capabilities channel (the whole
+      // caps object is threaded below): it gates the one escalation approve/deny
+      // control INDEPENDENTLY of read-only mode, so a read-only mirror can still
+      // surface that single human-gated mutation.
       const indicator = caps.canWrite
         ? mcpIndicator(res.server.name)
         : `${mcpIndicator(res.server.name)} (read-only)`;
