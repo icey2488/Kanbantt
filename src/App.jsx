@@ -2462,33 +2462,115 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
             </div>
             <div style={fieldLabel}>Control diff (authorization artifact)</div>
             {/*
-              control_diff is the authorization artifact and MUST be shown verbatim:
-              the literal unified-diff text, line for line. We only colorize whole
-              lines (added / removed / context) — we never parse it into a key/value
-              or side-by-side view. A parsed view is a lossy, derived layer, and on
-              an approval surface a lossy view of what is being authorized is unsafe.
+              control_diff is the authorization artifact. Canonically it is a
+              STRUCTURED OBJECT — { control_id, old_value, new_value, reduces_control }
+              — naming exactly which control is being overridden and how. We render
+              it as an explicit delta (old → new) and SHOUT when the change relaxes a
+              control (reduces_control === true): a loud coral flag plus the new value
+              in red, so a loosened safety boundary can never be approved by accident.
+              A bare STRING is the legacy/fallback shape — render it verbatim as a raw
+              unified diff, colorizing whole lines only (never re-parsed). A null /
+              absent control_diff renders a muted em dash. This block renders for both
+              the unresolved and denied states.
             */}
-            <pre style={{
-              margin: 0, marginTop: 4, padding: 12,
-              background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7,
-              fontFamily: F.mono, fontSize: 12, lineHeight: 1.5,
-              whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-              maxHeight: 280, overflowY: 'auto',
-            }}>
-              {String(badge.control_diff || '').split('\n').map((line, i) => {
-                // Whole-line classification only; the literal text is rendered as-is.
-                // `+++`/`---` file headers stay neutral (they aren't content edits).
-                const added = line.startsWith('+') && !line.startsWith('+++');
-                const removed = line.startsWith('-') && !line.startsWith('---');
-                const color = added ? C.mint : removed ? C.coral : C.textMuted;
-                const bg = added ? `${C.mint}14` : removed ? `${C.coral}14` : 'transparent';
+            {(() => {
+              const cd = badge.control_diff;
+
+              // null / absent → nothing to authorize; muted placeholder.
+              if (cd == null) {
                 return (
-                  <span key={i} style={{ display: 'block', minHeight: '1.5em', color, background: bg }}>
-                    {line}
-                  </span>
+                  <div style={{
+                    marginTop: 4, fontFamily: F.mono, fontSize: 12, color: C.textMuted,
+                  }}>—</div>
                 );
-              })}
-            </pre>
+              }
+
+              // STRING (legacy/fallback) → verbatim unified diff, whole-line colorized.
+              if (typeof cd === 'string') {
+                return (
+                  <pre style={{
+                    margin: 0, marginTop: 4, padding: 12,
+                    background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7,
+                    fontFamily: F.mono, fontSize: 12, lineHeight: 1.5,
+                    whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                    maxHeight: 280, overflowY: 'auto',
+                  }}>
+                    {cd.split('\n').map((line, i) => {
+                      // Whole-line classification only; the literal text is rendered as-is.
+                      // `+++`/`---` file headers stay neutral (they aren't content edits).
+                      const added = line.startsWith('+') && !line.startsWith('+++');
+                      const removed = line.startsWith('-') && !line.startsWith('---');
+                      const color = added ? C.mint : removed ? C.coral : C.textMuted;
+                      const bg = added ? `${C.mint}14` : removed ? `${C.coral}14` : 'transparent';
+                      return (
+                        <span key={i} style={{ display: 'block', minHeight: '1.5em', color, background: bg }}>
+                          {line}
+                        </span>
+                      );
+                    })}
+                  </pre>
+                );
+              }
+
+              // OBJECT (canonical) → structured delta with a loud reduces_control signal.
+              const relaxes = cd.reduces_control === true;
+              const fmtVal = (v) => {
+                if (v === undefined) return '—';
+                if (v === null) return 'null';
+                return typeof v === 'object' ? JSON.stringify(v) : String(v);
+              };
+              return (
+                <div style={{
+                  marginTop: 4, padding: 12, borderRadius: 7, background: C.bg,
+                  border: `1px solid ${relaxes ? `${C.coral}66` : C.border}`,
+                }}>
+                  <div style={{
+                    fontFamily: F.mono, fontSize: 9, color: C.textDim,
+                    letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: 5,
+                  }}>Control overridden</div>
+                  <div style={{
+                    fontFamily: F.mono, fontSize: 13, color: C.text, fontWeight: 700,
+                    wordBreak: 'break-word', marginBottom: 12,
+                  }}>{fmtVal(cd.control_id)}</div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 9, flexWrap: 'wrap' }}>
+                    <span style={{
+                      fontFamily: F.mono, fontSize: 12, color: C.textMuted,
+                      padding: '3px 8px', borderRadius: 5, background: `${C.textMuted}14`,
+                      textDecoration: 'line-through', wordBreak: 'break-word',
+                    }}>{fmtVal(cd.old_value)}</span>
+                    <span style={{
+                      fontFamily: F.mono, fontSize: 14, fontWeight: 700, flexShrink: 0,
+                      color: relaxes ? C.coral : C.textDim,
+                    }}>→</span>
+                    <span style={{
+                      fontFamily: F.mono, fontSize: 12, fontWeight: 700,
+                      padding: '3px 8px', borderRadius: 5, wordBreak: 'break-word',
+                      color: relaxes ? C.coral : C.mint,
+                      background: relaxes ? `${C.coral}1f` : `${C.mint}14`,
+                    }}>{fmtVal(cd.new_value)}</span>
+                  </div>
+
+                  {relaxes ? (
+                    <div style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 6, marginTop: 12,
+                      padding: '4px 9px', borderRadius: 6,
+                      background: `${C.coral}1f`, border: `1px solid ${C.coral}66`,
+                      color: C.coral, fontFamily: F.mono, fontSize: 10, fontWeight: 700,
+                      letterSpacing: '0.1em', textTransform: 'uppercase',
+                    }}>
+                      <AlertTriangle size={11} strokeWidth={2.25} />
+                      Relaxes control — weakens guardrail
+                    </div>
+                  ) : cd.reduces_control === false ? (
+                    <div style={{
+                      marginTop: 12, fontFamily: F.mono, fontSize: 10, fontWeight: 700,
+                      letterSpacing: '0.1em', textTransform: 'uppercase', color: C.mint,
+                    }}>Does not weaken control</div>
+                  ) : null}
+                </div>
+              );
+            })()}
 
             {/* DENIED → the receipt (K4): the decision + its rationale, shown in place
                 of any control. A denied control change is a persistent kill-signal. */}
