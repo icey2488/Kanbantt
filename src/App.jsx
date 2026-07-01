@@ -2325,7 +2325,7 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
 /* ============================================================
    TASK MODAL
    ============================================================ */
-function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCreateTag, readOnly, mcpWritable, canResolve, onResolveEscalation }) {
+function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCreateTag, readOnly, mcpWritable, canRetier, onRetier, canResolve, onResolveEscalation }) {
   const C = useTheme();
   const [draft, setDraft] = useState(task);
   const [newTagInput, setNewTagInput] = useState(false);
@@ -2335,9 +2335,61 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
   // Two-step delete confirm — the MCP-writable tombstone guard (a stray click must
   // not delete a card). Only the MCP path arms it; local delete stays immediate.
   const [confirmDelete, setConfirmDelete] = useState(false);
-  // tier is WRITE-ONCE on the spine (settable while null; a non-null tier can't be
-  // changed). Lock the control once set so the user can't queue a doomed write.
+  // tier is WRITE-ONCE on the spine via card_update (settable while null; a non-null
+  // tier can't be changed there). Lock the plain control once set so the user can't
+  // queue a doomed update. The GOVERNED re-tier (card_retier) is the ONE sanctioned
+  // way to change a set tier — gated on canRetier, surfaced as a deliberate sub-flow.
   const tierLocked = task.tier != null;
+
+  // ── Governed re-tier sub-flow (card_retier) ─────────────────────────────────
+  // A FOCUSED, isolated action — NOT bundled with the title/AC save. Two-step +
+  // deliberate, in the spirit of the delete confirm: Unlock reveals a tier picker +
+  // a REQUIRED reason, and Confirm calls the audited path. Tier is hyphen "tier-N"
+  // internally (the provider maps to the wire "tier:N"); compare on the numeric part.
+  const [retierOpen, setRetierOpen] = useState(false);
+  const [retierTier, setRetierTier] = useState(task.tier); // selected new tier (defaults to current)
+  const [retierReason, setRetierReason] = useState('');
+  const [retiering, setRetiering] = useState(false);
+  const tierNum = (t) => { const m = /^tier-([1-9][0-9]*)$/.exec(t || ''); return m ? Number(m[1]) : null; };
+  // Mirror the spine's invariants client-side (the spine still enforces them as the
+  // backstop): a re-tier needs a DIFFERENT in-range tier and a non-empty reason.
+  const retierChanged = retierTier != null && retierTier !== draft.tier;
+  const retierReasonOk = retierReason.trim().length > 0;
+  const canConfirmRetier = retierChanged && retierReasonOk && !retiering;
+  // reduces_control cue: a DOWNGRADE (new tier number < current) weakens oversight.
+  // No coral when new_tier >= current. draft.tier is the current (re-)locked value.
+  const retierDowngrade = retierChanged
+    && tierNum(retierTier) != null && tierNum(draft.tier) != null
+    && tierNum(retierTier) < tierNum(draft.tier);
+
+  // Confirm → the governed write. The parent (onRetier) owns the optimistic apply +
+  // the SHARED loud-revert path (snap-back + persistent banner) and hands back the
+  // fresh Card on success; we re-lock the field at that fresh tier and clear the
+  // sub-flow. On failure the parent already surfaced the loud banner + snapped the
+  // board back, so we just close the sub-flow (re-locking at the unchanged value) —
+  // we do NOT invent a second, modal-local error surface.
+  const confirmRetier = async () => {
+    if (!canConfirmRetier) return;
+    setRetiering(true);
+    try {
+      const card = await onRetier(task.id, retierTier, retierReason.trim());
+      if (card && card.tier != null) setDraft((d) => ({ ...d, tier: card.tier }));
+      setRetierOpen(false);
+      setRetierReason('');
+    } catch {
+      // Loud-revert already fired in the parent (banner + board snap-back). Close.
+      setRetierOpen(false);
+      setRetierReason('');
+    } finally {
+      setRetiering(false);
+    }
+  };
+  // Cancel → re-lock the field, discard the reason, reset the picker to current.
+  const cancelRetier = () => {
+    setRetierOpen(false);
+    setRetierReason('');
+    setRetierTier(draft.tier);
+  };
 
   const fieldLabel = {
     fontFamily: F.mono, fontSize: 10, color: C.textMuted,
@@ -2704,12 +2756,96 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
                 style={{ ...input, minHeight: 80, resize: 'vertical', fontFamily: F.body, fontSize: 13 }} />
             </div>
             <div>
-              <label style={fieldLabel}>Tier{tierLocked ? ' · write-once (set)' : ''}</label>
+              <label style={fieldLabel}>Tier{tierLocked ? (canRetier ? ' · set' : ' · write-once (set)') : ''}</label>
               {tierLocked ? (
-                // Already tiered → render the value read-only; the spine rejects a
-                // change (tier_write_once), so don't offer one.
-                <div style={{ ...input, color: C.textMuted, fontFamily: F.mono, display: 'flex', alignItems: 'center' }}>
-                  {draft.tier}
+                // Already tiered. The plain control stays LOCKED — card_update can't
+                // change a set tier (tier_write_once). When the spine advertises
+                // card_retier (canRetier), offer the GOVERNED re-tier as a deliberate,
+                // isolated sub-flow next to the locked value; without canRetier the
+                // value is read-only exactly as before (no action the backend can't do).
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <div style={{ ...input, flex: 1, color: C.textMuted, fontFamily: F.mono, display: 'flex', alignItems: 'center' }}>
+                      {draft.tier}
+                    </div>
+                    {/* GATE on canRetier: the unlock affordance appears ONLY when the
+                        provider reports it. canRetier is false ⇒ no button, tier stays
+                        locked — exactly as today. */}
+                    {canRetier && !retierOpen && (
+                      <button type="button"
+                        onClick={() => { setRetierTier(draft.tier); setRetierReason(''); setRetierOpen(true); }}
+                        style={{
+                          flexShrink: 0, background: 'transparent', border: `1px solid ${C.border}`,
+                          color: C.textMuted, padding: '9px 12px', borderRadius: 7, cursor: 'pointer',
+                          fontFamily: F.mono, fontSize: 11, fontWeight: 700,
+                          letterSpacing: '0.06em', textTransform: 'uppercase', whiteSpace: 'nowrap',
+                        }}>Unlock to re-tier</button>
+                    )}
+                  </div>
+
+                  {/* The deliberate two-step re-tier sub-flow: tier picker (defaults to
+                      current) + REQUIRED reason + Confirm/Cancel. Isolated from the
+                      footer Save (title/AC via cardUpdate): this Confirm never carries
+                      title/AC, and Save never carries the tier — separate calls. */}
+                  {canRetier && retierOpen && (
+                    <div style={{
+                      padding: 12, borderRadius: 7, background: C.bg,
+                      border: `1px solid ${retierDowngrade ? `${C.coral}66` : C.border}`,
+                      display: 'flex', flexDirection: 'column', gap: 10,
+                    }}>
+                      <div>
+                        <label style={fieldLabel}>New tier</label>
+                        <select value={retierTier || ''}
+                          onChange={(e) => setRetierTier(e.target.value || null)}
+                          style={{ ...input, cursor: 'pointer' }}>
+                          <option value="tier-1">tier-1</option>
+                          <option value="tier-2">tier-2</option>
+                          <option value="tier-3">tier-3</option>
+                          <option value="tier-4">tier-4</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label style={fieldLabel}>Reason (required)</label>
+                        <input type="text" value={retierReason}
+                          onChange={(e) => setRetierReason(e.target.value)}
+                          placeholder="Why is this tier changing? Recorded in the tier audit."
+                          style={input} />
+                      </div>
+                      {/* reduces_control cue (light, on-ethos): coral ONLY on a downgrade
+                          (new tier < current = weaker oversight), reusing the control_diff
+                          "relaxes control" coral language. No coral when new_tier >= current. */}
+                      {retierDowngrade && (
+                        <div style={{
+                          display: 'inline-flex', alignItems: 'center', gap: 6,
+                          padding: '4px 9px', borderRadius: 6, alignSelf: 'flex-start',
+                          background: `${C.coral}1f`, border: `1px solid ${C.coral}66`,
+                          color: C.coral, fontFamily: F.mono, fontSize: 10, fontWeight: 700,
+                          letterSpacing: '0.08em', textTransform: 'uppercase',
+                        }}>
+                          <AlertTriangle size={11} strokeWidth={2.25} />
+                          Lowering the tier weakens oversight — this will be logged.
+                        </div>
+                      )}
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <button type="button" onClick={confirmRetier} disabled={!canConfirmRetier} style={{
+                          flex: 1, padding: '9px 12px', borderRadius: 7,
+                          background: canConfirmRetier ? C.ice : C.surface,
+                          border: `1px solid ${canConfirmRetier ? C.ice : C.border}`,
+                          color: canConfirmRetier ? C.bg : C.textMuted,
+                          cursor: canConfirmRetier ? 'pointer' : 'not-allowed',
+                          fontFamily: F.mono, fontSize: 12, fontWeight: 700,
+                          letterSpacing: '0.06em', textTransform: 'uppercase',
+                          opacity: retiering ? 0.7 : 1,
+                        }}>{retiering ? 'Re-tiering…' : 'Confirm re-tier'}</button>
+                        <button type="button" onClick={cancelRetier} style={{
+                          background: 'transparent', border: `1px solid ${C.border}`, color: C.textMuted,
+                          padding: '9px 16px', borderRadius: 7, cursor: 'pointer',
+                          fontFamily: F.mono, fontSize: 12, fontWeight: 700,
+                          letterSpacing: '0.06em', textTransform: 'uppercase',
+                        }}>Cancel</button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <select value={draft.tier || ''}
@@ -4212,6 +4348,11 @@ export default function App() {
   // threaded via state.capabilities exactly like canWrite. It is INDEPENDENT of
   // mcpReadOnly: a read-only board mirror can still resolve escalations.
   const mcpCanResolve = !!(spineState && spineState.capabilities && spineState.capabilities.canResolve);
+  // canRetier gates the GOVERNED tier-change control (card_retier), threaded via
+  // state.capabilities exactly like canResolve. It is INDEPENDENT of canWrite — a
+  // server may advertise the audited re-tier without the full card_* write set — so
+  // the re-tier affordance gates on THIS flag, never on canWrite.
+  const mcpCanRetier = !!(spineState && spineState.capabilities && spineState.capabilities.canRetier);
   const spineTasks = useMemo(() => {
     if (!spineModel) return null;
     const today = iso(new Date());
@@ -4561,6 +4702,48 @@ export default function App() {
     }
   };
 
+  // Governed re-tier (card_retier) — the audited path that changes an ALREADY-SET
+  // tier and writes a tier_audit row. SAME CAPTURE → OPTIMISTIC → call → reconcile /
+  // loud-revert shape as saveTaskMcp, but ISOLATED to the tier: it rides card_retier,
+  // NOT card_update, so a re-tier never carries title/AC (and a Save never carries the
+  // tier). The modal owns the deliberate sub-flow; this owns the write + the SHARED
+  // loud-revert path. It hands the fresh Card back so the modal re-locks at the new
+  // tier; on failure it surfaces the persistent banner AND rethrows so the modal can
+  // close its sub-flow (the banner is the one error surface — no new error path).
+  // expected_version is the live card's opaque version token (cur.version), sourced
+  // from spineModel exactly like every other write here — NOT the modal's snapshot.
+  const retierTaskMcp = async (taskId, newTier, reason) => {
+    const provider = spineProvider();
+    const model = spineModel;
+    if (!provider || !model) { surface('No live spine connection — re-tier not sent.'); return; }
+    const cur = model.cards.find((c) => c.id === taskId && !c.deleted_at);
+    if (!cur) { surface('That card was deleted'); return; }
+    const prior = { tier: cur.tier };       // CAPTURE
+    const expected_version = cur.version;    // the card's opaque version token
+    setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
+      c.id === taskId ? { ...c, tier: newTier } : c) } : m));
+    try {
+      const card = await provider.cardRetier(taskId, newTier, expected_version, reason);
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // RECONCILE (merge fresh tier + version)
+        c.id === taskId ? { ...c, ...card } : c) } : m));
+      reconcileSpine();
+      return card; // hand the fresh Card back so the modal re-locks at the new tier
+    } catch (e) {
+      // SAME loud-revert path as saveTaskMcp: a `conflict` snaps the card TO the
+      // server's truth (fresh tier + version, so a retry uses the right
+      // expected_version); any other error restores the captured prior tier. Either
+      // way the persistent error banner fires — a re-tier conflict surfaces loudly
+      // exactly like the other governed writes.
+      const fresh = e?.code === 'conflict' && e.meta?.current;
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // SNAP-BACK-or-REVERT (synchronous)
+        c.id === taskId
+          ? (fresh ? { ...c, ...e.meta.current } : { ...c, tier: prior.tier })
+          : c) } : m));
+      surface(writeError('re-tier', e));
+      throw e; // let the modal close its sub-flow (the banner is the error surface)
+    }
+  };
+
   const deleteTaskMcp = async (id) => {
     const provider = spineProvider();
     const model = spineModel;
@@ -4884,6 +5067,7 @@ export default function App() {
             onSave={saveTask} onDelete={deleteTask}
             onClose={() => setEditing(null)} onCreateTag={createTag} readOnly={mcpReadOnly}
             mcpWritable={mcpWritable}
+            canRetier={mcpCanRetier} onRetier={retierTaskMcp}
             canResolve={mcpCanResolve} onResolveEscalation={handleResolveEscalation} />
         )}
         {/* SettingsModal readOnly=mcpActive (NOT mcpReadOnly): board-config
