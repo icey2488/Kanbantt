@@ -138,6 +138,63 @@ function errorPayload(result) {
 }
 
 /* ------------------------------------------------------------------------ */
+/* Transport-error classification (mid-session degrade discrimination)      */
+/* ------------------------------------------------------------------------ */
+/**
+ * Classify a RAW transport/SDK error (thrown by client.callTool / client.connect /
+ * client.listTools) into the two FATAL classes that must tear the whole connection
+ * down — or null for a non-fatal transport hiccup that stays op-level.
+ *
+ *   'auth'        — HTTP 401: the request got a RESPONSE with status 401. The token is
+ *                   rejected; retrying with the same credential is pointless → degrade.
+ *   'unreachable' — the request never got a response: a network / CORS / mixed-content /
+ *                   connection failure. Browsers DELIBERATELY collapse these into an
+ *                   opaque TypeError ("Failed to fetch" / "NetworkError…" / "Load
+ *                   failed"), so JS cannot tell which — all mean the spine is gone.
+ *   null          — anything else (e.g. a JSON-RPC protocol error): NOT a connection
+ *                   loss; leave the connection up and let the op-level path handle it.
+ *
+ * Domain errors (validation_failed / conflict) NEVER reach this classifier: they come
+ * back as in-band `isError` results (not thrown), so they can never trigger a degrade —
+ * exactly the discrimination the mid-session hardening requires.
+ */
+export function classifyFatal(e) {
+  const status = e && (e.status ?? e.code ?? (e.response && e.response.status));
+  if (status === 401) return 'auth';
+  const msg = String((e && e.message) || e || '');
+
+  // Auth semantics an error VALUE may carry. Keyed off the value (not a bare scan of the
+  // whole message), so an unrelated mention of a word can't false-positive.
+  const AUTH_VALUE = /unauthorized|invalid[\s_-]*(token|credential)|token[\s_-]*expired|\b401\b/i;
+
+  // Parse-THEN-regex (FIX B): the SDK wraps the server's JSON body in a prose prefix, e.g.
+  //   Error POSTing to endpoint: {"error":"unauthorized"}
+  // Extract the {...} substring and JSON.parse it under try/catch; if a STRING error field
+  // carries auth semantics, classify 'auth' off that structured value. On a parse failure or
+  // no match, fall through to the raw-message regex net below (behavior unchanged there).
+  const open = msg.indexOf('{');
+  const close = msg.lastIndexOf('}');
+  if (open !== -1 && close > open) {
+    try {
+      const body = JSON.parse(msg.slice(open, close + 1));
+      const field = body && (body.error ?? body.message ?? body.error_description ?? body.code);
+      if (typeof field === 'string' && AUTH_VALUE.test(field)) return 'auth';
+    } catch { /* not JSON — fall through to the raw regex net */ }
+  }
+
+  // Raw-message safety net (final): a 401/unauthorized anywhere in the text is still auth;
+  // the opaque browser network collapses (TypeError / "failed to fetch" / connection-refused)
+  // are unreachable. This block is unchanged from before FIX B — the structured parse only
+  // ADDS a precise auth path ahead of it, never removing a classification.
+  if (/\b401\b|unauthorized/i.test(msg)) return 'auth';
+  if ((typeof TypeError !== 'undefined' && e instanceof TypeError)
+    || /failed to fetch|networkerror|network request failed|load failed|err_connection|connection (refused|reset|closed|timed out)|econnrefused|enotfound|fetch failed/i.test(msg)) {
+    return 'unreachable';
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Tier wire ⇄ internal mapping (Pass 2b refinement)                        */
 /* ------------------------------------------------------------------------ */
 /**
@@ -219,6 +276,7 @@ export function createMCPProvider({
   baseUrl,
   authToken,
   fetchFn,
+  onFatal,
   name = 'MCP',
   clientName = 'kanbantt',
   clientVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.0.0',
@@ -254,7 +312,24 @@ export function createMCPProvider({
     try {
       result = await client.callTool({ name: toolName, arguments: args || {} });
     } catch (e) {
-      throw new MCPProviderError('transport', e?.message || `MCP transport error calling ${toolName}`, { cause: e });
+      // Mid-session TRANSPORT failure (thrown by the SDK — distinct from an in-band
+      // domain error, which arrives below as an isError result). Discriminate the two
+      // FATAL classes that must tear the whole connection down (auth 401 /
+      // network|CORS|connection) from a benign protocol hiccup: ONLY a fatal class
+      // notifies onFatal → the controller degrades to Local (setLocal(true)), firing the
+      // subscribe→setSpineModel(null) cascade so the board snaps to disconnected. We
+      // STILL throw so the caller's per-op loud-revert also runs (both fire; the revert
+      // no-ops once the mirror is gone). validation_failed / conflict never reach here
+      // (they're isError results, handled below) — so they NEVER degrade.
+      const fatal = classifyFatal(e);
+      const err = new MCPProviderError(fatal || 'transport', e?.message || `MCP transport error calling ${toolName}`, { cause: e });
+      // Label the fatal class on the thrown error (FIX C) so the controller's degrade policy
+      // can tell 'auth' (degrade instantly) from 'unreachable' (poll rides out strikes)
+      // without re-classifying. onFatal still fires here so a USER-OP fatal degrades at once;
+      // the controller counts strikes only for the poll path (via its pollInFlight window).
+      if (fatal) err.fatalKind = fatal;
+      if (fatal && typeof onFatal === 'function') onFatal(err);
+      throw err;
     }
     if (result && result.isError) throw mapDomainError(errorPayload(result));
     return structured(result);
@@ -277,7 +352,12 @@ export function createMCPProvider({
       try {
         await client.connect(transport);
       } catch (e) {
-        throw new MCPProviderError('unreachable', e?.message || 'MCP connect failed', { cause: e });
+        // Classify so the UI can separate a rejected token (401 → 'auth' → "check your
+        // token") from an unreachable/CORS/mixed-content spine ('unreachable' → the
+        // connection checklist). A non-fatal-classed connect failure still surfaces as
+        // 'unreachable' (connect failed = no board to render), never a false 'auth'.
+        const cls = classifyFatal(e);
+        throw new MCPProviderError(cls === 'auth' ? 'auth' : 'unreachable', e?.message || 'MCP connect failed', { cause: e });
       }
 
       const info = client.getServerVersion(); // serverInfo { name, version }
@@ -285,7 +365,11 @@ export function createMCPProvider({
       try {
         ({ tools } = await client.listTools());
       } catch (e) {
-        throw new MCPProviderError('transport', e?.message || 'tools/list failed', { cause: e });
+        // A 401/network failure on tools/list (after a clean initialize) is still a
+        // fatal connect outcome — classify it so the UI shows the right message; any
+        // other listTools failure stays 'transport'.
+        const cls = classifyFatal(e);
+        throw new MCPProviderError(cls || 'transport', e?.message || 'tools/list failed', { cause: e });
       }
       toolNames = new Set((tools || []).map((t) => t.name));
 

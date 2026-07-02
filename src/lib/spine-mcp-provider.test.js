@@ -19,7 +19,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 import { createMcpTestServer } from './spine-mcp-test-server.js';
-import { createMCPProvider, MCPProviderError } from './spine-mcp-provider.js';
+import { createMCPProvider, MCPProviderError, classifyFatal } from './spine-mcp-provider.js';
 
 /** Connect a provider to a fresh harness; returns { provider, harness }. */
 async function connected(opts = {}) {
@@ -675,4 +675,57 @@ test('WIRE card_retier new_tier null → REJECTED, no audit row, tier unchanged 
   assert.equal(harness.tierAudit().length, 0, 'no audit row on the rejected retier');
   assert.ok((harness.store.get('c1').tags || []).includes('tier:2'), 'tier unchanged');
   await close();
+});
+
+/* ================================================================== */
+/* HARDENING FIX B: classifyFatal — parse-THEN-regex 401 classification */
+/* ------------------------------------------------------------------- */
+/* The SDK surfaces a rejected token as a THROWN transport error whose  */
+/* message wraps the server's JSON body, e.g.                           */
+/*   Error POSTing to endpoint: {"error":"unauthorized"}                */
+/* classifyFatal extracts + JSON.parses that body and classifies 'auth' */
+/* off the STRUCTURED value first, with the raw-message regex as the    */
+/* final safety net. A JSON-RPC protocol error (no auth value) → null:  */
+/* NOT a connection loss, so the op-level path handles it. Domain       */
+/* errors (validation_failed/conflict) are isError results and never    */
+/* reach this classifier at all.                                        */
+/* ================================================================== */
+
+test('classifyFatal: an HTTP 401 status field ⇒ auth (before any message parsing)', () => {
+  assert.equal(classifyFatal(Object.assign(new Error('nope'), { status: 401 })), 'auth', 'e.status');
+  assert.equal(classifyFatal(Object.assign(new Error('nope'), { code: 401 })), 'auth', 'e.code');
+  assert.equal(classifyFatal({ response: { status: 401 } }), 'auth', 'e.response.status');
+});
+
+test('classifyFatal: JSON body {"error":"unauthorized"} in the SDK message ⇒ auth (parsed value)', () => {
+  assert.equal(classifyFatal(new Error('Error POSTing to endpoint (HTTP 401): {"error":"unauthorized"}')), 'auth');
+});
+
+test('classifyFatal: JSON body {"error":"invalid credentials"} ⇒ auth (parsed value)', () => {
+  assert.equal(classifyFatal(new Error('Error POSTing to endpoint: {"error":"invalid credentials"}')), 'auth');
+});
+
+test('classifyFatal: JSON body {"error":"token expired"} ⇒ auth (parsed value)', () => {
+  assert.equal(classifyFatal(new Error('Error POSTing to endpoint: {"error":"token expired"}')), 'auth');
+});
+
+test('classifyFatal: a MALFORMED JSON body carrying "unauthorized" ⇒ auth via the raw-regex net', () => {
+  // No closing brace ⇒ the JSON.parse branch is skipped; the final raw-message regex still
+  // catches the bare word — the safety net the parse step falls through to.
+  assert.equal(classifyFatal(new Error('Error POSTing to endpoint: {"error":"unauthorized"')), 'auth');
+  // Braces present but not valid JSON ⇒ JSON.parse throws → same fall-through to the net.
+  assert.equal(classifyFatal(new Error('boom {error: unauthorized, code: 401}')), 'auth');
+});
+
+test('classifyFatal: connection-refused / TypeError ⇒ unreachable (no auth false-positive)', () => {
+  assert.equal(classifyFatal(new Error('connect ECONNREFUSED 127.0.0.1:8787')), 'unreachable');
+  assert.equal(classifyFatal(new TypeError('Failed to fetch')), 'unreachable');
+});
+
+test('classifyFatal: a JSON-RPC protocol error ⇒ null (NOT a connection loss)', () => {
+  // A structured body whose value is NOT auth semantics must fall through to null — the
+  // connection stays up and the op-level path handles the protocol error.
+  assert.equal(classifyFatal(new Error('MCP error -32601: {"code":-32601,"message":"Method not found"}')), null);
+  // An object-valued `error` (the nested JSON-RPC shape) must not false-positive to auth either.
+  assert.equal(classifyFatal(new Error('rpc failed: {"error":{"code":-32600,"message":"Invalid Request"}}')), null);
 });

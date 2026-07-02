@@ -3701,11 +3701,35 @@ function SettingsModal({
   syncEnabled, onToggleSync, syncStatus, onSyncNow,
   onAddColumn, onRenameColumn, onRecolorColumn, onReorderColumn, onDeleteColumn,
   onAddTag, onRenameTag, onRecolorTag, onDeleteTag, readOnly,
+  spineState, onSpineConnect, onSpineDisconnect,
 }) {
   const C = useTheme();
   const [tab, setTab] = useState('columns');
   const [newColumnName, setNewColumnName] = useState('');
   const [newTagName, setNewTagName] = useState('');
+  // Connection tab — prefill from the effective kanbantt_config (env baseline overlaid
+  // with the stored override). These are the editable form values; the live status
+  // comes from spineState (the controller's truth), never from these.
+  const initialMcp = useMemo(() => readKanbanttConfig().mcp || {}, []);
+  const [spineUrl, setSpineUrl] = useState(initialMcp.url || '');
+  const [spineToken, setSpineToken] = useState(initialMcp.auth_token || '');
+  const [showToken, setShowToken] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [copied, setCopied] = useState(false);
+  // Clear the transient "Connecting…" once the controller reaches a terminal state:
+  // connected (provider 'mcp'), or degraded/failed (a fallback/error on local state).
+  // Done as a render-time state adjustment keyed off a spineState transition (React's
+  // documented alternative to an effect for deriving state from a changing prop) — it
+  // fires exactly once per transition and never on a steady state.
+  const [prevSpineState, setPrevSpineState] = useState(spineState);
+  if (spineState !== prevSpineState) {
+    setPrevSpineState(spineState);
+    if (connecting && spineState
+      && (spineState.provider === 'mcp'
+        || (spineState.provider === 'local' && (spineState.fallback || spineState.error)))) {
+      setConnecting(false);
+    }
+  }
 
   useEffect(() => {
     const onKey = (e) => { if (e.key === 'Escape') onClose(); };
@@ -3762,6 +3786,56 @@ function SettingsModal({
     opacity: readOnly ? 0.55 : 1,
   };
 
+  /* ---- Connection tab: live status + typed errors + contextual guidance ---- */
+  // The controller's connection state is the source of truth (never the form fields).
+  const spineConnected = !!(spineState && spineState.provider === 'mcp');
+  const spineCaps = (spineState && spineState.capabilities) || null;
+  const spineDegraded = !!(spineState && spineState.provider === 'local' && (spineState.fallback || spineState.error));
+  const spineErrCode = (spineState && spineState.error && spineState.error.code) || null;
+  const spineErrMsg = (spineState && spineState.error && spineState.error.message) || null;
+  // 401 (the fetch got a RESPONSE with status 401) → a specific, actionable message.
+  // Any other failure is a connection-class failure the browser won't let JS pin down
+  // (CORS vs network vs mixed-content are deliberately indistinguishable) → a checklist.
+  const spineAuthError = spineErrCode === 'auth';
+  // window.location is the ONE honest source for the origin to whitelist + the https
+  // detection (correct whether served from the deployed host, localhost:5173, or a fork).
+  const origin = (typeof window !== 'undefined' && window.location && window.location.origin) || '';
+  const originEnvLine = `CLAUNKER_SPINE_ORIGIN=${origin}`;
+  const pageIsHttps = typeof window !== 'undefined' && window.location && window.location.protocol === 'https:';
+  // Contextual localhost hint: a DEPLOYED (https) page cannot reach a http://localhost
+  // spine (mixed content + Private Network Access). Detect the entered URL's host.
+  const enteredHost = (() => {
+    try { return spineUrl.trim() ? new URL(spineUrl.trim()).hostname : ''; } catch { return ''; }
+  })();
+  const enteredIsLocalhost = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(enteredHost);
+  const localhostConflict = enteredIsLocalhost && pageIsHttps;
+
+  const doSpineConnect = async () => {
+    if (!spineUrl.trim()) return;
+    setConnecting(true);
+    await onSpineConnect(spineUrl, spineToken);
+  };
+  const doSpineDisconnect = async () => {
+    setConnecting(false);
+    await onSpineDisconnect();
+  };
+  const copyOrigin = async () => {
+    try {
+      await navigator.clipboard.writeText(originEnvLine);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard blocked (insecure context / denied) — the text stays selectable */ }
+  };
+  const fieldLabel = {
+    fontFamily: F.mono, fontSize: 10, letterSpacing: '0.18em',
+    textTransform: 'uppercase', color: C.textMuted,
+  };
+  const pillBtn = {
+    padding: '7px 12px', background: C.surfaceHi, color: C.text,
+    border: `1px solid ${C.border}`, borderRadius: 7, cursor: 'pointer',
+    fontFamily: F.body, fontSize: 12, fontWeight: 500, flexShrink: 0,
+  };
+
   return (
     <div onClick={onClose} style={{
       position: 'fixed', inset: 0, background: `${C.bg}b3`,
@@ -3806,6 +3880,7 @@ function SettingsModal({
             { id: 'columns', label: 'Columns', count: columns.length },
             { id: 'tags', label: 'Tags', count: tags.length },
             { id: 'account', label: 'Account', count: null },
+            { id: 'connection', label: 'Connection', count: null },
           ].map((t) => {
             const active = tab === t.id;
             return (
@@ -4209,6 +4284,218 @@ function SettingsModal({
               <BuildStamp />
             </>
           ))}
+
+          {tab === 'connection' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              {/* STATUS — the controller's truth (spineState), never the form fields */}
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 14,
+                padding: 14, background: C.surface, borderRadius: 10,
+                border: `1px solid ${spineConnected ? `${C.mint}40` : spineDegraded ? `${C.coral}40` : C.border}`,
+              }}>
+                <div style={{
+                  width: 44, height: 44, borderRadius: '50%',
+                  background: C.surfaceHi, border: `1px solid ${C.border}`,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                }}>
+                  <Cloud size={18} strokeWidth={1.5}
+                    color={spineConnected ? C.mint : spineDegraded ? C.coral : C.textDim} />
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontFamily: F.body, fontSize: 14, color: C.text, fontWeight: 500 }}>
+                    {spineConnected ? (spineState.server?.name || 'Spine')
+                      : connecting ? 'Connecting…' : spineDegraded ? 'Disconnected' : 'Not connected'}
+                  </div>
+                  <div style={{
+                    fontFamily: F.mono, fontSize: 11, color: C.textMuted, marginTop: 2,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  }}>
+                    {spineConnected ? (spineCaps && spineCaps.canWrite ? 'Writable board' : 'Read-only mirror')
+                      : connecting ? 'Standing up the connection' : 'Your board is local on this device'}
+                  </div>
+                </div>
+                {spineConnected && (
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0,
+                    padding: '4px 10px', borderRadius: 6,
+                    background: (spineCaps && spineCaps.canWrite) ? `${C.mint}15` : C.surfaceHi,
+                    border: `1px solid ${(spineCaps && spineCaps.canWrite) ? `${C.mint}30` : C.border}`,
+                  }}>
+                    <span style={{
+                      fontFamily: F.mono, fontSize: 10, letterSpacing: '0.08em',
+                      textTransform: 'uppercase', color: C.text,
+                    }}>{(spineCaps && spineCaps.canWrite) ? 'Writable' : 'Read-only'}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Capability badges — canWrite / canRetier / canResolve from spineState.capabilities */}
+              {spineConnected && (
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {[
+                    { key: 'canWrite', label: 'Write' },
+                    { key: 'canRetier', label: 'Re-tier' },
+                    { key: 'canResolve', label: 'Resolve' },
+                  ].map((b) => {
+                    const on = !!(spineCaps && spineCaps[b.key]);
+                    return (
+                      <span key={b.key} style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 5,
+                        fontFamily: F.mono, fontSize: 10, letterSpacing: '0.06em',
+                        textTransform: 'uppercase', padding: '4px 9px', borderRadius: 6,
+                        color: on ? C.text : C.textDim,
+                        background: on ? `${C.mint}15` : C.surface,
+                        border: `1px solid ${on ? `${C.mint}40` : C.border}`,
+                      }}>
+                        {on ? <Check size={11} color={C.mint} strokeWidth={2.5} />
+                          : <X size={11} strokeWidth={2} />}
+                        {b.label}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* TYPED ERROR — 401 → a specific message; a 404 / Not Found → a path hint
+                  (the server was reached but the /mcp path is likely missing); every other
+                  failure is a connection-class failure the browser won't let JS pin down (CORS vs
+                  network vs mixed-content are deliberately indistinguishable) → a checklist. */}
+              {spineDegraded && (
+                <div style={{
+                  padding: '12px 14px', background: `${C.coral}10`,
+                  border: `1px solid ${C.coral}30`, borderRadius: 8,
+                  display: 'flex', gap: 10,
+                }}>
+                  <AlertTriangle size={15} color={C.coral} strokeWidth={2}
+                    style={{ flexShrink: 0, marginTop: 1 }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    {spineAuthError ? (
+                      <div style={{ fontFamily: F.body, fontSize: 13, color: C.text }}>
+                        Authentication failed — check your token.
+                      </div>
+                    ) : (/\b404\b|not\s*found/i.test(spineErrMsg || '')) ? (
+                      <>
+                        <div style={{ fontFamily: F.body, fontSize: 13, color: C.text, marginBottom: 6 }}>
+                          Endpoint not found.
+                        </div>
+                        <div style={{ fontFamily: F.mono, fontSize: 11, color: C.textMuted, lineHeight: 1.7 }}>
+                          The server answered but nothing lives at that path. MCP endpoints usually live at /mcp: try appending it to your spine URL.
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div style={{ fontFamily: F.body, fontSize: 13, color: C.text, marginBottom: 6 }}>
+                          Couldn’t connect. Check:
+                        </div>
+                        <ul style={{
+                          margin: 0, paddingLeft: 16, fontFamily: F.mono, fontSize: 11,
+                          color: C.textMuted, lineHeight: 1.7,
+                        }}>
+                          <li>the spine is running and the URL is correct;</li>
+                          <li>if it’s up, its allowed origin must include this site’s origin
+                            (<span style={{ color: C.text }}>{origin}</span>);</li>
+                          <li>a deployed https page can’t reach a http://localhost spine — use a tunnel.</li>
+                        </ul>
+                      </>
+                    )}
+                    {spineErrMsg && (
+                      <div style={{ fontFamily: F.mono, fontSize: 10, color: C.textDim, marginTop: 6 }}>
+                        ({spineErrMsg})
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* FORM — Spine URL + Bearer token (maskable), prefilled from config.mcp */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <label style={fieldLabel}>Spine URL</label>
+                <input value={spineUrl} onChange={(e) => setSpineUrl(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && doSpineConnect()}
+                  placeholder="http://localhost:8848/mcp"
+                  spellCheck={false} autoCapitalize="none" autoComplete="off"
+                  style={{ ...input, flex: 'unset' }} />
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <label style={fieldLabel}>Bearer token</label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input value={spineToken} onChange={(e) => setSpineToken(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && doSpineConnect()}
+                    type={showToken ? 'text' : 'password'}
+                    placeholder="optional — Bearer token"
+                    spellCheck={false} autoCapitalize="none" autoComplete="off"
+                    style={input} />
+                  <button onClick={() => setShowToken((s) => !s)}
+                    title={showToken ? 'Hide token' : 'Show token'} style={pillBtn}>
+                    {showToken ? 'Hide' : 'Show'}
+                  </button>
+                </div>
+              </div>
+
+              {/* Contextual localhost note (PART 2) */}
+              {localhostConflict ? (
+                <div style={{
+                  padding: '12px 14px', background: `${C.amber}12`,
+                  border: `1px solid ${C.amber}40`, borderRadius: 8,
+                  fontFamily: F.mono, fontSize: 11, color: C.textMuted, lineHeight: 1.6,
+                }}>
+                  A deployed (https) page can’t reach a localhost spine (mixed content +
+                  Private Network Access). Use a Cloudflare Tunnel or other https endpoint.
+                </div>
+              ) : (
+                <div style={helperText}>
+                  The spine must be reachable from this browser and allow this site’s origin (CORS).
+                </div>
+              )}
+
+              {/* ACTIONS — Connect/Save triggers the reconnect; Disconnect degrades to local */}
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button onClick={doSpineConnect} disabled={connecting || !spineUrl.trim()}
+                  style={{
+                    ...addBtn,
+                    opacity: (connecting || !spineUrl.trim()) ? 0.5 : 1,
+                    cursor: (connecting || !spineUrl.trim()) ? 'default' : 'pointer',
+                  }}>
+                  {connecting ? 'Connecting…' : spineConnected ? 'Save & reconnect' : 'Connect'}
+                </button>
+                {(spineConnected || spineDegraded || initialMcp.url) && (
+                  <button onClick={doSpineDisconnect} style={{
+                    padding: '8px 14px', background: 'transparent', color: C.coral,
+                    border: `1px solid ${C.coral}66`, borderRadius: 7, cursor: 'pointer',
+                    fontFamily: F.body, fontSize: 12, fontWeight: 500,
+                  }}>
+                    Disconnect
+                  </button>
+                )}
+              </div>
+
+              {/* PART 2 GUIDANCE — origin whitelist, copy-pasteable + exact for this site */}
+              <div>
+                <div style={{ ...fieldLabel, marginBottom: 8 }}>Allow this origin on your spine</div>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'stretch' }}>
+                  <code style={{
+                    flex: 1, minWidth: 0, fontFamily: F.mono, fontSize: 11, color: C.text,
+                    background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7,
+                    padding: '8px 11px', overflowX: 'auto', whiteSpace: 'nowrap',
+                    display: 'flex', alignItems: 'center',
+                  }}>{originEnvLine}</code>
+                  <button onClick={copyOrigin} style={pillBtn}>
+                    {copied ? 'Copied' : 'Copy'}
+                  </button>
+                </div>
+                <div style={{ ...helperText, marginTop: 6 }}>
+                  Set this on your spine (env var) so it accepts requests from this site.
+                </div>
+              </div>
+
+              {/* Token trust note (PART 2) */}
+              <div style={helperText}>
+                Stored locally on this device only. Only connect tokens you trust — the
+                token grants write access to your board.
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -4309,6 +4596,12 @@ export default function App() {
   // The active MCP connection (provider + pollNow), captured so the escalation-resolve
   // handler can reach the provider without re-deriving it. Set in the connection effect.
   const spineConnRef = useRef(null);
+  // Bump to trigger a spine RECONNECT: the connection effect below depends on this, so
+  // incrementing it re-runs the effect — React first tears down the existing conn
+  // (cleanup: unsub + conn.disconnect() + clear the ref), then rebuilds from the fresh
+  // kanbantt_config. The Connection settings tab drives this on connect/disconnect; no
+  // page reload. (Distinct from handleReconnect, which re-acquires the GOOGLE token.)
+  const [spineConfigNonce, setSpineConfigNonce] = useState(0);
   // MOCK_EVENTS no longer renders; the Calendar/Timeline overlay plumbing stays
   // wired to this empty list as an attachment point for real Google Calendar
   // integration (see MOCK_EVENTS above).
@@ -4474,6 +4767,13 @@ export default function App() {
   // and we keep showing local data. No spine target configured → no-op.
   useEffect(() => {
     const config = readKanbanttConfig();
+    // Reconnect path (spineConfigNonce bumped by the Connection settings tab): React
+    // first ran the previous cleanup (tore down the old conn, unsubscribed, cleared the
+    // ref); now reset the transient spine state so a DISCONNECT (no target) reverts the
+    // board to local, and a SERVER SWITCH doesn't momentarily show the prior server's
+    // caps. On the initial mount both are already null → these are no-ops.
+    setSpineState(null);
+    setSpineModel(null);
     if (!hasMcpTarget(config)) return undefined;
     // Lazy-load the connection module (and the MCP SDK it pulls in) only when a
     // spine target is configured — keeps the SDK out of the default bundle.
@@ -4500,7 +4800,7 @@ export default function App() {
       })
       .catch((e) => { console.error('MCP connection load failed:', e); });
     return () => { disposed = true; unsub(); if (conn) conn.disconnect(); spineConnRef.current = null; };
-  }, []);
+  }, [spineConfigNonce]);
 
   // Connect: loads GIS on demand (first Google traffic, inside the click), then
   // runs interactive sign-in. A GIS load failure flips the control to disabled;
@@ -4526,6 +4826,36 @@ export default function App() {
   const handleReconnect = async () => {
     await handleConnect();
     driveSync?.syncNow();
+  };
+
+  // ── BYO-spine (MCP) connection settings — the "connect from the web" flow ──────
+  // Persist the entered target into kanbantt_config (MERGED — data_source and
+  // poll_interval_ms are preserved), then bump the reconnect nonce so the connection
+  // effect tears the old conn down and stands a fresh one up against the new config.
+  const handleSpineConnect = async (url, token) => {
+    const trimmedUrl = (url || '').trim();
+    const trimmedToken = (token || '').trim();
+    const cfg = readKanbanttConfig();
+    const next = {
+      ...cfg,
+      // Never leave the source pinned to 'local' when the user is explicitly connecting;
+      // 'auto' lets hasMcpTarget() honor the url. A pre-existing 'mcp' is preserved.
+      data_source: cfg.data_source === 'local' ? 'auto' : (cfg.data_source || 'auto'),
+      mcp: { ...(cfg.mcp || {}), url: trimmedUrl },
+    };
+    if (trimmedToken) next.mcp.auth_token = trimmedToken;
+    else delete next.mcp.auth_token; // an emptied token field drops the Bearer
+    await safeSet('kanbantt_config', next);
+    setSpineConfigNonce((n) => n + 1);
+  };
+  // Disconnect: pin data_source:'local' and clear the mcp target in kanbantt_config
+  // (MERGED — other fields preserved), then bump the nonce so the effect tears down and
+  // degrades to local. Pinning local is what makes the disconnect STICK even if a build
+  // env baseline (VITE_SPINE_URL) would otherwise re-supply a target.
+  const handleSpineDisconnect = async () => {
+    const cfg = readKanbanttConfig();
+    await safeSet('kanbantt_config', { ...cfg, data_source: 'local', mcp: {} });
+    setSpineConfigNonce((n) => n + 1);
   };
   const handleResolveCollision = async (choice) => {
     if (!driveSync) return;
@@ -5086,7 +5416,9 @@ export default function App() {
             onAddTag={addTag} onRenameTag={renameTag}
             onRecolorTag={recolorTag} onDeleteTag={deleteTag}
             syncEnabled={syncEnabled} onToggleSync={setSyncEnabled}
-            syncStatus={syncStatus} onSyncNow={handleSyncNow} readOnly={mcpActive} />
+            syncStatus={syncStatus} onSyncNow={handleSyncNow} readOnly={mcpActive}
+            spineState={spineState}
+            onSpineConnect={handleSpineConnect} onSpineDisconnect={handleSpineDisconnect} />
         )}
         {driveSync && syncStatus === 'collision_pending' && (
           <CollisionDialog onResolve={handleResolveCollision} busy={collisionBusy} />

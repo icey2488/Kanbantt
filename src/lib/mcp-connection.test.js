@@ -245,3 +245,181 @@ test('toBoardColumns falls back to the reserved spine columns when given none', 
   assert.equal(toBoardColumns([]).length, 4);
   assert.equal(toBoardColumns(undefined)[0].id, 'todo');
 });
+
+/* ================================================================== */
+/* HARDENING FIX A (teardown guard) + FIX C (poll strike counter)      */
+/* ------------------------------------------------------------------- */
+/* Driven against a fully CONTROLLABLE provider double: its poll reads  */
+/* (getBoard/list) can be armed to throw a classified FATAL and — like  */
+/* the real provider's call() — invoke the injected onFatal BEFORE      */
+/* throwing, so the controller's degrade policy runs. connect()/        */
+/* getBoard() can be deferred to a test-resolved promise to drive the   */
+/* teardown race deterministically.                                     */
+/* ================================================================== */
+
+function controllableProvider() {
+  const caps = { canWrite: true, canRetier: true, escalations: true, artifacts: true, columns: true, tags: true, realtime: false };
+  const ctl = {
+    onFatal: null,
+    fail: null,          // null | 'auth' | 'unreachable'  — arms getBoard/list
+    boardCalls: 0,
+    disconnects: 0,
+    deferConnect: null,  // a Promise the test resolves to complete connect()
+    deferBoard: null,    // a Promise the test resolves to complete getBoard()
+    board: { columns: [{ id: 'todo', name: 'To Do', order: 'a' }] },
+    cards: [],
+  };
+  const fatalErr = (kind) => Object.assign(
+    new Error(kind === 'auth' ? '401 unauthorized' : 'Failed to fetch'),
+    { code: kind, fatalKind: kind },
+  );
+  function maybeFatal() {
+    if (ctl.fail) {
+      const err = fatalErr(ctl.fail);
+      if (typeof ctl.onFatal === 'function') ctl.onFatal(err); // mirrors provider call(): onFatal BEFORE throw
+      throw err;
+    }
+  }
+  ctl.provider = {
+    async connect() { if (ctl.deferConnect) await ctl.deferConnect; return { ok: true, server: { name: 'Fake' }, capabilities: caps }; },
+    async getBoard() { ctl.boardCalls += 1; if (ctl.deferBoard) await ctl.deferBoard; maybeFatal(); return { board: ctl.board }; },
+    async list() { maybeFatal(); return { cards: ctl.cards }; },
+    disconnect() { ctl.disconnects += 1; },
+    // Simulate a USER-INITIATED op fatal: funnels through onFatal exactly like a write op's call().
+    async opFatal(kind) { const err = fatalErr(kind); if (typeof ctl.onFatal === 'function') ctl.onFatal(err); throw err; },
+  };
+  ctl.make = (hooks = {}) => { ctl.onFatal = hooks.onFatal; return ctl.provider; };
+  return ctl;
+}
+
+const mcpConfig = { data_source: 'mcp', mcp: { url: 'http://x/mcp' } };
+/** Spin the microtask queue until `cond()` (bounded) — lets a parked async continuation run. */
+async function flushUntil(cond, max = 20) { for (let i = 0; i < max && !cond(); i++) await Promise.resolve(); }
+
+test('FIX C: background-poll "unreachable" rides out 2 strikes; the 3rd consecutive degrades', async () => {
+  const ctl = controllableProvider();
+  const sched = manualScheduler();
+  let applied = 0;
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: () => { applied += 1; }, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  await conn.connect();
+  assert.equal(conn.getState().provider, 'mcp');
+  assert.ok(applied >= 1, 'the first poll painted the board');
+
+  ctl.fail = 'unreachable';
+  await sched.fireNext();
+  assert.equal(conn.getState().provider, 'mcp', 'strike 1: board stays live');
+  await sched.fireNext();
+  assert.equal(conn.getState().provider, 'mcp', 'strike 2: board stays live');
+  assert.ok(conn.isPolling(), 'still polling through strikes 1-2');
+  await sched.fireNext();
+  assert.equal(conn.getState().provider, 'local', 'strike 3: degraded to Local');
+  assert.equal(conn.getState().fallback, true, 'the degrade is a fallback');
+  assert.equal(conn.isPolling(), false, 'the poll loop stopped on degrade');
+});
+
+test('FIX C: a clean poll between failures resets the strike counter', async () => {
+  const ctl = controllableProvider();
+  const sched = manualScheduler();
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: () => {}, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  await conn.connect();
+
+  ctl.fail = 'unreachable';
+  await sched.fireNext();          // strike 1
+  ctl.fail = null;
+  await sched.fireNext();          // clean poll → reset to 0
+  assert.equal(conn.getState().provider, 'mcp');
+  ctl.fail = 'unreachable';
+  await sched.fireNext();          // strike 1 (post-reset), NOT the 2nd
+  await sched.fireNext();          // strike 2
+  assert.equal(conn.getState().provider, 'mcp', 'reset worked: 2 post-reset strikes still live');
+  await sched.fireNext();          // strike 3 → degrade
+  assert.equal(conn.getState().provider, 'local', 'degrades only after 3 CONSECUTIVE post-reset');
+});
+
+test('FIX C: a fatal "auth" on the poll degrades immediately (no strike tolerance)', async () => {
+  const ctl = controllableProvider();
+  const sched = manualScheduler();
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: () => {}, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  await conn.connect();
+  ctl.fail = 'auth';
+  await sched.fireNext();
+  assert.equal(conn.getState().provider, 'local', 'auth degrades on the FIRST poll fatal');
+  assert.equal(conn.getState().error.code, 'auth');
+  assert.equal(conn.isPolling(), false);
+});
+
+test('FIX C: a user-op "unreachable" degrades immediately (strike tolerance is poll-only)', async () => {
+  const ctl = controllableProvider();
+  const sched = manualScheduler();
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: () => {}, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  await conn.connect();
+  assert.equal(conn.getState().provider, 'mcp');
+  // A write op (NOT the poll) hits an unreachable spine: pollInFlight is false ⇒ instant degrade.
+  await assert.rejects(() => conn.getProvider().opFatal('unreachable'));
+  assert.equal(conn.getState().provider, 'local', 'user-op unreachable degrades on the FIRST fatal');
+  assert.equal(conn.getState().fallback, true);
+  assert.equal(conn.isPolling(), false);
+});
+
+test('FIX A: a connect that RESOLVES AFTER teardown invokes nothing (no applyModel/subscriber/poll/degrade)', async () => {
+  const ctl = controllableProvider();
+  const sched = manualScheduler();
+  let applied = 0;
+  let notifies = 0;
+  let resolveConnect;
+  ctl.deferConnect = new Promise((r) => { resolveConnect = r; });
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: () => { applied += 1; }, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  conn.subscribe(() => { notifies += 1; });
+  const p = conn.connect();      // activate is parked awaiting deferConnect
+  conn.disconnect();             // teardown BEFORE connect resolves
+  resolveConnect();              // the late connect completion arrives
+  await p;                       // let activate run its post-await disposed guard
+  await flushUntil(() => false, 3);
+
+  assert.equal(applied, 0, 'no applyModel after teardown');
+  assert.equal(notifies, 0, 'no subscriber notify after teardown');
+  assert.equal(ctl.boardCalls, 0, 'the late connect never started polling');
+  assert.equal(conn.isPolling(), false);
+  assert.equal(conn.getState().provider, 'local');
+  assert.equal(conn.getState().fallback, false, 'a clean teardown is not a degrade-fallback');
+  assert.equal(ctl.disconnects, 1, 'the late-connected provider was closed on the disposed bail');
+});
+
+test('FIX A: a poll IN FLIGHT at teardown never applies its late result (no applyModel/degrade)', async () => {
+  const ctl = controllableProvider();
+  const sched = manualScheduler();
+  let applied = 0;
+  let resolveBoard;
+  ctl.deferBoard = new Promise((r) => { resolveBoard = r; });
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: () => { applied += 1; }, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  const p = conn.connect();                     // connect resolves; first pollOnce parks on deferBoard
+  await flushUntil(() => ctl.boardCalls === 1); // wait until the first poll has entered getBoard
+  assert.equal(applied, 0, 'nothing applied yet (board read is parked)');
+  conn.disconnect();                            // teardown WHILE the first poll is in flight
+  resolveBoard();                               // the late board result arrives
+  await p.catch(() => {});                       // activate/startPolling settle
+  await flushUntil(() => false, 3);
+
+  assert.equal(applied, 0, 'the in-flight poll did NOT apply its stale result after teardown');
+  assert.equal(conn.isPolling(), false);
+  assert.equal(conn.getState().provider, 'local');
+  assert.equal(conn.getState().fallback, false, 'a clean teardown mid-poll is not a degrade-fallback');
+});

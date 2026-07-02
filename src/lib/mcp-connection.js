@@ -30,6 +30,12 @@ export const mcpIndicator = (name) => `MCP: ${name}`;
 const DEFAULT_POLL_MS = 5000;
 const DEFAULT_PING_TIMEOUT_MS = 3000;
 
+/** Background-poll tolerance for a fatal 'unreachable' (FIX C): ride out the first
+ *  STRIKE_LIMIT-1 consecutive poll failures (board stays live, possibly stale), degrade
+ *  to Local on the STRIKE_LIMIT-th consecutive. A clean poll resets the count. 'auth' and
+ *  user-initiated ops never wait — they degrade on the first fatal. */
+const POLL_UNREACHABLE_STRIKE_LIMIT = 3;
+
 /** Defensive fallback if a server returns a board with no columns (a real board
  *  always carries its own). Reserved semantic-state ids per spec §Reserved IDs. */
 export const SPINE_BOARD_COLUMNS = [
@@ -101,6 +107,17 @@ export function createMcpConnection({
   let provider = null; // active MCPProvider while state.provider === 'mcp'
   let pollHandle = null;
   const listeners = new Set();
+  // Teardown guard (FIX A): once disposed, EVERY async continuation — a late-resolving
+  // connect, an in-flight poll, a subscriber notify, applyModel, degradeOnFatal — early-
+  // returns, so a connection torn down (config switch / StrictMode double-unmount) can
+  // neither resurrect itself nor clobber the successor session's React state. Idempotent.
+  let disposed = false;
+  // Contextual degrade accounting (FIX C): a background-poll 'unreachable' rides out
+  // POLL_UNREACHABLE_STRIKE_LIMIT-1 consecutive failures. pollInFlight is true precisely
+  // while a poll's provider call is on the stack, so degradeOnFatal can tell a poll-
+  // originated fatal (count a strike) from a user-op fatal (degrade instantly).
+  let pollInFlight = false;
+  let unreachableStrikes = 0;
 
   function localState(fallback, error) {
     return {
@@ -114,13 +131,53 @@ export function createMcpConnection({
     };
   }
   const getState = () => ({ ...state });
-  const emit = () => { for (const fn of listeners) fn(getState()); };
+  const emit = () => { if (disposed) return; for (const fn of listeners) fn(getState()); };
 
   function setLocal(fallback, error) {
     stopPolling();
     provider = null;
     state = localState(fallback, error);
     emit();
+  }
+
+  /**
+   * Mid-session degrade sink. A FATAL auth/connection failure on ANY provider op —
+   * poll, card write, re-tier, escalation resolve; every op funnels through the
+   * provider's call() choke point — can tear the WHOLE connection down to Local, not just
+   * the per-op revert. Wired into the provider as `onFatal` (see activate). setLocal
+   * emits, so the subscribe→setSpineModel(null) cascade fires and the board UI snaps to
+   * disconnected. Idempotent: once we've fallen back (state.provider !== 'mcp'), a burst
+   * of in-flight failing ops is ignored (no thrash). ONLY the provider's fatal classes
+   * ('auth' → 401, 'unreachable' → network/CORS) reach here; validation_failed/conflict
+   * are op-level (isError results) and stay with the caller's loud-revert.
+   *
+   * CONTEXTUAL DEGRADE (FIX C): the DECISION is graded by class and source. 'auth' is
+   * deterministic (a rejected token never heals) → degrade on the first fatal, any source.
+   * 'unreachable' from a USER-INITIATED op → degrade instantly (loud-revert unchanged).
+   * 'unreachable' from the BACKGROUND POLL → tolerate the first STRIKE_LIMIT-1 consecutive
+   * failures and degrade on the STRIKE_LIMIT-th; a clean poll resets the count (pollOnce).
+   */
+  function degradeOnFatal(err) {
+    if (disposed || state.provider !== 'mcp') return;
+    const kind = (err && err.fatalKind) || (err && err.code) || 'unreachable';
+    if (kind === 'auth') {
+      unreachableStrikes = 0;
+      setLocal(true, { code: 'auth', message: (err && err.message) || 'authentication failed' });
+      return;
+    }
+    // 'unreachable' from the poll path (pollInFlight): count a strike, ride it out until
+    // the limit. The board stays live (possibly stale) meanwhile; scheduleNext keeps polling
+    // (state is still 'mcp'), so a recovery heals it before we ever degrade.
+    if (pollInFlight) {
+      unreachableStrikes += 1;
+      if (unreachableStrikes < POLL_UNREACHABLE_STRIKE_LIMIT) return;
+      unreachableStrikes = 0;
+      setLocal(true, { code: 'unreachable', message: (err && err.message) || 'connection lost' });
+      return;
+    }
+    // 'unreachable' from a user-initiated op: instant degrade.
+    unreachableStrikes = 0;
+    setLocal(true, { code: 'unreachable', message: (err && err.message) || 'connection lost' });
   }
 
   /* ---- polling (only while MCP is active; realtime:false ⇒ poll) ---- */
@@ -132,19 +189,45 @@ export function createMcpConnection({
     };
   }
   async function pollOnce() {
-    if (state.provider !== 'mcp' || !provider) return;
+    if (disposed || state.provider !== 'mcp' || !provider) return;
+    // Capture the active provider: a mid-poll teardown/degrade nulls the closure `provider`,
+    // and the captured `active` keeps the in-flight calls from crashing on it.
+    const active = provider;
     // Full snapshot each tick (sync_token incremental sync is a later
     // optimization): board_get for columns, card_list for the live cards. The
     // server's `column_id` is authoritative — never recomputed here.
-    const { board } = await provider.getBoard();
-    const { cards } = await provider.list({ includeDeleted: false });
-    applyModel(buildModel(board, cards));
+    pollInFlight = true; // marks the poll path for degradeOnFatal's strike accounting (FIX C)
+    try {
+      const { board } = await active.getBoard();
+      const { cards } = await active.list({ includeDeleted: false });
+      // Re-check AFTER the awaits (FIX A): a teardown (disconnect) or a mid-poll degrade can
+      // land while these were in flight. Without this gate the continuation would call
+      // applyModel (setSpineModel) after the owning effect was cleaned up — the exact
+      // successor-clobber the disposed guard closes.
+      if (disposed || state.provider !== 'mcp') return;
+      unreachableStrikes = 0; // a clean poll cycle heals the background-strike counter (FIX C)
+      applyModel(buildModel(board, cards));
+    } finally {
+      pollInFlight = false;
+    }
   }
   function scheduleNext() {
-    if (state.provider !== 'mcp') return;
+    if (disposed || state.provider !== 'mcp') return;
     pollHandle = schedule(async () => {
       pollHandle = null;
-      await pollOnce();
+      if (disposed) return; // a timer that fired after teardown does nothing (FIX A)
+      try {
+        await pollOnce();
+      } catch (e) {
+        // The poll threw. Three cases: (1) a fatal that DEGRADED — 'auth', or the
+        // STRIKE_LIMIT-th consecutive 'unreachable' — already ran onFatal → degradeOnFatal →
+        // setLocal, so state.provider is now 'local' and the guard below stops the loop
+        // cleanly; (2) a TOLERATED unreachable strike (below the limit) left state 'mcp' —
+        // keep polling so a recovery heals it; (3) a non-fatal poll error must NOT silently
+        // kill the loop. (2) and (3) re-arm below; teardown is caught by the disposed guard.
+        if (disposed || state.provider !== 'mcp') return;
+        console.warn('MCP poll error (non-fatal or tolerated strike); continuing to poll:', (e && e.message) || e);
+      }
       scheduleNext();
     }, interval);
   }
@@ -162,10 +245,19 @@ export function createMcpConnection({
     if (!wantsMcp) { setLocal(false, null); return getState(); }
     let p;
     try {
-      p = makeProvider();
+      // Pass the mid-session degrade sink to the provider: a fatal auth/connection
+      // failure on any subsequent op routes back here to setLocal(true).
+      p = makeProvider({ onFatal: degradeOnFatal });
       // connect() runs the MCP initialize handshake + tools/list and rejects a
       // server missing any REQUIRED_TOOLS (incompatible_server) before we go live.
       const res = await withTimeout(p.connect(), pingTimeoutMs, schedule, cancel);
+      // Teardown can land while connect was in flight (config switch / StrictMode
+      // unmount). Do NOT resurrect (FIX A — the connect-race half): close the just-opened
+      // provider and bail without touching state, subscribers, or the poll loop.
+      if (disposed) {
+        try { if (typeof p.disconnect === 'function') p.disconnect(); } catch { /* best effort */ }
+        return getState();
+      }
       const caps = res.capabilities;
       provider = p;
       // A server advertising the read pair but not all four card_* write tools is
@@ -209,8 +301,16 @@ export function createMcpConnection({
     connect: activate,
     retry: activate,
     disconnect() {
-      if (provider && typeof provider.disconnect === 'function') provider.disconnect();
-      setLocal(false, null);
+      // Idempotent teardown (FIX A): flip disposed FIRST so every in-flight continuation
+      // (connect completion, poll, subscriber notify, applyModel, degradeOnFatal) early-
+      // returns, then release the provider and snap state to Local. Safe under StrictMode's
+      // double unmount/remount — a second call is a no-op.
+      if (disposed) return;
+      disposed = true;
+      if (provider && typeof provider.disconnect === 'function') {
+        try { provider.disconnect(); } catch { /* best effort */ }
+      }
+      setLocal(false, null); // stopPolling + provider=null + state→Local(clean); emit is disposed-gated (no notify)
     },
     getState,
     /** The active MCP provider (board writes go through it; a stale-version write
@@ -230,10 +330,14 @@ export function createMcpConnection({
  * passes its refresh path as `applyModel` — no board component changes.
  */
 export function createMcpConnectionFromConfig({ config, applyModel, fetchFn, schedule, cancel, pollIntervalMs } = {}) {
-  const makeProvider = () => createMCPProvider({
+  // The controller passes its degrade sink as `hooks.onFatal` when it builds the
+  // provider (see activate); thread it through so a mid-session fatal error on any op
+  // routes back to setLocal(true).
+  const makeProvider = (hooks = {}) => createMCPProvider({
     baseUrl: config.mcp.url,
     authToken: config.mcp && config.mcp.auth_token,
     fetchFn,
+    onFatal: hooks.onFatal,
   });
   return createMcpConnection({ config, makeProvider, applyModel, schedule, cancel, pollIntervalMs });
 }
