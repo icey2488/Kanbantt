@@ -1,15 +1,35 @@
-# Cloudflare Pages security headers.
-# Drop this file in /public/ so it's copied to the build output as /_headers.
+# Cloudflare Pages security headers — Kanbantt.
+# Copied to the build output as /_headers via Vite's publicDir passthrough.
 #
-# The CSP is the important part: Google Identity Services injects iframes and
-# loads its own scripts from accounts.google.com and apis.google.com. Without
-# these allowances the sign-in popup fails silently or with cryptic errors.
+# CSP posture (Connection plan, part 4): a strict blast door at the script layer,
+# an open door for BYO MCP spines at the connect layer. Composed from evidence in
+# the built bundle + source, not assumption.
+#   - script-src 'self' ONLY. No 'unsafe-inline', no 'unsafe-eval'. The built HTML
+#     carries no inline <script>, and the bundle has no eval()/new Function()/wasm/
+#     Worker (verified). OAuth is a top-level redirect — no GIS script is injected —
+#     so nothing needs a script exception. This is the blast door.
+#   - connect-src stays wide (https:) so a user's own MCP spine on ANY https origin
+#     connects without a policy change (BYO spine). It ALSO allows http://localhost:*
+#     and http://127.0.0.1:* — a deliberate, FLAGGED widening: Chrome exempts
+#     localhost from mixed-content, so a deployed page can reach a loopback (PNA)
+#     spine and the local preview harness can exercise a real connect. This added
+#     permissiveness points only at the user's own machine.
+#   - style-src keeps 'unsafe-inline' (React inline styles) + fonts.googleapis.com
+#     (the runtime-injected Google Fonts stylesheet); font-src adds fonts.gstatic.com
+#     (where that stylesheet's @font-face files live).
+#   - Google OAuth: accounts.google.com is reached by NAVIGATION (window.location),
+#     not script/xhr/frame, so it needs no directive; the token-exchange is a
+#     same-origin Function, and revoke/userinfo/Drive/Calendar fetches ride https:.
+#     The former GIS iframe (frame-src accounts.google.com) and GIS script origins
+#     went away with the popup flow and are intentionally NOT present.
+#   - Profile picture is not rendered (name + email only), so img-src carries no
+#     googleusercontent origin — dead in the prior policy.
 
 /*
-  X-Frame-Options: SAMEORIGIN
-  Cross-Origin-Opener-Policy: same-origin-allow-popups
+  Content-Security-Policy: default-src 'self'; script-src 'self'; connect-src 'self' https: http://localhost:* http://127.0.0.1:*; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob:; font-src 'self' https://fonts.gstatic.com data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
+  X-Frame-Options: DENY
+  Cross-Origin-Opener-Policy: same-origin-allow-popups
   Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()
   Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://accounts.google.com https://apis.google.com; connect-src 'self' https://*.googleapis.com https://accounts.google.com https://oauth2.googleapis.com; img-src 'self' data: https://*.googleusercontent.com https://*.google.com; style-src 'self' 'unsafe-inline' https://accounts.google.com https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; frame-src https://accounts.google.com; form-action 'self'; base-uri 'self'
