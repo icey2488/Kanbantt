@@ -5373,8 +5373,17 @@ export default function App() {
         c.id === draggedId ? { ...c, ...card } : c) } : m));
       reconcileSpine();
     } catch (e) {
-      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // REVERT (synchronous)
-        c.id === draggedId ? { ...c, column_id: prior.column_id, order: prior.order } : c) } : m));
+      // SAME loud-revert path as saveTaskMcp: a `conflict` means the server already
+      // moved this card on (someone else dragged it, or a governed write retiered/
+      // archived it) and carries its fresh position under meta.current — restoring
+      // our captured `prior` would snap it back to a position the server no longer
+      // agrees with. Any other error (network/transport) means the write never
+      // landed → restore prior.
+      const fresh = e?.code === 'conflict' && e.meta?.current;
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // SNAP-BACK-or-REVERT (synchronous)
+        c.id === draggedId
+          ? (fresh ? { ...c, ...e.meta.current } : { ...c, column_id: prior.column_id, order: prior.order })
+          : c) } : m));
       surface(writeError('move', e));
     }
   };
@@ -5671,11 +5680,25 @@ export default function App() {
       await provider.cardDelete(id, { expected_version });
       reconcileSpine(); // confirm removal against the authoritative card_list
     } catch (e) {
-      setSpineModel((m) => { // REVERT: restore at its order-driven position (unless a poll re-added it)
-        if (!m) return m;
-        if (m.cards.some((c) => c.id === id)) return m;
-        return { ...m, cards: [...m.cards, priorCard] };
-      });
+      // SAME loud-revert path as saveTaskMcp, with a delete-specific nuance: a
+      // `conflict` whose meta.current is ALREADY deleted_at means the card is
+      // genuinely gone server-side — the delete effectively already succeeded, so
+      // resurrecting it locally would be wrong; leave it removed. A `conflict`
+      // whose meta.current is NOT deleted (something else changed first, e.g. a
+      // version bump from an unrelated edit) means the card is still alive server-
+      // side → re-insert the server's fresh state, not our stale captured one. Any
+      // other error (network/transport) means the write never landed → restore the
+      // captured prior card (unless a poll already re-added it).
+      const fresh = e?.code === 'conflict' && e.meta?.current;
+      if (fresh && e.meta.current.deleted_at) {
+        // already deleted server-side — nothing to restore
+      } else {
+        setSpineModel((m) => { // SNAP-BACK-or-REVERT: restore (unless a poll re-added it)
+          if (!m) return m;
+          if (m.cards.some((c) => c.id === id)) return m;
+          return { ...m, cards: [...m.cards, fresh ? { ...priorCard, ...e.meta.current } : priorCard] };
+        });
+      }
       surface(writeError('delete', e));
     }
   };
