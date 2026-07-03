@@ -1678,19 +1678,23 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, read
    CALENDAR VIEW
    ============================================================ */
 // Device-local calendar view preference — its own localStorage key, NOT board data
-// (same pattern as theme). v0.2 layouts: month grid, week row, work-week (Mon-Fri) row.
+// (same pattern as theme). v0.3 layouts: month grid, week row, work-week (Mon-Fri) row,
+// single-day column.
 const K_CAL_VIEW = 'kanbantt:calendar-view:v1';
 const CAL_LAYOUTS = [
   { id: 'month', label: 'Month' },
   { id: 'week', label: 'Week' },
   { id: 'workweek', label: 'Work Week' },
+  { id: 'day', label: 'Day' },
 ];
 
 // Shared day-cell chips — the SAME markup the month grid has always used, lifted into
 // one place so the week / work-week day-columns reuse it verbatim (no parallel chip).
 // `max` caps the list: month keeps its 3 + "+N more"; week/work-week pass Infinity to
 // show the full day (the column is tall and has no expand affordance for "+N more").
-function DayChips({ dayTasks, dayEvents, columns, onTaskClick, max = 3 }) {
+// `detailed` (Day view only): a roomier task row — priority dot + tag chips below the
+// title — since Day's single column has far more space per task than week/work-week.
+function DayChips({ dayTasks, dayEvents, columns, onTaskClick, max = 3, tags = [], detailed = false }) {
   const C = useTheme();
   const combined = [
     ...dayTasks.map((t) => ({ kind: 'task', data: t })),
@@ -1705,6 +1709,31 @@ function DayChips({ dayTasks, dayEvents, columns, onTaskClick, max = 3 }) {
           const t = item.data;
           const col = columns.find((c) => c.id === t.status);
           const overdue = isOverdue(t);
+          if (detailed) {
+            const priorityColor = C[PRIORITY[t.priority].key];
+            const taskTags = tags.filter((tag) => (t.tags || []).includes(tag.id));
+            return (
+              <div key={t.id} onClick={() => onTaskClick(t)} style={{
+                display: 'flex', flexDirection: 'column', gap: 6,
+                color: C.text, background: C.surfaceHi,
+                borderLeft: `2px solid ${overdue ? C.coral : C[col.accentKey]}`,
+                padding: '8px 10px', borderRadius: 5, cursor: 'pointer',
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                  <div style={{
+                    width: 6, height: 6, borderRadius: '50%',
+                    background: priorityColor, flexShrink: 0,
+                  }} />
+                  <div style={{ fontSize: 13, fontWeight: 500 }}>{t.title}</div>
+                </div>
+                {taskTags.length > 0 && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, paddingLeft: 13 }}>
+                    {taskTags.map((tag) => <TagChip key={tag.id} tag={tag} size="sm" />)}
+                  </div>
+                )}
+              </div>
+            );
+          }
           return (
             <div key={t.id} onClick={() => onTaskClick(t)} style={{
               fontSize: 11, color: C.text, background: C.surfaceHi,
@@ -1736,7 +1765,7 @@ function DayChips({ dayTasks, dayEvents, columns, onTaskClick, max = 3 }) {
   );
 }
 
-function CalendarView({ tasks, events, columns, onTaskClick }) {
+function CalendarView({ tasks, events, columns, onTaskClick, tags = [] }) {
   const C = useTheme();
   const narrow = useNarrow();
   const [cursor, setCursor] = useState(new Date());
@@ -1752,7 +1781,7 @@ function CalendarView({ tasks, events, columns, onTaskClick }) {
   const [layout, setLayout] = useState(() => {
     try {
       const v = JSON.parse(localStorage.getItem(K_CAL_VIEW));
-      return v === 'week' || v === 'workweek' ? v : 'month';
+      return v === 'week' || v === 'workweek' || v === 'day' ? v : 'month';
     } catch { return 'month'; }
   });
   useEffect(() => { safeSet(K_CAL_VIEW, layout); }, [layout]);
@@ -1777,6 +1806,9 @@ function CalendarView({ tasks, events, columns, onTaskClick }) {
   const weekDays = layout === 'workweek'
     ? Array.from({ length: 5 }, (_, i) => addDays(weekStart, i + 1))
     : Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
+  // Day view's single visible date — normalized the same way weekStart is, so its
+  // iso()-based bucketing can't drift from a stray time-of-day left on `cursor`.
+  const dayDate = startOfDay(cursor);
 
   const tasksForDay = (d) => d ? tasks.filter((t) => t.dueDate === iso(d)) : [];
   const eventsForDay = (d) => d ? events.filter((e) => e.date === iso(d)) : [];
@@ -1793,16 +1825,21 @@ function CalendarView({ tasks, events, columns, onTaskClick }) {
       return `${start.toLocaleDateString('en-US', md)} – ${end.toLocaleDateString('en-US', md)}, ${end.getFullYear()}`;
     return `${start.toLocaleDateString('en-US', ymd)} – ${end.toLocaleDateString('en-US', ymd)}`;
   };
+  const dayLabel = dayDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
   const title = layout === 'month'
     ? monthLabel
+    : layout === 'day' ? dayLabel
     : fmtRange(weekDays[0], weekDays[weekDays.length - 1]);
 
-  // prev/next: by one month in month view, by one week in week / work-week.
+  // prev/next: by one month in month view, by one day in day view, by one week in
+  // week / work-week.
   const goPrev = () => setCursor(layout === 'month'
     ? new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1)
+    : layout === 'day' ? addDays(cursor, -1)
     : addDays(cursor, -7));
   const goNext = () => setCursor(layout === 'month'
     ? new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1)
+    : layout === 'day' ? addDays(cursor, 1)
     : addDays(cursor, 7));
 
   const navBtn = {
@@ -2076,6 +2113,36 @@ function CalendarView({ tasks, events, columns, onTaskClick }) {
             );
           })}
         </div>
+      ) : layout === 'day' ? (
+        <div style={{
+          background: C.surface, border: `1px solid ${C.border}`,
+          borderRadius: 10, overflow: 'hidden', maxWidth: 480,
+        }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            background: C.bgGrain, padding: '10px 14px', borderBottom: `1px solid ${C.border}`,
+          }}>
+            <span style={{
+              fontFamily: F.mono, fontSize: 10.5, letterSpacing: '0.1em',
+              color: C.textMuted, textTransform: 'uppercase',
+            }}>{dayDate.toLocaleDateString('en-US', { weekday: 'long' })}</span>
+            <span style={{
+              fontFamily: F.mono, fontSize: 13,
+              color: isToday(dayDate) ? (C.isLight ? '#fff' : C.bg) : C.textMuted,
+              background: isToday(dayDate) ? C.ice : 'transparent',
+              borderRadius: 4, padding: isToday(dayDate) ? '2px 7px' : '0',
+              fontWeight: isToday(dayDate) ? 600 : 400,
+            }}>{dayDate.getDate()}</span>
+          </div>
+          <div style={{ padding: 14, minHeight: 480 }}>
+            {(tasksForDay(dayDate).length || eventsForDay(dayDate).length) ? (
+              <DayChips dayTasks={tasksForDay(dayDate)} dayEvents={eventsForDay(dayDate)}
+                columns={columns} onTaskClick={onTaskClick} max={Infinity} tags={tags} detailed />
+            ) : (
+              <div style={{ fontFamily: F.body, fontSize: 13, color: C.textDim }}>No tasks due</div>
+            )}
+          </div>
+        </div>
       ) : (
         <div style={{
           display: 'grid',
@@ -2148,26 +2215,73 @@ function Legend() {
 /* ============================================================
    GANTT VIEW
    ============================================================ */
+// Device-local timeline view preference — its own localStorage key, NOT board data
+// (same pattern as Calendar's K_CAL_VIEW). Sub-modes: the original rolling 42-day
+// scroll (default) and a fixed 5-day Mon-Fri Work Week window.
+const K_TIMELINE_VIEW = 'kanbantt:timeline-view:v1';
+const TIMELINE_LAYOUTS = [
+  { id: 'rolling', label: 'Rolling' },
+  { id: 'workweek', label: 'Work Week' },
+];
+
 function GanttView({ tasks, events, columns, onTaskClick }) {
   const C = useTheme();
   const narrow = useNarrow();
   const DAY_W = 36;
   const ROW_H = 44;
   const LABEL_W = 220;
+  // Work Week only has 5 columns (vs the scroll's 42), so each gets far more room —
+  // mirrors how Calendar's own Week/Work-Week rows dwarf a Month cell.
+  const WW_DAY_W = 140;
   // Narrow-only: shrink the label column, day width, and page padding for a phone.
   // On desktop these collapse to the module constants so the render is byte-for-byte.
   const labelW = narrow ? 124 : LABEL_W;
-  const dayW = narrow ? 32 : DAY_W;
+  const rollingDayW = narrow ? 32 : DAY_W;
+  const wwDayW = narrow ? 84 : WW_DAY_W;
   const pagePad = narrow ? 12 : 28;
 
   const [offset, setOffset] = useState(-7);
-  const viewStart = addDays(new Date(), offset);
-  viewStart.setHours(0, 0, 0, 0);
-  const numDays = 42;
+  // Work Week's own cursor (any day in the target week) — independent of the
+  // rolling scroll's `offset`, exactly like Calendar keeps one `cursor` per layout.
+  const [weekCursor, setWeekCursor] = useState(() => new Date());
+  // Device-local sub-mode preference: synchronous lazy read, same mechanism as
+  // Calendar's `layout` state. Anything else (incl. absent) falls back to rolling.
+  const [subview, setSubview] = useState(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(K_TIMELINE_VIEW));
+      return v === 'workweek' ? v : 'rolling';
+    } catch { return 'rolling'; }
+  });
+  useEffect(() => { safeSet(K_TIMELINE_VIEW, subview); }, [subview]);
+  const isWW = subview === 'workweek';
+
+  const rollingStart = addDays(new Date(), offset);
+  rollingStart.setHours(0, 0, 0, 0);
+  // Mon-Sat-Sunday-anchored week (same convention as Calendar's weekStart), sliced
+  // to its Monday so the Work Week window always opens on Monday.
+  const wwWeekStart = startOfDay(addDays(weekCursor, -weekCursor.getDay()));
+  const wwMonday = addDays(wwWeekStart, 1);
+
+  const viewStart = isWW ? wwMonday : rollingStart;
+  const numDays = isWW ? 5 : 42;
+  const dayW = isWW ? wwDayW : rollingDayW;
   const days = Array.from({ length: numDays }, (_, i) => addDays(viewStart, i));
 
   const sorted = [...tasks].sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
   const todayIdx = Math.round((new Date().setHours(0, 0, 0, 0) - viewStart.getTime()) / 86400000);
+
+  // Per-task bar metrics, shared by both sub-modes (identical math, just a different
+  // viewStart/numDays). Work Week additionally DROPS rows with no visible bar at all
+  // (a task entirely outside Mon-Fri shouldn't show an empty row); the rolling scroll
+  // keeps every task's label row regardless of bar visibility, exactly as before.
+  const rows = sorted.map((t) => {
+    const start = startOfDay(new Date(t.startDate));
+    const end = startOfDay(new Date(t.dueDate));
+    const startIdx = Math.round((start - viewStart.getTime()) / 86400000);
+    const duration = Math.round((end - start) / 86400000) + 1;
+    const visible = startIdx + duration > 0 && startIdx < numDays;
+    return { t, startIdx, duration, visible };
+  }).filter((r) => !isWW || r.visible);
 
   // On narrow, land the horizontal scroll on today: the 42-day window starts a week
   // before today (offset -7), so today otherwise sits off-screen to the right. Nudge
@@ -2179,7 +2293,7 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
     if (!el) return;
     el.scrollLeft = Math.max(0, todayIdx * dayW - dayW);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [narrow]);
+  }, [narrow, subview]);
 
   const eventByDay = {};
   events.forEach((e) => {
@@ -2192,6 +2306,13 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
     width: 32, height: 32, borderRadius: 7, cursor: 'pointer',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
   };
+
+  // prev/next/today: page by 14 days / jump to offset -7 on the rolling scroll,
+  // step by one week / jump to this week in Work Week — mirroring Calendar's own
+  // per-layout goPrev/goNext split.
+  const goPrev = () => isWW ? setWeekCursor((c) => addDays(c, -7)) : setOffset((o) => o - 14);
+  const goNext = () => isWW ? setWeekCursor((c) => addDays(c, 7)) : setOffset((o) => o + 14);
+  const goToday = () => isWW ? setWeekCursor(new Date()) : setOffset(-7);
 
   return (
     <div style={narrow ? {
@@ -2213,16 +2334,36 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
           fontFamily: F.display, fontStyle: 'italic', fontWeight: 400,
           fontSize: 28, margin: 0, color: C.text, letterSpacing: '-0.02em',
         }}>Timeline</h2>
-        <div style={{ display: 'flex', gap: 4 }}>
-          <button onClick={() => setOffset(offset - 14)} style={navBtn}>
-            <ChevronLeft size={16} strokeWidth={1.5} />
-          </button>
-          <button onClick={() => setOffset(-7)} style={{
-            ...navBtn, padding: '0 14px', width: 'auto', fontFamily: F.mono, fontSize: 11,
-          }}>TODAY</button>
-          <button onClick={() => setOffset(offset + 14)} style={navBtn}>
-            <ChevronRight size={16} strokeWidth={1.5} />
-          </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <div style={{
+            display: 'flex', gap: 4, background: C.surface,
+            padding: 4, borderRadius: 10, border: `1px solid ${C.border}`,
+          }}>
+            {TIMELINE_LAYOUTS.map(({ id, label }) => {
+              const active = subview === id;
+              return (
+                <button key={id} onClick={() => setSubview(id)} style={{
+                  padding: '6px 12px',
+                  background: active ? C.surfaceHi : 'transparent',
+                  color: active ? C.text : C.textMuted, border: 'none',
+                  borderRadius: 7, cursor: 'pointer', fontFamily: F.body,
+                  fontSize: 12, fontWeight: 500, transition: 'all 120ms ease',
+                  whiteSpace: 'nowrap',
+                }}>{label}</button>
+              );
+            })}
+          </div>
+          <div style={{ display: 'flex', gap: 4 }}>
+            <button onClick={goPrev} style={navBtn}>
+              <ChevronLeft size={16} strokeWidth={1.5} />
+            </button>
+            <button onClick={goToday} style={{
+              ...navBtn, padding: '0 14px', width: 'auto', fontFamily: F.mono, fontSize: 11,
+            }}>TODAY</button>
+            <button onClick={goNext} style={navBtn}>
+              <ChevronRight size={16} strokeWidth={1.5} />
+            </button>
+          </div>
         </div>
       </div>
 
@@ -2298,12 +2439,7 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
                 background: C.ice, opacity: 0.4, zIndex: 1,
               }} />
             )}
-            {sorted.map((t) => {
-              const start = startOfDay(new Date(t.startDate));
-              const end = startOfDay(new Date(t.dueDate));
-              const startIdx = Math.round((start - viewStart.getTime()) / 86400000);
-              const duration = Math.round((end - start) / 86400000) + 1;
-              const visible = startIdx + duration > 0 && startIdx < numDays;
+            {rows.map(({ t, startIdx, duration, visible }) => {
               const overdue = isOverdue(t);
               const col = columns.find((c) => c.id === t.status);
               const accent = overdue ? C.coral : C[col.accentKey];
@@ -2311,6 +2447,17 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
               const clipL = startIdx < 0 ? -startIdx : 0;
               const clipR = Math.max(0, startIdx + duration - numDays);
               const barWidth = Math.max(8, (duration - clipL - clipR) * dayW - 4);
+              // Work Week only: a clipped edge drops its rounded cap and gets a small
+              // chevron so a bar that runs past Monday/Friday visibly keeps going,
+              // rather than reading as a hard stop. The 42-day scroll is untouched —
+              // clipL/R already existed there (shrinking barWidth) but never got a
+              // distinct look, so leaving its rounded corners alone keeps it byte-for-
+              // byte identical to before.
+              const clipLShown = isWW && clipL > 0;
+              const clipRShown = isWW && clipR > 0;
+              const barRadius = isWW
+                ? `${clipLShown ? 0 : 4}px ${clipRShown ? 0 : 4}px ${clipRShown ? 0 : 4}px ${clipLShown ? 0 : 4}px`
+                : 4;
 
               return (
                 <div key={t.id} style={{
@@ -2342,7 +2489,7 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
                         top: '50%', transform: 'translateY(-50%)',
                         width: barWidth, height: 22,
                         background: `linear-gradient(90deg, ${accent}35, ${accent}20)`,
-                        borderLeft: `3px solid ${accent}`, borderRadius: 4,
+                        borderLeft: `3px solid ${accent}`, borderRadius: barRadius,
                         cursor: 'pointer', display: 'flex', alignItems: 'center',
                         paddingLeft: 8, fontFamily: F.mono, fontSize: 10,
                         color: accent, letterSpacing: '0.05em',
@@ -2357,7 +2504,17 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
                           e.currentTarget.style.background = `linear-gradient(90deg, ${accent}35, ${accent}20)`;
                         }}
                       >
+                        {clipLShown && (
+                          <ChevronLeft size={10} strokeWidth={2.5} style={{
+                            position: 'absolute', left: 1, opacity: 0.85, flexShrink: 0,
+                          }} />
+                        )}
                         {overdue ? '◆ ' : ''}{duration}d
+                        {clipRShown && (
+                          <ChevronRight size={10} strokeWidth={2.5} style={{
+                            position: 'absolute', right: 1, opacity: 0.85, flexShrink: 0,
+                          }} />
+                        )}
                       </div>
                     )}
                   </div>
@@ -5810,7 +5967,7 @@ export default function App() {
             } : null} />
         )}
         {view === 'calendar' && (
-          <CalendarView tasks={filteredTasks} events={events} columns={activeColumns} onTaskClick={openEdit} />
+          <CalendarView tasks={filteredTasks} events={events} columns={activeColumns} onTaskClick={openEdit} tags={activeTags} />
         )}
         {view === 'gantt' && (
           <GanttView tasks={filteredTasks} events={events} columns={activeColumns} onTaskClick={openEdit} />
