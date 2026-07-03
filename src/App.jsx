@@ -114,13 +114,22 @@ const QUADRANT_DEFS = {
 };
 
 const getImpact = (task) => task.impact ?? (task.priority === 'low' ? 'low' : 'high');
+// 3x3-aware effort x impact -> quadrant. Effort's gate is STRICT (only 'low' counts
+// as cheap enough for a quick win); impact's gate is LENIENT ('med' already counts as
+// worth doing). So low-effort/med-impact reads as 'do' (cheap enough to just ship),
+// while med-effort/high-impact reads as 'plan' (valuable but no longer a quick win).
+const EFFORT_IMPACT_QUADRANT = {
+  low: { low: 'deprioritize', med: 'do', high: 'do' },
+  med: { low: 'avoid', med: 'plan', high: 'plan' },
+  high: { low: 'avoid', med: 'plan', high: 'plan' },
+};
 const getQuadrant = (task) => {
-  if (task.effort === undefined) return 'unsorted';
+  // Spec: effort/impact are `low | med | high | null`; a live spine card carries
+  // explicit null (not an absent key) when unclassified — treat null and undefined
+  // as the same "not yet classified" state.
+  if (task.effort == null) return 'unsorted';
   const impact = getImpact(task);
-  if (impact === 'high' && task.effort === 'high') return 'plan';
-  if (impact === 'high' && task.effort === 'low') return 'do';
-  if (impact === 'low' && task.effort === 'high') return 'avoid';
-  return 'deprioritize';
+  return EFFORT_IMPACT_QUADRANT[task.effort][impact];
 };
 
 const TAG_PALETTE = {
@@ -1087,6 +1096,11 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
   const checklist = task.checklist || [];
   const checklistDone = checklist.filter((c) => c.done).length;
   const hasChecklist = checklist.length > 0;
+  // Matrix quadrant symbol (display-only) — a plain icon+label pair, deliberately
+  // NOT a pill/badge like the escalation marker above, so it never competes with
+  // that reserved styling. Omitted entirely while unclassified (no effort set).
+  const quadrant = getQuadrant(task);
+  const qDef = quadrant === 'unsorted' ? null : QUADRANT_DEFS[quadrant];
   // E1/E2: a per-card escalation badge from card_list. Gated PURELY on the badge
   // data — NOT featureFlags.escalations (display is decoupled from the list/resolve
   // tools). Three states drive the pill: 'unresolved' → amber "Escalated" (needs a
@@ -1261,10 +1275,21 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
               </div>
             )}
           </div>
-          <div style={{
-            fontFamily: F.mono, fontSize: 10, color: C.textDim,
-            letterSpacing: '0.05em',
-          }}>{PRIORITY[task.priority].label}</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {qDef && (
+              <div title={`${qDef.label} — ${qDef.tagline}`} style={{
+                display: 'flex', alignItems: 'center', gap: 3,
+                fontFamily: F.mono, fontSize: 10, color: C[qDef.accentKey],
+                letterSpacing: '0.05em',
+              }}>
+                <qDef.Icon size={10} strokeWidth={2} />
+              </div>
+            )}
+            <div style={{
+              fontFamily: F.mono, fontSize: 10, color: C.textDim,
+              letterSpacing: '0.05em',
+            }}>{PRIORITY[task.priority].label}</div>
+          </div>
         </div>
       </div>
     </div>
@@ -3174,6 +3199,7 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
                 style={{ ...input, cursor: 'pointer' }}>
                 <option value="">— unset</option>
                 <option value="low">Low</option>
+                <option value="med">Med</option>
                 <option value="high">High</option>
               </select>
             </div>
@@ -3184,9 +3210,30 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
                 style={{ ...input, cursor: 'pointer' }}>
                 <option value="">— from priority</option>
                 <option value="low">Low</option>
+                <option value="med">Med</option>
                 <option value="high">High</option>
               </select>
             </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: -6 }}>
+            {(() => {
+              const q = QUADRANT_DEFS[getQuadrant(draft)];
+              if (!q) return <span style={{ ...fieldLabel, textTransform: 'none' }}>Unsorted — drag into the Matrix to classify</span>;
+              const Icon = q.Icon;
+              const accent = C[q.accentKey];
+              return (
+                <span style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  padding: '4px 9px', borderRadius: 6,
+                  background: `${accent}${q.tintAlpha}`, border: `1px solid ${accent}66`,
+                  color: accent, fontFamily: F.mono, fontSize: 11, fontWeight: 700,
+                  letterSpacing: '0.06em', textTransform: 'uppercase',
+                }}>
+                  <Icon size={12} strokeWidth={2.25} />
+                  {q.label} · {q.tagline}
+                </span>
+              );
+            })()}
           </div>
 
           <div>
