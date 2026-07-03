@@ -1,4 +1,4 @@
-<!-- CANONICAL. Home of this contract (kanbantt-app owns it); the Claunker spine keeps a synced copy at claunker-hermes/docs/kanbantt-mcp-spec.md. v0.4.0 (the archive surface) ORIGINATED spine-side on 2026-07-02 — the documented reverse-flow exception — and was back-synced FROM that spine copy VERBATIM on 2026-07-02, closing the drift. Normal flow (kanbantt → spine re-sync on change) resumes from here. -->
+<!-- CANONICAL. Home of this contract (kanbantt-app owns it); the Claunker spine keeps a synced copy at claunker-hermes/docs/kanbantt-mcp-spec.md. Bodies verified byte-identical outside this comment 2026-07-03. v0.4.0 (the archive surface) ORIGINATED spine-side on 2026-07-02 — the documented reverse-flow exception — and was back-synced FROM that spine copy VERBATIM on 2026-07-02, closing the drift. Normal flow (kanbantt → spine re-sync on change) resumes from here. -->
 
 # Kanbantt MCP Specification
 
