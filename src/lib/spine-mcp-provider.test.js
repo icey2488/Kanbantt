@@ -61,6 +61,7 @@ test('connect → initialize + tools/list; server name and capabilities from adv
     projects: true, tasks: true,
     hasCardCreate: true, hasCardUpdate: true, hasCardMove: true, hasCardDelete: true, canWrite: true,
     canRetier: true,
+    canArchive: true, canUnarchive: true,
     escalations: true, canResolve: true, artifacts: true, columns: true, tags: true, realtime: false,
   });
   assert.equal(provider.supportsRealtime(), false, 'v1 is tools-only → board polls');

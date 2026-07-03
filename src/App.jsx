@@ -26,6 +26,8 @@ import {
   Cloud,
   RefreshCw,
   Palette,
+  Archive,
+  ArchiveRestore,
 } from 'lucide-react';
 import { initAuth, signIn, signOut, isGisReady } from './lib/auth.js';
 import { driveSync } from './lib/sync-instance.js';
@@ -835,7 +837,7 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
 /* ============================================================
    FILTER BAR
    ============================================================ */
-function FilterBar({ tags, filters, setFilters }) {
+function FilterBar({ tags, filters, setFilters, showArchived, onToggleShowArchived }) {
   const C = useTheme();
   const narrow = useNarrow();
   // Narrow folds the inline tag chips into a single button + popover (see below);
@@ -1020,6 +1022,30 @@ function FilterBar({ tags, filters, setFilters }) {
         <AlertTriangle size={11} strokeWidth={1.75} />
         Overdue
       </button>
+
+      {/* Show Archived (spec v0.4.0): a VIEW MODE toggle, not a filter — it admits
+          archived cards into the shared filteredTasks pipeline (one seam, all views).
+          Rendered only when the parent wires it (an MCP board; local cards carry no
+          archived_at), default OFF. Deliberately not counted in activeCount / not
+          reset by Clear: clearing filters shouldn't silently flip a visibility mode. */}
+      {onToggleShowArchived && (
+        <button
+          onClick={onToggleShowArchived}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            padding: '5px 10px', borderRadius: 6, cursor: 'pointer',
+            fontFamily: F.mono, fontSize: 10, letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+            background: showArchived ? `${C.ice}22` : 'transparent',
+            border: `1px solid ${showArchived ? `${C.ice}55` : C.border}`,
+            color: showArchived ? C.ice : C.textMuted,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          <Archive size={11} strokeWidth={1.75} />
+          Archived
+        </button>
+      )}
 
       {activeCount > 0 && (
         <button
@@ -1333,7 +1359,7 @@ function QuickAdd({ colId, onAdd }) {
 /* ============================================================
    BOARD VIEW
    ============================================================ */
-function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, readOnly, canCreate }) {
+function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, readOnly, canCreate, sweep }) {
   const C = useTheme();
   const narrow = useNarrow();
   const [draggedId, setDraggedId] = useState(null);
@@ -1478,9 +1504,32 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, read
                   whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                 }}>{col.label}</span>
               </div>
-              <span style={{ fontFamily: F.mono, fontSize: 11, color: C.textDim, flexShrink: 0 }}>
-                {colTasks.length.toString().padStart(2, '0')}
-              </span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                {/* Bulk sweep "Archive all delivered" — renders ONLY in the sweep's
+                    target column (the spine's delivered state) when eligible cards
+                    are visible. The handler + eligibility live in the parent; this
+                    is a dumb affordance gated on `sweep` (capability-derived). */}
+                {sweep && col.id === sweep.columnId && sweep.count > 0 && (
+                  <button onClick={sweep.onSweep} disabled={sweep.busy}
+                    title={`Archive all ${sweep.count} delivered card${sweep.count === 1 ? '' : 's'}`}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 5,
+                      padding: '3px 8px', borderRadius: 5,
+                      cursor: sweep.busy ? 'default' : 'pointer',
+                      fontFamily: F.mono, fontSize: 9, letterSpacing: '0.08em',
+                      textTransform: 'uppercase',
+                      background: 'transparent', border: `1px solid ${C.border}`,
+                      color: C.textMuted, whiteSpace: 'nowrap',
+                      opacity: sweep.busy ? 0.5 : 1,
+                    }}>
+                    <Archive size={10} strokeWidth={1.75} />
+                    {sweep.busy ? 'Archiving…' : 'Archive all'}
+                  </button>
+                )}
+                <span style={{ fontFamily: F.mono, fontSize: 11, color: C.textDim }}>
+                  {colTasks.length.toString().padStart(2, '0')}
+                </span>
+              </div>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               {colTasks.map((t) => (
@@ -2325,7 +2374,7 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
 /* ============================================================
    TASK MODAL
    ============================================================ */
-function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCreateTag, readOnly, mcpWritable, canRetier, onRetier, canResolve, onResolveEscalation }) {
+function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCreateTag, readOnly, mcpWritable, canRetier, onRetier, canResolve, onResolveEscalation, canArchive, canUnarchive, onArchive, onUnarchive }) {
   const C = useTheme();
   const [draft, setDraft] = useState(task);
   const [newTagInput, setNewTagInput] = useState(false);
@@ -2389,6 +2438,33 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
     setRetierOpen(false);
     setRetierReason('');
     setRetierTier(draft.tier);
+  };
+
+  // ── Per-card Archive/Unarchive (card_archive / card_unarchive) ──────────────
+  // Gated on canArchive / canUnarchive — each derived from its OWN advertised tool,
+  // INDEPENDENT of canWrite (spec §Discovery: a read-only mirror can still archive;
+  // a card_archive-only server is a valid one-way archiver, so the two affordances
+  // gate separately). The parent handler (onArchive/onUnarchive) sources
+  // expected_version from the LIVE spineModel card exactly as onRetier does — never
+  // from this modal's snapshot. Reason is omitted → the server's audited
+  // "manual_archive"/"manual_unarchive" default. On success the modal closes (the
+  // card just changed visibility class); on failure the parent already surfaced the
+  // persistent banner + snapped the board back, so we only clear the busy state.
+  const archivedNow = task.archived_at != null;
+  const showArchiveControl = !isNew && (archivedNow ? (canUnarchive && !!onUnarchive) : (canArchive && !!onArchive));
+  const [archiving, setArchiving] = useState(false);
+  const confirmArchiveToggle = async () => {
+    if (archiving) return;
+    setArchiving(true);
+    try {
+      if (archivedNow) await onUnarchive(task.id);
+      else await onArchive(task.id);
+      onClose();
+    } catch {
+      // Loud-revert already fired in the parent (banner + snap-back). Stay open.
+    } finally {
+      setArchiving(false);
+    }
   };
 
   const fieldLabel = {
@@ -3059,7 +3135,8 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
           alignItems: 'center', marginTop: 24,
           paddingTop: 18, borderTop: `1px solid ${C.border}`,
         }}>
-          {(!isNew && !readOnly) ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {(!isNew && !readOnly) && (
             confirmDelete ? (
               // Armed confirm (MCP-writable only): a stray click can't tombstone.
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -3088,7 +3165,27 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
                 Delete
               </button>
             )
-          ) : <div />}
+            )}
+            {/* Archive/Unarchive — OUTSIDE the readOnly gate deliberately: the pair
+                gates on its OWN capabilities (canArchive/canUnarchive), independent
+                of canWrite, so a read-only mirror with card_archive still offers it.
+                Single-click, no confirm arm: unlike delete, archive is reversible
+                (unarchive) and the server enforces the escalation gate loudly. */}
+            {showArchiveControl && (
+              <button onClick={confirmArchiveToggle} disabled={archiving} style={{
+                background: 'transparent', border: `1px solid ${C.border}`,
+                color: C.textMuted, padding: '9px 12px', borderRadius: 7,
+                cursor: archiving ? 'default' : 'pointer', display: 'flex', alignItems: 'center',
+                gap: 6, fontFamily: F.body, fontSize: 13,
+                opacity: archiving ? 0.6 : 1,
+              }}>
+                {archivedNow
+                  ? <ArchiveRestore size={14} strokeWidth={1.5} />
+                  : <Archive size={14} strokeWidth={1.5} />}
+                {archiving ? (archivedNow ? 'Unarchiving…' : 'Archiving…') : (archivedNow ? 'Unarchive' : 'Archive')}
+              </button>
+            )}
+          </div>
           <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={onClose} style={{
               background: 'transparent', border: `1px solid ${C.border}`,
@@ -3702,6 +3799,7 @@ function SettingsModal({
   onAddColumn, onRenameColumn, onRecolorColumn, onReorderColumn, onDeleteColumn,
   onAddTag, onRenameTag, onRecolorTag, onDeleteTag, readOnly,
   spineState, onSpineConnect, onSpineDisconnect,
+  archiveConfig, onArchiveConfigChange,
 }) {
   const C = useTheme();
   const [tab, setTab] = useState('columns');
@@ -3881,6 +3979,7 @@ function SettingsModal({
             { id: 'tags', label: 'Tags', count: tags.length },
             { id: 'account', label: 'Account', count: null },
             { id: 'connection', label: 'Connection', count: null },
+            { id: 'archive', label: 'Archive', count: null },
           ].map((t) => {
             const active = tab === t.id;
             return (
@@ -4496,6 +4595,83 @@ function SettingsModal({
               </div>
             </div>
           )}
+
+          {/* ARCHIVE — the kanbantt_config `archive` sub-key ({ autoAgeDays, showArchived }),
+              modeled on the Connection tab: a status row driven by the controller's truth
+              (spineCaps.canArchive), then the editable settings. The settings persist
+              regardless of connection state; the sweep itself only runs against a live
+              spine that advertises card_archive. */}
+          {tab === 'archive' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 14,
+                padding: 14, background: C.surface, borderRadius: 10,
+                border: `1px solid ${(spineCaps && spineCaps.canArchive) ? `${C.mint}40` : C.border}`,
+              }}>
+                <div style={{
+                  width: 44, height: 44, borderRadius: '50%',
+                  background: C.surfaceHi, border: `1px solid ${C.border}`,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                }}>
+                  <Archive size={18} strokeWidth={1.5}
+                    color={(spineCaps && spineCaps.canArchive) ? C.mint : C.textDim} />
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontFamily: F.body, fontSize: 14, color: C.text, fontWeight: 500 }}>
+                    {(spineCaps && spineCaps.canArchive) ? 'Governed archive available' : 'Archive unavailable'}
+                  </div>
+                  <div style={{ fontFamily: F.mono, fontSize: 11, color: C.textMuted, marginTop: 2 }}>
+                    {(spineCaps && spineCaps.canArchive)
+                      ? 'card_archive advertised — every archive is audited on the spine'
+                      : 'Connect a spine that advertises card_archive'}
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <label style={fieldLabel}>Auto-archive delivered cards after</label>
+                <select
+                  value={archiveConfig && archiveConfig.autoAgeDays != null ? String(archiveConfig.autoAgeDays) : ''}
+                  onChange={(e) => onArchiveConfigChange({ autoAgeDays: e.target.value === '' ? null : Number(e.target.value) })}
+                  style={{ ...input, flex: 'unset', cursor: 'pointer' }}>
+                  <option value="">Off</option>
+                  <option value="1">1 day</option>
+                  <option value="2">2 days</option>
+                  <option value="3">3 days</option>
+                  <option value="5">5 days</option>
+                  <option value="7">7 days</option>
+                  <option value="14">14 days</option>
+                </select>
+                <div style={helperText}>
+                  A client-side sweep (on load and periodically) archives delivered cards older
+                  than this. v1 measures age from the card's last update (updated_at) — there is
+                  no delivered-transition timestamp on the wire — so any later edit resets the
+                  clock. Cards with an unresolved escalation are skipped loudly, never buried.
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <button
+                  onClick={() => onArchiveConfigChange({ showArchived: !(archiveConfig && archiveConfig.showArchived) })}
+                  aria-pressed={!!(archiveConfig && archiveConfig.showArchived)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 6,
+                    padding: '6px 12px', borderRadius: 6, cursor: 'pointer',
+                    fontFamily: F.mono, fontSize: 10, letterSpacing: '0.08em',
+                    textTransform: 'uppercase',
+                    background: (archiveConfig && archiveConfig.showArchived) ? `${C.ice}22` : 'transparent',
+                    border: `1px solid ${(archiveConfig && archiveConfig.showArchived) ? `${C.ice}55` : C.border}`,
+                    color: (archiveConfig && archiveConfig.showArchived) ? C.ice : C.textMuted,
+                  }}>
+                  <Archive size={11} strokeWidth={1.75} />
+                  {(archiveConfig && archiveConfig.showArchived) ? 'Showing archived' : 'Show archived'}
+                </button>
+                <div style={{ ...helperText, marginTop: 0 }}>
+                  Default off — archived cards stay out of every view. Same toggle as the filter bar.
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -4602,6 +4778,15 @@ export default function App() {
   // kanbantt_config. The Connection settings tab drives this on connect/disconnect; no
   // page reload. (Distinct from handleReconnect, which re-acquires the GOOGLE token.)
   const [spineConfigNonce, setSpineConfigNonce] = useState(0);
+  // Archive settings — the kanbantt_config `archive` sub-key (spec v0.4.0 client
+  // behavior): { autoAgeDays: null|number, showArchived: boolean }. Device-local,
+  // read once on mount (readKanbanttConfig supplies the defaults), persisted on
+  // change like the mcp target. showArchived doubles as the poll's include_archived
+  // flag, read through a ref so the connection's per-tick getter never goes stale.
+  const [archiveCfg, setArchiveCfg] = useState(() => readKanbanttConfig().archive || { autoAgeDays: null, showArchived: false });
+  const showArchived = !!archiveCfg.showArchived;
+  const showArchivedRef = useRef(showArchived);
+  useEffect(() => { showArchivedRef.current = showArchived; }, [showArchived]);
   // MOCK_EVENTS no longer renders; the Calendar/Timeline overlay plumbing stays
   // wired to this empty list as an attachment point for real Google Calendar
   // integration (see MOCK_EVENTS above).
@@ -4646,6 +4831,12 @@ export default function App() {
   // server may advertise the audited re-tier without the full card_* write set — so
   // the re-tier affordance gates on THIS flag, never on canWrite.
   const mcpCanRetier = !!(spineState && spineState.capabilities && spineState.capabilities.canRetier);
+  // canArchive / canUnarchive gate the governed archive pair, threaded exactly like
+  // canRetier — each derived from its OWN advertised tool, independent of canWrite
+  // (a card_archive-only spine is a valid ONE-WAY archiver: archive affordances
+  // render, unarchive stays hidden).
+  const mcpCanArchive = !!(spineState && spineState.capabilities && spineState.capabilities.canArchive);
+  const mcpCanUnarchive = !!(spineState && spineState.capabilities && spineState.capabilities.canUnarchive);
   const spineTasks = useMemo(() => {
     if (!spineModel) return null;
     const today = iso(new Date());
@@ -4669,6 +4860,10 @@ export default function App() {
         // textarea is always controlled; tier stays null when untiered.
         acceptance_criteria: c.acceptance_criteria || '',
         tier: c.tier ?? null,
+        // Archive flag (spec v0.4.0): non-null = archived. The `...c` spread already
+        // carries it; enumerated (like badge/tier) because the shared filter, the
+        // per-card control, and both sweeps all key off it.
+        archived_at: c.archived_at ?? null,
         // E1 escalation display: card_list attaches a per-card escalation badge
         // ({ kind:'escalation', id, reason, control_diff }) or null. The `...c`
         // spread above already carries it, but enumerate it explicitly — the card
@@ -4781,16 +4976,28 @@ export default function App() {
     let unsub = () => {};
     let disposed = false;
     import('./lib/mcp-connection.js')
-      .then(({ createMcpConnectionFromConfig }) => {
+      .then(({ createMcpConnectionFromConfig, reconcileSpineModel }) => {
         if (disposed) return;
-        // SPLIT-BRAIN GUARD: applyModel is setSpineModel — polled board_get/card_list
-        // snapshots land ONLY in transient React state, NEVER in the card store (the
+        // SPLIT-BRAIN GUARD: applyModel lands polled board_get/card_list snapshots
+        // ONLY in transient React state (setSpineModel), NEVER in the card store (the
         // Local canonical in localStorage). Combined with every store-mutating handler
         // short-circuiting on mcpActive, the local board is left byte-for-byte untouched
         // while a spine is connected, so a later disconnected boot (or a boot with a
         // writable token) can never mistake a stale read-only mirror for local truth.
         // Do NOT route spineModel into the store.
-        conn = createMcpConnectionFromConfig({ config, applyModel: setSpineModel });
+        //
+        // PURGE-RULE GUARD (spec v0.4.0 §Archive): the poll's replace is wrapped in
+        // reconcileSpineModel — a locally-held card with non-null archived_at is NOT
+        // purged when a DEFAULT fetch's results omit it (archived cards are absent
+        // from default full fetches BY DESIGN; absence there is not deletion). Purge
+        // authority over archived cards requires an include_archived:true fetch —
+        // which the poll runs exactly when "Show archived" is on (the ref-backed
+        // getter below, re-read every tick).
+        conn = createMcpConnectionFromConfig({
+          config,
+          applyModel: (next) => setSpineModel((prev) => reconcileSpineModel(prev, next)),
+          includeArchived: () => showArchivedRef.current,
+        });
         spineConnRef.current = conn; // expose to the escalation-resolve handler
         unsub = conn.subscribe((st) => {
           setSpineState(st);
@@ -4885,6 +5092,20 @@ export default function App() {
   };
   /* ---- mutation plumbing ------------------------------------------------ */
   const surface = (msg) => setNotice(msg);
+  // TRANSIENT variant — the SAME banner slot/component as surface() (one notice
+  // surface, two dismissal policies; no new component), auto-dismissing after ~4s.
+  // Success-class messages only (the bulk/auto sweep's "Archived N of N."); anything
+  // warning-class goes through surface(), which never auto-dismisses. The equality
+  // guard keeps a late timer from clearing a NEWER notice that replaced this one.
+  const noticeTimerRef = useRef(null);
+  const surfaceTransient = (msg, ms = 4000) => {
+    setNotice(msg);
+    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = setTimeout(() => {
+      noticeTimerRef.current = null;
+      setNotice((cur) => (cur === msg ? null : cur));
+    }, ms);
+  };
   const lastOrderOf = (columnId, excludeId) => {
     const inCol = liveColumnCards(getSnapshot(), columnId, excludeId);
     return inCol.length ? inCol[inCol.length - 1].order : null;
@@ -5073,6 +5294,199 @@ export default function App() {
       throw e; // let the modal close its sub-flow (the banner is the error surface)
     }
   };
+
+  // Governed archive/unarchive (card_archive / card_unarchive) — the audited pair
+  // that moves the orthogonal archived_at flag (spec v0.4.0 §Archive). SAME CAPTURE →
+  // OPTIMISTIC → call → reconcile / loud-revert shape as retierTaskMcp, gated on
+  // canArchive/canUnarchive (NOT canWrite). expected_version comes from the LIVE
+  // spineModel card, never a modal snapshot. Reason is OMITTED → the server's
+  // audited "manual_archive"/"manual_unarchive" default (an explicit reason is for
+  // the sweeps, which pass canned strings). Rethrows on failure so the modal can
+  // close its busy state — the persistent banner here is the one error surface.
+  const archiveTaskMcp = async (id) => {
+    const provider = spineProvider();
+    const model = spineModel;
+    if (!provider || !model) { surface('No live spine connection — archive not sent.'); return undefined; }
+    const cur = model.cards.find((c) => c.id === id && !c.deleted_at);
+    if (!cur) { surface('That card was deleted'); return undefined; }
+    const prior = { archived_at: cur.archived_at ?? null }; // CAPTURE
+    const expected_version = cur.version;
+    setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC (server stamp reconciles over this)
+      c.id === id ? { ...c, archived_at: new Date().toISOString() } : c) } : m));
+    try {
+      const card = await provider.cardArchive(id, expected_version);
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // RECONCILE (merge fresh flag + version)
+        c.id === id ? { ...c, ...card } : c) } : m));
+      reconcileSpine();
+      return card;
+    } catch (e) {
+      const fresh = e?.code === 'conflict' && e.meta?.current;
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // SNAP-BACK-or-REVERT (synchronous)
+        c.id === id
+          ? (fresh ? { ...c, ...e.meta.current } : { ...c, archived_at: prior.archived_at })
+          : c) } : m));
+      surface(writeError('archive', e));
+      throw e;
+    }
+  };
+  const unarchiveTaskMcp = async (id) => {
+    const provider = spineProvider();
+    const model = spineModel;
+    if (!provider || !model) { surface('No live spine connection — unarchive not sent.'); return undefined; }
+    const cur = model.cards.find((c) => c.id === id && !c.deleted_at);
+    if (!cur) { surface('That card was deleted'); return undefined; }
+    const prior = { archived_at: cur.archived_at ?? null }; // CAPTURE
+    const expected_version = cur.version;
+    setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
+      c.id === id ? { ...c, archived_at: null } : c) } : m));
+    try {
+      const card = await provider.cardUnarchive(id, expected_version);
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // RECONCILE
+        c.id === id ? { ...c, ...card } : c) } : m));
+      reconcileSpine();
+      return card;
+    } catch (e) {
+      const fresh = e?.code === 'conflict' && e.meta?.current;
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // SNAP-BACK-or-REVERT
+        c.id === id
+          ? (fresh ? { ...c, ...e.meta.current } : { ...c, archived_at: prior.archived_at })
+          : c) } : m));
+      surface(writeError('unarchive', e));
+      throw e;
+    }
+  };
+
+  // ── Archive sweep core — SHARED by the bulk button and the age-rule auto sweep ──
+  // SEQUENTIAL per-card card_archive (matching the app's one-write-at-a-time
+  // precedent — there is no bulk tool on the wire), each success merged into the
+  // model as it lands. A rejected card (unresolved escalation; or a conflict racing
+  // the sweep) is SKIPPED and reported — never force-archived, never silent. One
+  // backstop poll at the end instead of per-card.
+  const sweepBusyRef = useRef(false);
+  const [sweepingDelivered, setSweepingDelivered] = useState(false);
+  const sweepArchive = async (targets, reason) => {
+    const provider = spineProvider();
+    if (!provider) return { archived: 0, skipped: [], total: targets.length };
+    let archived = 0;
+    const skipped = [];
+    for (const t of targets) {
+      try {
+        const card = await provider.cardArchive(t.id, t.version, reason);
+        setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => (c.id === t.id ? { ...c, ...card } : c)) } : m));
+        archived += 1;
+      } catch (e) {
+        skipped.push({ task: t, message: e?.message || e?.code || 'error' });
+      }
+    }
+    reconcileSpine();
+    return { archived, skipped, total: targets.length };
+  };
+  // LAYERED sweep reporting (locked): 100% success → transient toast (auto-dismisses);
+  // ANY skip → the persistent warning banner (surface(), never auto-dismissed) naming
+  // the count and identifying each skipped card inline — clicking one opens the card
+  // (the same openEdit targeting every view already uses), so a buried escalation is
+  // one click from human eyes.
+  const reportSweep = (res) => {
+    if (res.skipped.length === 0) {
+      surfaceTransient(`Archived ${res.archived} of ${res.total}.`);
+      return;
+    }
+    surface(
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        Archived {res.archived} of {res.total}. {res.skipped.length} skipped: unresolved escalation.
+        {res.skipped.map((s) => (
+          <button key={s.task.id} onClick={() => openEdit(s.task)} style={{
+            background: 'transparent', border: `1px solid ${C.coral}66`, color: C.coral,
+            padding: '2px 8px', borderRadius: 5, cursor: 'pointer',
+            fontFamily: F.mono, fontSize: 11, maxWidth: 180,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }} title={`Open "${s.task.title}"`}>{s.task.title}</button>
+        ))}
+      </span>,
+    );
+  };
+  // Bulk sweep "Archive all delivered": targets the CURRENTLY-VISIBLE delivered
+  // cards (post-filter — what the user sees is what sweeps) that are not yet
+  // archived. Wired to the delivered column's header button, gated on canArchive.
+  const archiveAllDelivered = async () => {
+    if (sweepBusyRef.current) return;
+    const targets = filteredTasks.filter((t) => t.status === 'delivered' && t.archived_at == null && !t.deleted_at);
+    if (!targets.length) return;
+    sweepBusyRef.current = true;
+    setSweepingDelivered(true);
+    try {
+      reportSweep(await sweepArchive(targets, 'bulk_archive_delivered'));
+    } finally {
+      sweepBusyRef.current = false;
+      setSweepingDelivered(false);
+    }
+  };
+
+  // Persist an archive-settings change (kanbantt_config.archive, merged like the mcp
+  // target) and nudge one poll so a showArchived flip repaints promptly — the next
+  // tick's card_list follows the new include_archived mode via the ref-backed getter.
+  const updateArchiveConfig = (patch) => {
+    setArchiveCfg((prev) => ({ ...prev, ...patch }));
+    const cfg = readKanbanttConfig();
+    safeSet('kanbantt_config', { ...cfg, archive: { ...(cfg.archive || {}), ...patch } });
+    if ('showArchived' in patch) {
+      showArchivedRef.current = !!patch.showArchived; // pre-effect, so the nudged poll already sees it
+      reconcileSpine();
+    }
+  };
+
+  // ── Age-rule AUTO sweep (client-side, v1) ────────────────────────────────────
+  // With archive.autoAgeDays set, delivered cards older than the threshold are
+  // swept on board load (mcpActive + canArchive coming true) and every 10 minutes
+  // (age is measured in DAYS — a tighter timer buys nothing). KNOWN v1 IMPRECISION,
+  // deliberate and flagged: the wire Card has NO delivered-transition timestamp
+  // (the cards' "Yesterday" labels are DUE-DATE relative, not state-change times),
+  // so age falls back to updated_at — any later edit resets the clock, and a card
+  // updated while sitting in delivered postpones its own sweep. Targets come from
+  // the FULL model (policy is not filter-scoped), read through a ref so the
+  // interval never acts on a stale closure. Reporting is the SAME layered rule as
+  // the bulk sweep, scaled down: swept nothing → SILENT (no toast spam every tick);
+  // N>0 clean → the transient toast; ANY skip → the persistent banner (a buried
+  // escalation is the same hazard whatever triggered the sweep) — re-surfaced only
+  // when the SKIP SET changes, so a dismissed banner doesn't re-nag every interval
+  // for the same stuck card.
+  const spineTasksRef = useRef(null);
+  useEffect(() => { spineTasksRef.current = spineTasks; }, [spineTasks]);
+  const lastAutoSkipSigRef = useRef('');
+  useEffect(() => {
+    const days = archiveCfg.autoAgeDays;
+    if (!mcpActive || !mcpCanArchive || !days || !(days > 0)) return undefined;
+    let cancelled = false;
+    const run = async () => {
+      if (cancelled || sweepBusyRef.current) return;
+      const cutoff = Date.now() - days * 86400000;
+      const targets = (spineTasksRef.current || []).filter((t) =>
+        t.status === 'delivered' && t.archived_at == null && !t.deleted_at
+        && t.updated_at && Date.parse(t.updated_at) <= cutoff);
+      if (!targets.length) return; // zero to do → silent
+      sweepBusyRef.current = true;
+      try {
+        const res = await sweepArchive(targets, `auto_age_archive_${days}d`);
+        if (cancelled) return;
+        if (res.skipped.length === 0) {
+          if (res.archived > 0) surfaceTransient(`Archived ${res.archived} of ${res.total}.`);
+          return;
+        }
+        const sig = res.skipped.map((s) => s.task.id).sort().join(',');
+        if (sig !== lastAutoSkipSigRef.current) {
+          lastAutoSkipSigRef.current = sig;
+          reportSweep(res);
+        }
+      } finally {
+        sweepBusyRef.current = false;
+      }
+    };
+    run(); // board load / rule change
+    const h = setInterval(run, 10 * 60 * 1000);
+    return () => { cancelled = true; clearInterval(h); };
+    // run() reads live state via refs; deps re-arm on connection or rule changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mcpActive, mcpCanArchive, archiveCfg.autoAgeDays]);
 
   const deleteTaskMcp = async (id) => {
     const provider = spineProvider();
@@ -5286,9 +5700,17 @@ export default function App() {
   };
 
   // Apply filters over the active board source (local store, or the live spine
-  // model while MCP is active).
+  // model while MCP is active). This memo is the ONE filtering seam every view
+  // consumes (board/calendar/timeline/matrix — and the Dispatch Log board, which is
+  // just a spine project rendered through the same views), so the archived gate
+  // below applies everywhere by construction, wired once.
   const filteredTasks = useMemo(() => {
     return baseTasks.filter((t) => {
+      // Show Archived (default OFF): archived cards are held in the model (the
+      // purge guard retains them; an include_archived poll refreshes them) but
+      // enter the views only when the toggle admits them. Local-mode tasks carry
+      // no archived_at, so this gate is a no-op off the spine.
+      if (t.archived_at != null && !showArchived) return false;
       if (filters.search) {
         const q = filters.search.toLowerCase();
         const tagNames = (t.tags || [])
@@ -5304,7 +5726,7 @@ export default function App() {
       if (filters.overdueOnly && !isOverdue(t)) return false;
       return true;
     });
-  }, [baseTasks, activeTags, filters]);
+  }, [baseTasks, activeTags, filters, showArchived]);
 
   const C = THEMES[theme];
 
@@ -5373,11 +5795,19 @@ export default function App() {
           syncEnabled={syncEnabled} syncStatus={syncStatus}
           onSyncNow={handleSyncNow} onReconnect={handleReconnect}
           spineState={spineState} canCreate={!mcpActive} />
-        <FilterBar tags={activeTags} filters={filters} setFilters={setFilters} />
+        <FilterBar tags={activeTags} filters={filters} setFilters={setFilters}
+          showArchived={showArchived}
+          onToggleShowArchived={mcpActive ? () => updateArchiveConfig({ showArchived: !showArchived }) : undefined} />
         {view === 'board' && (
           <BoardView tasks={filteredTasks} tags={activeTags} columns={activeColumns}
             onTaskClick={openEdit} onMove={moveTask} onQuickAdd={quickAdd}
-            readOnly={mcpReadOnly} canCreate={!mcpActive} />
+            readOnly={mcpReadOnly} canCreate={!mcpActive}
+            sweep={mcpActive && mcpCanArchive ? {
+              columnId: 'delivered',
+              count: filteredTasks.filter((t) => t.status === 'delivered' && t.archived_at == null && !t.deleted_at).length,
+              busy: sweepingDelivered,
+              onSweep: archiveAllDelivered,
+            } : null} />
         )}
         {view === 'calendar' && (
           <CalendarView tasks={filteredTasks} events={events} columns={activeColumns} onTaskClick={openEdit} />
@@ -5398,6 +5828,8 @@ export default function App() {
             onClose={() => setEditing(null)} onCreateTag={createTag} readOnly={mcpReadOnly}
             mcpWritable={mcpWritable}
             canRetier={mcpCanRetier} onRetier={retierTaskMcp}
+            canArchive={mcpCanArchive} canUnarchive={mcpCanUnarchive}
+            onArchive={archiveTaskMcp} onUnarchive={unarchiveTaskMcp}
             canResolve={mcpCanResolve} onResolveEscalation={handleResolveEscalation} />
         )}
         {/* SettingsModal readOnly=mcpActive (NOT mcpReadOnly): board-config
@@ -5418,7 +5850,8 @@ export default function App() {
             syncEnabled={syncEnabled} onToggleSync={setSyncEnabled}
             syncStatus={syncStatus} onSyncNow={handleSyncNow} readOnly={mcpActive}
             spineState={spineState}
-            onSpineConnect={handleSpineConnect} onSpineDisconnect={handleSpineDisconnect} />
+            onSpineConnect={handleSpineConnect} onSpineDisconnect={handleSpineDisconnect}
+            archiveConfig={archiveCfg} onArchiveConfigChange={updateArchiveConfig} />
         )}
         {driveSync && syncStatus === 'collision_pending' && (
           <CollisionDialog onResolve={handleResolveCollision} busy={collisionBusy} />

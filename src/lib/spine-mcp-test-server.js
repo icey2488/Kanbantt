@@ -33,6 +33,7 @@ import { createStore } from './card-store.js';
  *  lets the provider's `canRetier` derive true (spec v0.3.0). */
 const ALL_TOOLS = [
   'board_get', 'card_list', 'card_get', 'card_create', 'card_update', 'card_move', 'card_delete', 'card_retier',
+  'card_archive', 'card_unarchive',
   'column_create', 'column_update', 'column_delete',
   'tag_create', 'tag_update', 'tag_delete',
   'escalation_list', 'escalation_resolve', 'artifact_list',
@@ -42,6 +43,10 @@ const ALL_TOOLS = [
  *  byte-identical to the real spine's RETIER_ACTOR ("client:bearer"). Every client
  *  shares the single Bearer token today; per-user attribution is a Stage-2 seam. */
 const RETIER_ACTOR = 'client:bearer';
+
+/** Actor stamped on every archive_audit row — same placeholder stance as
+ *  RETIER_ACTOR, byte-identical to the real spine's ARCHIVE_ACTOR. */
+const ARCHIVE_ACTOR = 'client:bearer';
 
 /** Minimal in-memory localStorage shim for createStore (Node has no localStorage). */
 function memStorage() {
@@ -163,9 +168,17 @@ function patchTierToInt(value) {
  *        (set >1 to exercise the provider's schema_unsupported refusal).
  * @param {Object<string,{code,message,meta}>} [opts.errorOn]  force a tool to
  *        always return the given domain error (e.g. rate_limited with retry_after).
- * @returns {{ url, fetchFn, store, server, close }}
+ * @param {Array<object>} [opts.escalations]  MINIMAL escalation fixture (the mock
+ *        previously had NO escalation model — escalation_list was a bare [] stub).
+ *        Entries follow the spine's linkage the archive gate + projection badge share:
+ *        { id, card_id, resolved_at: null|ISO, deleted_at: null|ISO, resolution? }.
+ *        OPEN (blocks card_archive) = live (deleted_at == null) AND unresolved
+ *        (resolved_at == null) — the spine's _has_open_escalation predicate verbatim;
+ *        a resolved escalation (even a DENIED one) does NOT block. Tests mutate the
+ *        exposed `escalations` handle (or use escalation_resolve) to flip states.
+ * @returns {{ url, fetchFn, store, server, escalations, close }}
  */
-export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], payloadStyle = 'structured', schemaVersion = 1, errorOn = {} } = {}) {
+export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], payloadStyle = 'structured', schemaVersion = 1, errorOn = {}, escalations = [] } = {}) {
   const store = createStore({ storage: memStorage(), actor: { type: 'agent', id: 'spine' } });
   store.load();
   if (typeof seed === 'function') seed(store);
@@ -174,6 +187,19 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
   // tier_audit table. card_retier pushes ONE row per successful change; tests read it
   // back via the exposed `tierAudit()` accessor (the spine exposes store.list_tier_audit).
   const auditLog = [];
+
+  // The append-only ARCHIVE governance ledger — the in-memory analogue of the spine's
+  // archive_audit table (one row per successful archive/unarchive; NO rejection branch
+  // writes a row). Read back via the exposed `archiveAudit()` accessor.
+  const archiveAuditLog = [];
+
+  // The live escalation fixture (see opts.escalations above). A mutable array handle:
+  // the archive gate reads it, escalation_list serves it, escalation_resolve resolves
+  // into it, and tests may mutate entries directly.
+  const escalationFixture = escalations.map((e) => ({ ...e }));
+  /** The spine's _has_open_escalation predicate: live + unresolved + linked to card. */
+  const hasOpenEscalation = (cardId) =>
+    escalationFixture.some((e) => e.card_id === cardId && e.deleted_at == null && e.resolved_at == null);
 
   const tools = ALL_TOOLS.filter((t) => !omitTools.includes(t));
   const has = (t) => tools.includes(t);
@@ -226,6 +252,19 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
         case 'card_list': {
           const out = store.list({ since: a.updated_since ?? null, includeDeleted: !!a.include_deleted });
           let cards = out.cards;
+          // include_archived (spec v0.4.0): archived cards are OMITTED from a FULL
+          // fetch by default, included on request. The filter is SUBTRACTIVE and runs
+          // over whatever include_deleted admitted, so the two flags COMPOSE: a
+          // deleted+archived card needs BOTH to appear (mirrors the real spine's
+          // list_cards ordering — tombstone merge first, archived filter after).
+          // Per spec §Synchronization the flag is IGNORED for delta queries
+          // (updated_since set): archive/unarchive mint a version like any mutation,
+          // so those changes ride the delta unconditionally. (The real spine has no
+          // delta path in v1 — updated_since is a documented full-snapshot no-op
+          // there — so the spec, not the spine, is the parity target for deltas.)
+          if (a.updated_since == null && !a.include_archived) {
+            cards = cards.filter((c) => c.archived_at == null);
+          }
           if (a.column_id != null) cards = cards.filter((c) => c.column_id === a.column_id);
           if (a.tag != null) cards = cards.filter((c) => (c.tags || []).includes(a.tag));
           return ok({ cards, sync_token: out.sync_token });
@@ -316,14 +355,102 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
           });
           return ok({ card });
         }
+        case 'card_archive': {
+          // GOVERNED, audited archive — IDENTICAL semantics AND ORDER to the spine's
+          // card_archive path (spec v0.4.0 §Archive). TOOL-LAYER reason defaulting
+          // runs FIRST (spine server.py: an OMITTED reason → "manual_archive" before
+          // anything else), so only an EXPLICIT empty/whitespace reason can reach the
+          // ledger's reject — the two-layer rule: omission is ergonomic, explicit
+          // garbage is loud. Then gate → invariants, the spine's archive_task order:
+          // gateMutable (not_found / tombstone / stale version → conflict; NO force —
+          // conflict-before-domain, so a stale re-archive is a `conflict`, never a
+          // spurious "already archived") → LOUD idempotency (already-archived →
+          // validation_failed; a healthy archive and a re-archive must not emit the
+          // same signal — sweepers filter their own targets) → ESCALATION GATE (an
+          // OPEN escalation — live AND unresolved — blocks; archiving would bury a
+          // card awaiting attention; a RESOLVED escalation, even a denied one, does
+          // NOT block) → the ledger's non-empty-reason invariant. On success: the
+          // version-checked write (mints a fresh version; archived_at rides it) +
+          // ONE audit row appended AFTER it — no orphan row on a failed write, the
+          // retier idiom. NO rejection branch writes a row.
+          const reason = a.reason == null ? 'manual_archive' : a.reason;
+          const gate = gateMutable(a.id, { expected_version: a.expected_version }); // NO force
+          if (gate.error) return gate.error;
+          if (gate.card.archived_at != null) {
+            return domainError('validation_failed', `task ${pyRepr(a.id)} is already archived`, { id: a.id });
+          }
+          if (hasOpenEscalation(a.id)) {
+            return domainError('validation_failed', 'cannot archive a task with an unresolved escalation', { id: a.id });
+          }
+          if (typeof reason !== 'string' || reason.trim() === '') {
+            return domainError('validation_failed', 'archive_audit rows require a non-empty reason', { id: a.id });
+          }
+          const card = store.update(a.id, { archived_at: new Date().toISOString() }, { expected_version: a.expected_version });
+          archiveAuditLog.push({
+            id: globalThis.crypto.randomUUID(),
+            card_id: a.id,
+            action: 'archive',
+            actor: ARCHIVE_ACTOR,
+            reason,
+            ts: new Date().toISOString(),
+          });
+          return ok({ card });
+        }
+        case 'card_unarchive': {
+          // Symmetric to card_archive (same tool-layer reason defaulting — the
+          // "manual_unarchive" default — same gate-then-invariants order, same audit
+          // idiom, action: "unarchive") with the two spec asymmetries: loud
+          // idempotency flips (a NOT-archived target → validation_failed), and there
+          // is NO escalation gate — restoring a card to view never buries anything.
+          const reason = a.reason == null ? 'manual_unarchive' : a.reason;
+          const gate = gateMutable(a.id, { expected_version: a.expected_version }); // NO force
+          if (gate.error) return gate.error;
+          if (gate.card.archived_at == null) {
+            return domainError('validation_failed', `task ${pyRepr(a.id)} is not archived`, { id: a.id });
+          }
+          if (typeof reason !== 'string' || reason.trim() === '') {
+            return domainError('validation_failed', 'archive_audit rows require a non-empty reason', { id: a.id });
+          }
+          const card = store.update(a.id, { archived_at: null }, { expected_version: a.expected_version });
+          archiveAuditLog.push({
+            id: globalThis.crypto.randomUUID(),
+            card_id: a.id,
+            action: 'unarchive',
+            actor: ARCHIVE_ACTOR,
+            reason,
+            ts: new Date().toISOString(),
+          });
+          return ok({ card });
+        }
         case 'column_create': store.columnCreate(a); return ok(board());
         case 'column_update': store.columnUpdate(a.id, a.patch || {}); return ok(board());
         case 'column_delete': store.columnDelete(a.id, a.orphan_destination_column_id); return ok(board());
         case 'tag_create': store.tagCreate(a); return ok(board());
         case 'tag_update': store.tagUpdate(a.id, a.patch || {}); return ok(board());
         case 'tag_delete': store.tagDelete(a.id); return ok(board());
-        case 'escalation_list': return ok({ escalations: [] });
-        case 'escalation_resolve': return ok({ escalation: { id: a.id, status: 'resolved', resolution: a.resolution, resolution_rationale: a.resolution_rationale } });
+        case 'escalation_list': {
+          // Serves the LIVE fixture (deleted entries omitted), optional status filter
+          // per the spec wire shape: pending = unresolved, resolved = resolved_at set.
+          let list = escalationFixture.filter((e) => e.deleted_at == null);
+          if (a.status === 'pending') list = list.filter((e) => e.resolved_at == null);
+          if (a.status === 'resolved') list = list.filter((e) => e.resolved_at != null);
+          return ok({ escalations: list.map((e) => ({ ...e })) });
+        }
+        case 'escalation_resolve': {
+          // Resolves INTO the fixture when the id is known — stamping resolved_at is
+          // what closes an escalation (the archive gate reads the same array, so a
+          // resolve here immediately unblocks card_archive). An id the fixture does
+          // not carry keeps the old echo behavior (the wire-args echo existing
+          // provider tests assert on).
+          const esc = escalationFixture.find((e) => e.id === a.id);
+          if (esc) {
+            esc.resolved_at = new Date().toISOString();
+            esc.resolution = a.resolution;
+            esc.resolution_rationale = a.resolution_rationale;
+            return ok({ escalation: { ...esc, status: 'resolved' } });
+          }
+          return ok({ escalation: { id: a.id, status: 'resolved', resolution: a.resolution, resolution_rationale: a.resolution_rationale } });
+        }
         case 'artifact_list': return ok({ artifacts: [] });
         default: return domainError('not_found', `no tool ${toolName}`);
       }
@@ -362,6 +489,13 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
     /** The append-only tier_audit ledger (copies), in insert order — the in-memory
      *  analogue of the spine's store.list_tier_audit() for test assertions. */
     tierAudit: () => auditLog.map((r) => ({ ...r })),
+    /** The append-only archive_audit ledger (copies), in insert order — the
+     *  in-memory analogue of the spine's store.list_archive_audit(). */
+    archiveAudit: () => archiveAuditLog.map((r) => ({ ...r })),
+    /** The LIVE escalation fixture handle (see opts.escalations): tests mutate
+     *  entries directly (stamp resolved_at / deleted_at) or go through
+     *  escalation_resolve; the card_archive gate reads this SAME array. */
+    escalations: escalationFixture,
     async close() {
       try { await transport.close(); } catch { /* best effort */ }
       try { await server.close(); } catch { /* best effort */ }

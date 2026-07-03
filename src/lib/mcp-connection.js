@@ -89,6 +89,12 @@ function withTimeout(promise, ms, schedule, cancel) {
  * @param {(model)=>void} [opts.applyModel] the board refresh path (gets { columns, cards, flags })
  * @param {(fn,ms)=>any}  [opts.schedule] / [opts.cancel]   timer injection
  * @param {number}   [opts.pollIntervalMs] / [opts.pingTimeoutMs]
+ * @param {boolean|()=>boolean} [opts.includeArchived]  whether the poll's card_list
+ *        asks for archived cards (spec v0.4.0 include_archived). A FUNCTION is
+ *        re-read every tick, so a UI "Show archived" toggle changes the very next
+ *        poll without reconnecting. The built model carries which mode produced it
+ *        (`includedArchived`) — the consumer's PURGE GUARD keys off that flag (see
+ *        reconcileSpineModel).
  */
 export function createMcpConnection({
   config = {},
@@ -98,6 +104,7 @@ export function createMcpConnection({
   cancel = (h) => clearTimeout(h),
   pollIntervalMs,
   pingTimeoutMs = DEFAULT_PING_TIMEOUT_MS,
+  includeArchived = false,
 } = {}) {
   const interval = pollIntervalMs || config.poll_interval_ms || DEFAULT_POLL_MS;
   const mcpUrl = config.mcp && config.mcp.url;
@@ -181,11 +188,15 @@ export function createMcpConnection({
   }
 
   /* ---- polling (only while MCP is active; realtime:false ⇒ poll) ---- */
-  function buildModel(board, cards) {
+  function buildModel(board, cards, includedArchived) {
     return {
       columns: toBoardColumns(board && board.columns),
       cards: (cards || []).filter((c) => c && c.column_id != null),
       flags: state.featureFlags,
+      // Which fetch mode produced this model (spec v0.4.0): only a model built from
+      // an include_archived:true fetch carries PURGE AUTHORITY over archived cards —
+      // the consumer's reconcile (reconcileSpineModel) keys off this flag.
+      includedArchived: !!includedArchived,
     };
   }
   async function pollOnce() {
@@ -198,15 +209,17 @@ export function createMcpConnection({
     // server's `column_id` is authoritative — never recomputed here.
     pollInFlight = true; // marks the poll path for degradeOnFatal's strike accounting (FIX C)
     try {
+      // Re-read per tick so a "Show archived" toggle flips the NEXT poll's fetch.
+      const incArch = typeof includeArchived === 'function' ? !!includeArchived() : !!includeArchived;
       const { board } = await active.getBoard();
-      const { cards } = await active.list({ includeDeleted: false });
+      const { cards } = await active.list({ includeDeleted: false, includeArchived: incArch });
       // Re-check AFTER the awaits (FIX A): a teardown (disconnect) or a mid-poll degrade can
       // land while these were in flight. Without this gate the continuation would call
       // applyModel (setSpineModel) after the owning effect was cleaned up — the exact
       // successor-clobber the disposed guard closes.
       if (disposed || state.provider !== 'mcp') return;
       unreachableStrikes = 0; // a clean poll cycle heals the background-strike counter (FIX C)
-      applyModel(buildModel(board, cards));
+      applyModel(buildModel(board, cards, incArch));
     } finally {
       pollInFlight = false;
     }
@@ -325,11 +338,33 @@ export function createMcpConnection({
 }
 
 /**
+ * PURGE-RULE GUARD (spec v0.4.0 §Archive, "Full-fetch purge interaction"): reconcile
+ * a freshly polled model onto the previously held one WITHOUT letting a default
+ * fetch purge archived cards. Archived cards are absent from a default full fetch
+ * BY DESIGN — absence there is NOT deletion — so a locally-held card with non-null
+ * `archived_at` that the new model omits is RETAINED (carried over verbatim). Purge
+ * authority over archived cards requires an include_archived:true fetch: a model
+ * built from one (`includedArchived`) replaces outright, and absence THERE is
+ * authoritative. A card the new model DOES carry always takes the server copy
+ * (fresh version/flags win — retention only fills absence, never overrides).
+ * Non-archived cards keep the existing semantics: absent from any full fetch ⇒ gone.
+ *
+ * Pure and side-effect free — the board wires it as
+ * `applyModel: (next) => setSpineModel(prev => reconcileSpineModel(prev, next))`.
+ */
+export function reconcileSpineModel(prev, next) {
+  if (!prev || !next || next.includedArchived) return next;
+  const seen = new Set((next.cards || []).map((c) => c.id));
+  const retained = (prev.cards || []).filter((c) => c && c.archived_at != null && !seen.has(c.id));
+  return retained.length ? { ...next, cards: [...(next.cards || []), ...retained] } : next;
+}
+
+/**
  * Production entry: build the controller from kanbantt_config with a real MCP
  * provider (Streamable HTTP + Bearer auth from config). The board's boot wiring
  * passes its refresh path as `applyModel` — no board component changes.
  */
-export function createMcpConnectionFromConfig({ config, applyModel, fetchFn, schedule, cancel, pollIntervalMs } = {}) {
+export function createMcpConnectionFromConfig({ config, applyModel, fetchFn, schedule, cancel, pollIntervalMs, includeArchived } = {}) {
   // The controller passes its degrade sink as `hooks.onFatal` when it builds the
   // provider (see activate); thread it through so a mid-session fatal error on any op
   // routes back to setLocal(true).
@@ -339,5 +374,5 @@ export function createMcpConnectionFromConfig({ config, applyModel, fetchFn, sch
     fetchFn,
     onFatal: hooks.onFatal,
   });
-  return createMcpConnection({ config, makeProvider, applyModel, schedule, cancel, pollIntervalMs });
+  return createMcpConnection({ config, makeProvider, applyModel, schedule, cancel, pollIntervalMs, includeArchived });
 }

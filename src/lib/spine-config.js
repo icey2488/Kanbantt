@@ -12,7 +12,13 @@
  *   VITE_SPINE_POLL_MS      → poll_interval_ms  (optional)
  *
  * Shape returned matches what createMcpConnectionFromConfig consumes:
- *   { data_source, mcp: { url, auth_token }, poll_interval_ms }
+ *   { data_source, mcp: { url, auth_token }, poll_interval_ms,
+ *     archive: { autoAgeDays: null|number, showArchived: boolean } }
+ *
+ * `archive` is the v0.4.0 client-behavior sub-key (no env bootstrap — it is a
+ * per-device UI preference, defaulted here and overlaid field-by-field from the
+ * stored config exactly like `mcp`): autoAgeDays drives the age-rule auto sweep
+ * (null = off), showArchived the default-OFF visibility toggle.
  */
 
 const CONFIG_KEY = 'kanbantt_config';
@@ -42,14 +48,17 @@ function storedConfig() {
  * The effective config: env baseline with the stored config layered on top
  * (stored `mcp` fields win field-by-field, so a saved url/token overrides env).
  */
+const ARCHIVE_DEFAULTS = { autoAgeDays: null, showArchived: false };
+
 export function readKanbanttConfig() {
   const env = envConfig();
   const stored = storedConfig();
-  if (!stored) return env;
+  if (!stored) return { ...env, archive: { ...ARCHIVE_DEFAULTS } };
   return {
     ...env,
     ...stored,
     mcp: { ...env.mcp, ...(stored.mcp || {}) },
+    archive: { ...ARCHIVE_DEFAULTS, ...(stored.archive || {}) },
   };
 }
 

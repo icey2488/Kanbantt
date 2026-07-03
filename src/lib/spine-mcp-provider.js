@@ -401,6 +401,15 @@ export function createMCPProvider({
         // re-tier without the full card_* write set (exactly as canResolve is independent
         // of canWrite/escalations). Gate the re-tier affordance on this — never on canWrite.
         canRetier: toolNames.has('card_retier'),
+        // canArchive gates the GOVERNED archive pair (spec v0.4.0 §Archive) — the
+        // audited path that sets/clears the orthogonal archived_at flag and writes an
+        // archive_audit row. Per spec §Discovery it derives from card_archive ALONE,
+        // INDEPENDENT of canWrite and canRetier (the exact canRetier pattern).
+        // canUnarchive derives from card_unarchive alone: a server advertising
+        // card_archive WITHOUT card_unarchive is a valid one-way archiver — the client
+        // shows the archive affordance but no unarchive affordance (spec §Discovery).
+        canArchive: toolNames.has('card_archive'),
+        canUnarchive: toolNames.has('card_unarchive'),
         escalations: toolNames.has('escalation_list') && toolNames.has('escalation_resolve'),
         // canResolve gates the SINGLE mutating control (escalation approve/deny)
         // independently of `escalations` (which also needs escalation_list — this slice
@@ -465,11 +474,15 @@ export function createMCPProvider({
      * `sync_token_expired` / `invalid_sync_token` domain error propagates with
      * its code so the controller can discard the token and full-fetch (spec).
      */
-    async list({ since = null, includeDeleted = false, columnId, tag } = {}) {
+    async list({ since = null, includeDeleted = false, includeArchived = false, columnId, tag } = {}) {
       requireConnected();
       return call('card_list', {
         updated_since: since,
         include_deleted: includeDeleted,
+        // include_archived (spec v0.4.0): archived cards are OMITTED from a default
+        // full fetch; the flag composes with include_deleted (a deleted+archived card
+        // needs both). Param name mirrors includeDeleted at THIS interface.
+        include_archived: includeArchived,
         column_id: columnId,
         tag,
       }).then((out) => ({ cards: (out.cards || []).map(toInternalCard), sync_token: out.sync_token }));
@@ -584,6 +597,39 @@ export function createMCPProvider({
     async cardRetier(id, new_tier, expected_version, reason) {
       requireCapability('canRetier');
       const out = await call('card_retier', { id, new_tier: tierInternalToWire(new_tier), expected_version, reason });
+      return toInternalCard(out.card);
+    },
+
+    /** card_archive — the GOVERNED, audited archive (spec v0.4.0 §Archive). Sets the
+     *  orthogonal archived_at flag on an ACTIVE card (NOT a delete, NOT a column move);
+     *  the server records an append-only archive_audit row and enforces every invariant:
+     *  LOUD idempotency (an already-archived target → 'validation_failed', never a
+     *  silent no-op) and the ESCALATION GATE (an OPEN escalation on the card blocks
+     *  archive → 'validation_failed'). Gated on `canArchive` (card_archive advertised),
+     *  INDEPENDENT of canWrite/canRetier — cardRetier's shape mirrored exactly. There is
+     *  NO force: a stale expected_version or tombstoned target is code 'conflict'
+     *  carrying meta.current (the gate runs BEFORE the domain invariants — same
+     *  boundary as every governed write). `reason` is OPTIONAL on the wire: when the
+     *  caller omits it, it is genuinely OMITTED from the call (never sent as null) and
+     *  the server defaults "manual_archive"; an EXPLICITLY empty/whitespace reason is
+     *  server-REJECTED, not defaulted — so this method passes a supplied reason through
+     *  verbatim. NEVER folded into cardUpdate: archived_at moves ONLY through this pair. */
+    async cardArchive(id, expected_version, reason) {
+      requireCapability('canArchive');
+      const out = await call('card_archive', { id, expected_version, ...(reason != null ? { reason } : {}) });
+      return toInternalCard(out.card);
+    },
+    /** card_unarchive — clears archived_at, returning the card to the default view.
+     *  Symmetric to cardArchive (same governed shape, same conflict-before-invariants
+     *  gate, same two-layer reason handling with the "manual_unarchive" default) with
+     *  two deliberate asymmetries: it gates on `canUnarchive` (card_unarchive
+     *  advertised ALONE — a card_archive-only server is a valid one-way archiver per
+     *  spec §Discovery, so unarchive gets its own flag), and it has NO escalation gate
+     *  (restoring a card to view never buries anything). Loud idempotency mirrors
+     *  archive: a NOT-archived target → 'validation_failed'. */
+    async cardUnarchive(id, expected_version, reason) {
+      requireCapability('canUnarchive');
+      const out = await call('card_unarchive', { id, expected_version, ...(reason != null ? { reason } : {}) });
       return toInternalCard(out.card);
     },
 
