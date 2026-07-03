@@ -249,6 +249,9 @@ const K_THEME = 'kanbantt:theme:v1';
 // Drive-sync enabled toggle — device-local config (its own key, NOT in the blob),
 // same pattern as theme and the google-connected flag. Defaults on when signed in.
 const K_SYNC = 'kanbantt:sync-enabled:v1';
+// Top-level view tab (Board/Calendar/Timeline/Matrix): same pattern as Calendar's
+// K_CAL_VIEW and Timeline's K_TIMELINE_VIEW sub-mode persistence.
+const K_VIEW = 'kanbantt:view:v1';
 
 const safeGet = async (key, fallback) => {
   try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
@@ -4903,7 +4906,16 @@ export default function App() {
   useFonts();
   const [theme, setTheme] = useState('dark');
   const [user, setUser] = useState(null);
-  const [view, setView] = useState('board');
+  // Device-local top-level view preference: synchronous lazy read, same mechanism
+  // as Calendar's K_CAL_VIEW / Timeline's K_TIMELINE_VIEW. Anything else (incl.
+  // absent, e.g. first visit) falls back to Board.
+  const [view, setView] = useState(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(K_VIEW));
+      return v === 'board' || v === 'calendar' || v === 'gantt' || v === 'matrix' ? v : 'board';
+    } catch { return 'board'; }
+  });
+  useEffect(() => { safeSet(K_VIEW, view); }, [view]);
   const [editing, setEditing] = useState(null);
   const [isNew, setIsNew] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
