@@ -60,7 +60,7 @@ const POSIX_LOCALish_RE = /^\//;                        // any absolute POSIX pa
 // durable shapes
 const GIT_HASH_RE = /^[0-9a-f]{7,40}$/i;                // bare git commit hash
 const SCHEME_URI_RE = /^(https|gs|drive|git|ipfs|s3):\/\/[^\s]+$/i;
-const PREFIXED_REF_RE = /^(git|drive):[A-Za-z0-9_.\/-]+$/i; // git:<hash>, drive:<fileId>
+const PREFIXED_REF_RE = /^(git|drive):[A-Za-z0-9_./-]+$/i; // git:<hash>, drive:<fileId>
 
 /** True iff `ref` is an accepted durable target. Bare ambiguous strings and any
  *  executor-local/sandbox/file path are rejected (fail-closed). */

@@ -168,7 +168,7 @@ export function createSpineServer({ persistence = createMemoryPersistence(), dep
 
   const blob = () => store.getBlob();
   const taskForks = (taskId) => blob().tasks.filter((t) => baseId(t.id) === taskId);
-  const liveTaskForks = (taskId) => taskForks(taskId).filter((t) => t.deleted_at == null);
+
 
   // Representative row for a logical Task's static fields (the requested base id
   // if live, else any live fork, else any fork). Effective STATE comes from the

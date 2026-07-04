@@ -296,23 +296,14 @@ function rankedColumns(columns) {
 /* Sync tokens                                                              */
 /* ======================================================================== */
 
-// base64url that works in both the browser (btoa/atob) and Node (Buffer). Token
-// payloads are ASCII JSON, so the simple byte path is sufficient.
+// base64url for ASCII JSON payloads. btoa/atob are global in browsers and Node 16+.
 function b64urlEncode(s) {
-  const b64 =
-    typeof Buffer !== 'undefined'
-      ? Buffer.from(s, 'utf8').toString('base64')
-      : btoa(s);
-  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 function b64urlDecode(s) {
-  // Throws on malformed input (atob throws; Buffer is lenient but yields garbage
-  // that fails the later JSON parse). Either way callers map it to a domain error.
-  const padded = s.replace(/-/g, '+').replace(/_/g, '/');
-  return typeof Buffer !== 'undefined'
-    ? Buffer.from(padded, 'base64').toString('utf8')
-    : atob(padded);
+  // Throws on malformed input; callers map it to a domain error.
+  return atob(s.replace(/-/g, '+').replace(/_/g, '/'));
 }
 
 /** Issue an opaque delta-sync cursor pinned to `seq` and stamped at `iat`. */
@@ -1119,7 +1110,7 @@ export function runLegacyMigration({
 
   // Mint orders per column, then index them back by original task position.
   const orderByIdx = new Map();
-  for (const [columnId, idxs] of byColumn) {
+  for (const [, idxs] of byColumn) {
     const orders = mintOrders(idxs.length);
     idxs.forEach((taskIdx, pos) => orderByIdx.set(taskIdx, orders[pos]));
   }

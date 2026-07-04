@@ -214,36 +214,6 @@ const isOverdue = (task) => {
 };
 
 /* ============================================================
-   MOCK GOOGLE CALENDAR EVENTS
-   ============================================================ */
-function generateMockEvents() {
-  const t = startOfDay(new Date());
-  const events = [];
-  for (let i = -14; i < 14; i++) {
-    const d = addDays(t, i);
-    const dow = d.getDay();
-    if (dow >= 1 && dow <= 5) {
-      events.push({ id: `e-standup-${i}`, title: 'Team standup', date: iso(d), time: '9:30' });
-    }
-  }
-  const oneOffs = [
-    { offset: -5, title: 'Dentist', time: '14:00' },
-    { offset: -2, title: 'Lunch with M.', time: '12:30' },
-    { offset: 1, title: 'Tax planning call', time: '15:00' },
-    { offset: 3, title: 'Yoga class', time: '18:00' },
-    { offset: 6, title: '1:1 with manager', time: '10:00' },
-    { offset: 9, title: 'Quarterly review', time: '13:00' },
-    { offset: 12, title: 'Friend visiting', time: 'all-day' },
-    { offset: 14, title: 'Conference talk', time: '11:00' },
-  ];
-  oneOffs.forEach((e, idx) => {
-    events.push({ id: `e-one-${idx}`, title: e.title, date: iso(addDays(t, e.offset)), time: e.time });
-  });
-  return events;
-}
-const MOCK_EVENTS = generateMockEvents();
-
-/* ============================================================
    STORAGE
    ------------------------------------------------------------
    Board data (cards, tags, columns) lives entirely in card-store.js — the only
@@ -267,10 +237,10 @@ const safeGet = async (key, fallback) => {
   catch { return fallback; }
 };
 const safeSet = async (key, value) => {
-  try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* swallow */ }
 };
 const safeDelete = async (key) => {
-  try { localStorage.removeItem(key); } catch {}
+  try { localStorage.removeItem(key); } catch { /* swallow */ }
 };
 
 /* ============================================================
@@ -1441,6 +1411,7 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, read
   // Keep the active index in range when the column count shrinks (e.g. filtering),
   // and cancel any pending rAF on unmount.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setActiveCol((prev) => Math.min(prev, Math.max(0, columns.length - 1)));
   }, [columns.length]);
   useEffect(() => () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); }, []);
@@ -3899,6 +3870,7 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly }) {
    RELATIVE TIME (live-updating)
    ============================================================ */
 function RelativeTime({ ts }) {
+  // eslint-disable-next-line react-hooks/purity
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 10_000);
@@ -5003,9 +4975,8 @@ export default function App() {
   const showArchived = !!archiveCfg.showArchived;
   const showArchivedRef = useRef(showArchived);
   useEffect(() => { showArchivedRef.current = showArchived; }, [showArchived]);
-  // MOCK_EVENTS no longer renders; the Calendar/Timeline overlay plumbing stays
-  // wired to this empty list as an attachment point for real Google Calendar
-  // integration (see MOCK_EVENTS above).
+  // Calendar/Timeline overlay plumbing stays wired to this empty list as an
+  // attachment point for real Google Calendar integration.
   const events = [];
 
   // Board data comes exclusively from the card store via useSyncExternalStore.

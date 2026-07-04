@@ -55,7 +55,7 @@ const EXCHANGE_ENDPOINT = '/api/auth/exchange'; // same-origin Cloudflare Pages 
 
 // Must EXACTLY match the Authorized redirect URI registered in the Google console
 // (scheme + host + trailing slash). Sent to the Function, which re-checks it.
-const REDIRECT_URI = window.location.origin + '/';
+const REDIRECT_URI = typeof window !== 'undefined' ? window.location.origin + '/' : '';
 
 // Refresh this many ms before the real expiry.
 const EXPIRY_BUFFER_MS = 60_000;
@@ -299,7 +299,7 @@ async function beginAuth(prompt) {
     // Navigation blocked/failed: don't wedge auth, and let callers reject instead
     // of hanging on the never-resolving promise.
     redirecting = false;
-    throw new Error('beginAuth: navigation failed');
+    throw new Error('beginAuth: navigation failed', { cause: e });
   }
 }
 

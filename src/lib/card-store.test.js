@@ -82,7 +82,7 @@ function freshStore(opts = {}) {
 
 test('create then idempotent replay returns the existing card', () => {
   const { store } = freshStore();
-  const first = store.create({ id: 'c1', title: 'A', column_id: 'todo' });
+  store.create({ id: 'c1', title: 'A', column_id: 'todo' });
   const replay = store.create({ id: 'c1', title: 'B', column_id: 'done' });
 
   assert.equal(replay.id, 'c1');
