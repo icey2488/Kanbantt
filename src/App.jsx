@@ -3991,6 +3991,12 @@ function SettingsModal({
   const [spineUrl, setSpineUrl] = useState(initialMcp.url || '');
   const [spineToken, setSpineToken] = useState(initialMcp.auth_token || '');
   const [showToken, setShowToken] = useState(false);
+  // Remember-token opt-in (spec Auth v1): default UNCHECKED. Migration: a legacy config
+  // with auth_token but no remember_token flag predates the opt-in — initialise checked
+  // so the existing token is honored and the user can revoke by unchecking.
+  const initialRemember = initialMcp.remember_token === true
+    || (!!(initialMcp.auth_token) && initialMcp.remember_token === undefined);
+  const [rememberToken, setRememberToken] = useState(initialRemember);
   const [connecting, setConnecting] = useState(false);
   const [copied, setCopied] = useState(false);
   // Clear the transient "Connecting…" once the controller reaches a terminal state:
@@ -4090,7 +4096,7 @@ function SettingsModal({
   const doSpineConnect = async () => {
     if (!spineUrl.trim()) return;
     setConnecting(true);
-    await onSpineConnect(spineUrl, spineToken);
+    await onSpineConnect(spineUrl, spineToken, rememberToken);
   };
   const doSpineDisconnect = async () => {
     setConnecting(false);
@@ -4711,6 +4717,20 @@ function SettingsModal({
                 </div>
               </div>
 
+              {/* Remember-token opt-in (spec Auth v1: token in memory by default;
+                  persisting to localStorage is an explicit opt-in). Default UNCHECKED. */}
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={rememberToken}
+                  onChange={(e) => setRememberToken(e.target.checked)}
+                  style={{ cursor: 'pointer', accentColor: C.ice, width: 14, height: 14, flexShrink: 0 }}
+                />
+                <span style={{ fontFamily: F.body, fontSize: 13, color: C.text }}>
+                  Remember this server's token on this device
+                </span>
+              </label>
+
               {/* Contextual localhost note (PART 2) */}
               {localhostConflict ? (
                 <div style={{
@@ -4767,10 +4787,11 @@ function SettingsModal({
                 </div>
               </div>
 
-              {/* Token trust note (PART 2) */}
+              {/* Token trust note — context-sensitive (spec Auth v1) */}
               <div style={helperText}>
-                Stored locally on this device only. Only connect tokens you trust — the
-                token grants write access to your board.
+                {rememberToken
+                  ? 'Token saved to localStorage on this device. Any script running on this page can read it — CSP is the practical defense. Only save tokens you trust.'
+                  : 'Token held in memory only — not saved to localStorage. You will need to re-enter it after a page reload.'}
               </div>
             </div>
           )}
@@ -4960,6 +4981,10 @@ export default function App() {
   // The active MCP connection (provider + pollNow), captured so the escalation-resolve
   // handler can reach the provider without re-deriving it. Set in the connection effect.
   const spineConnRef = useRef(null);
+  // In-memory Bearer token (spec Auth v1: "Token held in memory by default"). Set by
+  // handleSpineConnect when remember_token is false; null on page load so only a
+  // remembered (persisted) token auto-connects on reload. Cleared on disconnect.
+  const inMemoryTokenRef = useRef(null);
   // Bump to trigger a spine RECONNECT: the connection effect below depends on this, so
   // incrementing it re-runs the effect — React first tears down the existing conn
   // (cleanup: unsub + conn.disconnect() + clear the ref), then rebuilds from the fresh
@@ -5182,6 +5207,9 @@ export default function App() {
         // getter below, re-read every tick).
         conn = createMcpConnectionFromConfig({
           config,
+          // Auth v1: in-memory token (remember_token: false) passed explicitly; null on
+          // initial load so only a remembered (persisted) token auto-connects on reload.
+          authToken: inMemoryTokenRef.current || undefined,
           applyModel: (next) => setSpineModel((prev) => reconcileSpineModel(prev, next)),
           includeArchived: () => showArchivedRef.current,
         });
@@ -5226,7 +5254,7 @@ export default function App() {
   // Persist the entered target into kanbantt_config (MERGED — data_source and
   // poll_interval_ms are preserved), then bump the reconnect nonce so the connection
   // effect tears the old conn down and stands a fresh one up against the new config.
-  const handleSpineConnect = async (url, token) => {
+  const handleSpineConnect = async (url, token, rememberToken) => {
     const trimmedUrl = (url || '').trim();
     const trimmedToken = (token || '').trim();
     const cfg = readKanbanttConfig();
@@ -5235,10 +5263,19 @@ export default function App() {
       // Never leave the source pinned to 'local' when the user is explicitly connecting;
       // 'auto' lets hasMcpTarget() honor the url. A pre-existing 'mcp' is preserved.
       data_source: cfg.data_source === 'local' ? 'auto' : (cfg.data_source || 'auto'),
-      mcp: { ...(cfg.mcp || {}), url: trimmedUrl },
+      mcp: { ...(cfg.mcp || {}), url: trimmedUrl, remember_token: !!rememberToken },
     };
-    if (trimmedToken) next.mcp.auth_token = trimmedToken;
-    else delete next.mcp.auth_token; // an emptied token field drops the Bearer
+    if (rememberToken && trimmedToken) {
+      // Opt-in: persist the token (spec §Configuration: auth_token present only if remember_token).
+      next.mcp.auth_token = trimmedToken;
+    } else {
+      // Default: token stays in memory only; drop any previously-persisted token (e.g. the
+      // user unchecked "Remember" — their stored token is revoked from localStorage on save).
+      delete next.mcp.auth_token;
+    }
+    // Hold the token in memory for the upcoming connection effect (auth v1 default path).
+    // Null on a remember-on connect — the token rides in config, not in memory.
+    inMemoryTokenRef.current = (!rememberToken && trimmedToken) ? trimmedToken : null;
     await safeSet('kanbantt_config', next);
     setSpineConfigNonce((n) => n + 1);
   };
@@ -5248,6 +5285,7 @@ export default function App() {
   // env baseline (VITE_SPINE_URL) would otherwise re-supply a target.
   const handleSpineDisconnect = async () => {
     const cfg = readKanbanttConfig();
+    inMemoryTokenRef.current = null; // spec Auth v1: disconnect clears the in-memory token
     await safeSet('kanbantt_config', { ...cfg, data_source: 'local', mcp: {} });
     setSpineConfigNonce((n) => n + 1);
   };

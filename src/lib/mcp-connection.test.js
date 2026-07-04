@@ -14,6 +14,7 @@ import { createMcpTestServer } from './spine-mcp-test-server.js';
 import { createMCPProvider } from './spine-mcp-provider.js';
 import {
   createMcpConnection,
+  createMcpConnectionFromConfig,
   toBoardColumns,
   LOCAL_INDICATOR,
   MCP_UNAVAILABLE_INDICATOR,
@@ -422,4 +423,82 @@ test('FIX A: a poll IN FLIGHT at teardown never applies its late result (no appl
   assert.equal(conn.isPolling(), false);
   assert.equal(conn.getState().provider, 'local');
   assert.equal(conn.getState().fallback, false, 'a clean teardown mid-poll is not a degrade-fallback');
+});
+
+/* ================================================================== */
+/* Auth v1: remember-token opt-in — token threading                    */
+/* -------------------------------------------------------------------- */
+/* These tests verify that createMcpConnectionFromConfig passes the     */
+/* right token to the provider, keyed off the capturing fetch wrapper:  */
+/* the StreamableHTTPClientTransport merges requestInit.headers into    */
+/* every outbound request, so the Authorization header appears in the   */
+/* first `init` object the fetchFn receives.                            */
+/* ================================================================== */
+
+/** Capture the first Authorization header seen across all fetch calls. */
+function authCapture(harness) {
+  let captured = 'NOT_SET';
+  const fetchFn = (url, init = {}) => {
+    if (captured === 'NOT_SET') {
+      const hs = init.headers;
+      captured = hs
+        ? (typeof hs.get === 'function' ? (hs.get('Authorization') ?? null) : (hs.Authorization ?? null))
+        : null;
+    }
+    return harness.fetchFn(url, init);
+  };
+  return { fetchFn, getAuth: () => captured };
+}
+
+test('Auth v1: remember_token: true — createMcpConnectionFromConfig uses stored auth_token', async () => {
+  const harness = createMcpTestServer({ seed: oneCard });
+  const { fetchFn, getAuth } = authCapture(harness);
+  const sched = manualScheduler();
+  const conn = createMcpConnectionFromConfig({
+    config: { data_source: 'mcp', mcp: { url: harness.url, remember_token: true, auth_token: 'stored-tok' } },
+    fetchFn,
+    applyModel: () => {},
+    schedule: sched.schedule,
+    cancel: sched.cancel,
+  });
+  await conn.connect();
+  assert.equal(getAuth(), 'Bearer stored-tok', 'stored token should appear in Authorization header');
+  conn.disconnect();
+  await harness.close();
+});
+
+test('Auth v1: remember_token: false with in-memory authToken — provider uses the in-memory token', async () => {
+  const harness = createMcpTestServer({ seed: oneCard });
+  const { fetchFn, getAuth } = authCapture(harness);
+  const sched = manualScheduler();
+  const conn = createMcpConnectionFromConfig({
+    config: { data_source: 'mcp', mcp: { url: harness.url, remember_token: false } }, // no auth_token in config
+    authToken: 'mem-tok',
+    fetchFn,
+    applyModel: () => {},
+    schedule: sched.schedule,
+    cancel: sched.cancel,
+  });
+  await conn.connect();
+  assert.equal(getAuth(), 'Bearer mem-tok', 'in-memory token should appear in Authorization header');
+  conn.disconnect();
+  await harness.close();
+});
+
+test('Auth v1: reload without remembered token → no Authorization header (no auto-connect with token)', async () => {
+  const harness = createMcpTestServer({ seed: oneCard });
+  const { fetchFn, getAuth } = authCapture(harness);
+  const sched = manualScheduler();
+  const conn = createMcpConnectionFromConfig({
+    config: { data_source: 'mcp', mcp: { url: harness.url, remember_token: false } }, // no token anywhere
+    // authToken omitted (as on page reload when remember_token: false — in-memory token is gone)
+    fetchFn,
+    applyModel: () => {},
+    schedule: sched.schedule,
+    cancel: sched.cancel,
+  });
+  await conn.connect();
+  assert.equal(getAuth(), null, 'no token provided → no Authorization header');
+  conn.disconnect();
+  await harness.close();
 });

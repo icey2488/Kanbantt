@@ -54,10 +54,18 @@ export function readKanbanttConfig() {
   const env = envConfig();
   const stored = storedConfig();
   if (!stored) return { ...env, archive: { ...ARCHIVE_DEFAULTS } };
+  const mergedMcp = { ...env.mcp, ...(stored.mcp || {}) };
+  // Migration: a config with auth_token but no remember_token flag predates the
+  // opt-in feature (spec Auth v1). The user already persisted their token under the
+  // old behavior — treat it as remember_token: true so the checkbox shows checked
+  // and their token continues to be honored. They can revoke by unchecking.
+  if (mergedMcp.auth_token && mergedMcp.remember_token === undefined) {
+    mergedMcp.remember_token = true;
+  }
   return {
     ...env,
     ...stored,
-    mcp: { ...env.mcp, ...(stored.mcp || {}) },
+    mcp: mergedMcp,
     archive: { ...ARCHIVE_DEFAULTS, ...(stored.archive || {}) },
   };
 }

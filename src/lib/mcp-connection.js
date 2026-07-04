@@ -364,13 +364,15 @@ export function reconcileSpineModel(prev, next) {
  * provider (Streamable HTTP + Bearer auth from config). The board's boot wiring
  * passes its refresh path as `applyModel` — no board component changes.
  */
-export function createMcpConnectionFromConfig({ config, applyModel, fetchFn, schedule, cancel, pollIntervalMs, includeArchived } = {}) {
+export function createMcpConnectionFromConfig({ config, applyModel, authToken, fetchFn, schedule, cancel, pollIntervalMs, includeArchived } = {}) {
   // The controller passes its degrade sink as `hooks.onFatal` when it builds the
   // provider (see activate); thread it through so a mid-session fatal error on any op
   // routes back to setLocal(true).
   const makeProvider = (hooks = {}) => createMCPProvider({
     baseUrl: config.mcp.url,
-    authToken: config.mcp && config.mcp.auth_token,
+    // Auth v1: an explicit in-memory token (remember_token: false) takes precedence;
+    // falls back to the stored config token (remember_token: true path).
+    authToken: authToken != null ? authToken : (config.mcp && config.mcp.auth_token),
     fetchFn,
     onFatal: hooks.onFatal,
   });
