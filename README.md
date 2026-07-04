@@ -1,16 +1,48 @@
-# React + Vite
+# Kanbantt
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Local-first kanban board with calendar, timeline, Gantt, and matrix views. All board data lives in the browser; Google Drive JSON sync is available as an opt-in persistence layer. An MCP spine can be connected to use any conforming remote server as the backend instead.
 
-Currently, two official plugins are available:
+## Views
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+| View | Description |
+|------|-------------|
+| Board | Drag-and-drop columns with quick-add and card filtering |
+| Calendar | Monthly/weekly/daily layout with due dates |
+| Timeline | Rolling agenda |
+| Gantt | Duration bars over a scrollable date axis |
+| Matrix | Effort × impact quadrant (Do/Schedule/Delegate/Drop) |
 
-## React Compiler
+## Storage
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+**Local (default).** Cards, columns, and tags are stored in `localStorage` as a versioned blob (`kanbantt:v1`). No account or server required.
 
-## Expanding the ESLint configuration
+**Google Drive sync.** Sign in with Google from the header. The board blob is stored as a JSON file in your Drive and synced on a configurable interval. Conflict resolution is deterministic and CRDTish (last-write-wins on a per-card basis with a content hash for identical-state fast-path).
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## MCP spine (BYO backend)
+
+Open **Settings → Connection** and enter the URL of any MCP server that implements the Kanbantt card contract. The contract is defined in [`docs/kanbantt-mcp-spec.md`](docs/kanbantt-mcp-spec.md) (v0.4.0). Any server speaking that protocol can serve as the backend — the UI has no dependency on a specific implementation.
+
+Capabilities are negotiated at connection time; the UI degrades gracefully when a server advertises a subset (e.g. read-only, no archive support).
+
+## Dev commands
+
+```sh
+npm install        # install dependencies
+npm run dev        # Vite dev server (http://localhost:5173)
+npm test           # Node test runner — src/lib/*.test.js
+npm run build      # production build → dist/
+npm run lint       # ESLint
+npm run preview    # preview the production build locally
+```
+
+## Deployment
+
+Deployed on Cloudflare Pages. The `functions/api/auth/exchange.js` Pages Function handles the Google OAuth authorization-code exchange server-side (PKCE, keeps the client secret off the browser). Set the `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` environment variables in the Cloudflare Pages dashboard.
+
+The `public/_headers` file configures the Content Security Policy and security headers; it is copied into the build output as `/_headers` by Vite's `publicDir` passthrough.
+
+Build command: `npm run build`. Output directory: `dist`.
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE). Non-commercial use only. Contact for commercial licensing.
