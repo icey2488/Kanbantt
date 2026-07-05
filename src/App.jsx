@@ -34,6 +34,7 @@ import { driveSync } from './lib/sync-instance.js';
 import { store, bootError, subscribe, getSnapshot, readLegacyDump, STORAGE_KEY } from './lib/store-instance.js';
 import { orderBetween, compareCards } from './lib/card-store.js';
 import { readKanbanttConfig, hasMcpTarget } from './lib/spine-config.js';
+import { createdAtLabel } from './lib/date-chip.js';
 
 /* global __APP_VERSION__, __GIT_COMMIT__ */
 // Injected by Vite's define() as string literals (see vite.config.js). In dev the
@@ -1060,6 +1061,7 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
   if (daysOut === 0) dueLabel = 'Today';
   else if (daysOut === 1) dueLabel = 'Tomorrow';
   else if (daysOut === -1) dueLabel = 'Yesterday';
+  const createdLabel = task.created_at ? createdAtLabel(task.created_at) : null;
 
   const priorityColor = C[PRIORITY[task.priority].key];
   const taskTags = (task.tags || []).map((id) => tags.find((t) => t.id === id)).filter(Boolean);
@@ -1234,6 +1236,14 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
             }}>
               {overdue ? '◆ ' : ''}{dueLabel}
             </div>
+            {createdLabel && (
+              <div style={{
+                fontFamily: F.mono, fontSize: 10.5,
+                color: C.ice, letterSpacing: '0.05em', textTransform: 'uppercase',
+              }}>
+                {createdLabel}
+              </div>
+            )}
             {hasChecklist && (
               <div style={{
                 display: 'flex', alignItems: 'center', gap: 4,
