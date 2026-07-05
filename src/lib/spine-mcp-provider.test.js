@@ -730,3 +730,49 @@ test('classifyFatal: a JSON-RPC protocol error ⇒ null (NOT a connection loss)'
   // An object-valued `error` (the nested JSON-RPC shape) must not false-positive to auth either.
   assert.equal(classifyFatal(new Error('rpc failed: {"error":{"code":-32600,"message":"Invalid Request"}}')), null);
 });
+
+/* ================================================================== */
+/* Pass 2: effort/impact write-through + local/MCP parity             */
+/* ------------------------------------------------------------------- */
+/* effort and impact are plain ungoverned fields — no wire remap, no   */
+/* write-once gate. cardUpdate forwards them verbatim; the same store  */
+/* backs the harness and the LocalProvider (spec Parity Contract).     */
+/* ================================================================== */
+
+test('cardUpdate with effort/impact: round-trips both fields; version bumps; no stray field clobbered', async () => {
+  const { provider, harness } = await connected({ seed: oneCard });
+  const updated = await provider.cardUpdate('c1', { effort: 'low', impact: 'high', expected_version: 1 });
+  assert.equal(updated.effort, 'low', 'effort round-trips');
+  assert.equal(updated.impact, 'high', 'impact round-trips');
+  assert.equal(updated.version, 2, 'version bumped');
+  assert.equal(updated.title, 'First', 'title untouched — patch is field-scoped');
+  assert.equal(updated.priority, 'med', 'priority untouched');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardUpdate patch with only effort/impact: no title change; stray-free (MCP/Local parity)', async () => {
+  const { provider, harness } = await connected({ seed: oneCard });
+  // First write: classify
+  await provider.cardUpdate('c1', { effort: 'high', impact: 'low', expected_version: 1 });
+  // Second write: reclassify via drag (same call shape classifyTaskMcp uses)
+  const reclassified = await provider.cardUpdate('c1', { effort: 'low', impact: 'high', expected_version: 2 });
+  assert.equal(reclassified.effort, 'low', 'effort updated');
+  assert.equal(reclassified.impact, 'high', 'impact updated');
+  assert.equal(reclassified.title, 'First', 'title unchanged — stray-free patch');
+  assert.equal(reclassified.version, 3);
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardUpdate effort/impact null: explicit null round-trips (unset sentinel); version bumps', async () => {
+  const { provider, harness } = await connected({ seed: (s) => s.create({
+    id: 'c1', title: 'First', column_id: 'todo', priority: 'med', effort: 'high', impact: 'low',
+  }) });
+  const updated = await provider.cardUpdate('c1', { effort: null, impact: null, expected_version: 1 });
+  assert.equal(updated.effort, null, 'effort null stored');
+  assert.equal(updated.impact, null, 'impact null stored');
+  assert.equal(updated.version, 2);
+  await provider.disconnect();
+  await harness.close();
+});

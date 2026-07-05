@@ -2976,10 +2976,13 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
         )}
 
         {/* Body form, two shapes:
-            • MCP-writable (Pass 2b): ONLY the spine-Card fields that round-trip —
-              title, acceptance_criteria, write-once tier. No Status control (a
-              column change is a move via drag/long-press, never an update). Not
-              wrapped in `disabled` — this mode is writable.
+            • MCP-writable (Pass 2b): the spine-Card fields that round-trip —
+              title, acceptance_criteria, write-once tier, plus effort/impact
+              (Pass 2 — plain ungoverned fields, no governance UI needed, just
+              selects wired to `draft` and folded into the card_update patch by
+              saveTaskMcp). No Status control (a column change is a move via
+              drag/long-press, never an update). Not wrapped in `disabled` — this
+              mode is writable.
             • local / read-only mirror: the full task form inside a fieldset whose
               disabled={readOnly} natively inerts every control for the read-only
               viewer; the footer Save/Delete are hidden below so there's no commit. */}
@@ -3104,6 +3107,53 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
                 </select>
               )}
             </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              <div>
+                <label style={fieldLabel}>Effort</label>
+                <select value={draft.effort || ''}
+                  onChange={(e) => setDraft({ ...draft, effort: e.target.value || undefined })}
+                  style={{ ...input, cursor: 'pointer' }}>
+                  {/* SET-ONLY: placeholder only while unset; null-clear deferred to card_update null-sentinel pass */}
+                  {!draft.effort && <option value="">—</option>}
+                  <option value="low">Low</option>
+                  <option value="med">Med</option>
+                  <option value="high">High</option>
+                </select>
+              </div>
+              <div>
+                <label style={fieldLabel}>Impact</label>
+                <select value={draft.impact || ''}
+                  onChange={(e) => setDraft({ ...draft, impact: e.target.value || undefined })}
+                  style={{ ...input, cursor: 'pointer' }}>
+                  {/* SET-ONLY: same — once impact is set, no return to derived-from-priority */}
+                  {!draft.impact && <option value="">—</option>}
+                  <option value="low">Low</option>
+                  <option value="med">Med</option>
+                  <option value="high">High</option>
+                </select>
+              </div>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: -6 }}>
+              {(() => {
+                const q = QUADRANT_DEFS[getQuadrant(draft)];
+                if (!q) return <span style={{ ...fieldLabel, textTransform: 'none' }}>Unsorted — drag into the Matrix to classify</span>;
+                const Icon = q.Icon;
+                const accent = C[q.accentKey];
+                return (
+                  <span style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    padding: '4px 9px', borderRadius: 6,
+                    background: `${accent}${q.tintAlpha}`, border: `1px solid ${accent}66`,
+                    color: accent, fontFamily: F.mono, fontSize: 11, fontWeight: 700,
+                    letterSpacing: '0.06em', textTransform: 'uppercase',
+                  }}>
+                    <Icon size={12} strokeWidth={2.25} />
+                    {q.label} · {q.tagline}
+                  </span>
+                );
+              })()}
+            </div>
           </fieldset>
         ) : (
         <fieldset disabled={readOnly} style={{
@@ -3181,7 +3231,8 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
               <select value={draft.effort || ''}
                 onChange={(e) => setDraft({ ...draft, effort: e.target.value || undefined })}
                 style={{ ...input, cursor: 'pointer' }}>
-                <option value="">— unset</option>
+                {/* SET-ONLY: placeholder only while unset; null-clear deferred to card_update null-sentinel pass */}
+                {!draft.effort && <option value="">—</option>}
                 <option value="low">Low</option>
                 <option value="med">Med</option>
                 <option value="high">High</option>
@@ -3192,7 +3243,8 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
               <select value={draft.impact || ''}
                 onChange={(e) => setDraft({ ...draft, impact: e.target.value || undefined })}
                 style={{ ...input, cursor: 'pointer' }}>
-                <option value="">— from priority</option>
+                {/* SET-ONLY: same — once impact is set, no return to derived-from-priority */}
+                {!draft.impact && <option value="">—</option>}
                 <option value="low">Low</option>
                 <option value="med">Med</option>
                 <option value="high">High</option>
@@ -5457,6 +5509,40 @@ export default function App() {
     }
   };
 
+  // Matrix-drag classify write-through (Pass 2): a drop writes straight through the
+  // spine's plain card_update (effort/impact are ungoverned fields, same treatment as
+  // title/AC — no audit trail needed) via the SAME CAPTURE → OPTIMISTIC → call →
+  // RECONCILE / SNAP-BACK-or-REVERT shape as saveTaskMcp/moveTaskMcp. `undefined`
+  // (the unsorted-drop case) is coerced to null — same as the tier `?? null`
+  // treatment — since `undefined` never survives JSON serialization to the wire.
+  const classifyTaskMcp = async (taskId, update) => {
+    const provider = spineProvider();
+    const model = spineModel;
+    if (!provider || !model) { surface('No live spine connection — classify not sent.'); return; }
+    const cur = model.cards.find((c) => c.id === taskId && !c.deleted_at);
+    if (!cur) { surface('That card was deleted'); return; }
+    const patch = {};
+    if ('effort' in update) patch.effort = update.effort ?? null;
+    if ('impact' in update) patch.impact = update.impact ?? null;
+    const prior = { effort: cur.effort, impact: cur.impact }; // CAPTURE
+    const expected_version = cur.version;
+    setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
+      c.id === taskId ? { ...c, ...patch } : c) } : m));
+    try {
+      const card = await provider.cardUpdate(taskId, { ...patch, expected_version });
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // RECONCILE (merge)
+        c.id === taskId ? { ...c, ...card } : c) } : m));
+      reconcileSpine();
+    } catch (e) {
+      const fresh = e?.code === 'conflict' && e.meta?.current;
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // SNAP-BACK-or-REVERT (synchronous)
+        c.id === taskId
+          ? (fresh ? { ...c, ...e.meta.current } : { ...c, effort: prior.effort, impact: prior.impact })
+          : c) } : m));
+      surface(writeError('classify', e));
+    }
+  };
+
   const saveTaskMcp = async (task) => {
     if (!task.title.trim()) return;
     const provider = spineProvider();
@@ -5465,15 +5551,18 @@ export default function App() {
     const cur = model.cards.find((c) => c.id === task.id && !c.deleted_at);
     if (!cur) { surface('That card was deleted'); setEditing(null); return; }
     // Patch only the spine-Card fields the modal edits (title, acceptance_criteria,
-    // tier) and only those that actually changed. A column change is a move, not an
-    // update — it never travels through here.
+    // tier, effort, impact) and only those that actually changed. A column change is
+    // a move, not an update — it never travels through here. effort/impact are plain
+    // ungoverned fields on the spine (same as title/AC) — no special validation.
     const patch = {};
     if (task.title !== cur.title) patch.title = task.title;
     if ((task.acceptance_criteria || '') !== (cur.acceptance_criteria || '')) patch.acceptance_criteria = task.acceptance_criteria || '';
     if ((task.tier ?? null) !== (cur.tier ?? null)) patch.tier = task.tier ?? null;
+    if ((task.effort ?? null) !== (cur.effort ?? null)) patch.effort = task.effort ?? null;
+    if ((task.impact ?? null) !== (cur.impact ?? null)) patch.impact = task.impact ?? null;
     setEditing(null); // close immediately; the edit shows optimistically behind it
     if (Object.keys(patch).length === 0) return; // nothing changed → no write
-    const prior = { title: cur.title, acceptance_criteria: cur.acceptance_criteria, tier: cur.tier }; // CAPTURE
+    const prior = { title: cur.title, acceptance_criteria: cur.acceptance_criteria, tier: cur.tier, effort: cur.effort, impact: cur.impact }; // CAPTURE
     const expected_version = cur.version;
     setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
       c.id === task.id ? { ...c, ...patch } : c) } : m));
@@ -5494,7 +5583,7 @@ export default function App() {
         c.id === task.id
           ? (fresh
             ? { ...c, ...e.meta.current } // SNAP-BACK to server truth
-            : { ...c, title: prior.title, acceptance_criteria: prior.acceptance_criteria, tier: prior.tier }) // REVERT prior
+            : { ...c, title: prior.title, acceptance_criteria: prior.acceptance_criteria, tier: prior.tier, effort: prior.effort, impact: prior.impact }) // REVERT prior
           : c) } : m));
       surface(writeError('save', e));
     }
@@ -5949,6 +6038,7 @@ export default function App() {
   };
 
   const classifyTask = (taskId, update) => {
+    if (mcpWritable) { classifyTaskMcp(taskId, update); return; }
     if (mcpActive) { surface(READONLY_MSG); return; }
     withConflict(() => {
       const cur = store.get(taskId);
@@ -6077,11 +6167,11 @@ export default function App() {
           <GanttView tasks={filteredTasks} events={events} columns={activeColumns} onTaskClick={openEdit} />
         )}
         {view === 'matrix' && (
-          // readOnly=mcpActive (NOT mcpReadOnly): matrix drag = classify (effort/
-          // impact), which is NOT part of the Pass 2b card write-through, so it stays
-          // read-only on ANY live spine — a writable spine still can't classify here.
+          // readOnly=mcpReadOnly (Pass 2, matches BoardView): matrix drag = classify
+          // (effort/impact) now rides the same plain card_update write-through as
+          // every other board write — gated on write capability, not on connection.
           <MatrixView tasks={filteredTasks} tags={activeTags}
-            onTaskClick={openEdit} onClassify={classifyTask} readOnly={mcpActive} />
+            onTaskClick={openEdit} onClassify={classifyTask} readOnly={mcpReadOnly} />
         )}
         {editing && (
           <TaskModal task={editing} tags={activeTags} columns={activeColumns} isNew={isNew}

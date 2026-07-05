@@ -554,7 +554,7 @@ export function createMCPProvider({
      *
      *  card_create is DEFERRED (it needs project-targeting plumbing that does not
      *  exist yet) — intentionally NOT added here; the next slice wires it. */
-    async cardUpdate(id, { title, acceptance_criteria, tier, expected_version } = {}) {
+    async cardUpdate(id, { title, acceptance_criteria, tier, effort, impact, expected_version } = {}) {
       requireCapability('canWrite');
       // Field-scoped patch: only the keys actually supplied, so an unset field is
       // never clobbered with `undefined`. column_id/order are NOT update fields — a
@@ -570,6 +570,11 @@ export function createMCPProvider({
       // restoring write-once tierLock, untier is unreachable by design anyway — this is
       // belt-and-suspenders, and keeps the patch consistent with toWirePatch.
       if (tier !== undefined && tier !== null) patch.tier = tierInternalToWire(tier);
+      // effort/impact are plain ungoverned fields on the spine — forwarded verbatim
+      // (no wire remap, unlike tier), including an explicit null (unset), since the
+      // spine treats them as ordinary Card fields, not a write-once/validated one.
+      if (effort !== undefined) patch.effort = effort;
+      if (impact !== undefined) patch.impact = impact;
       return toInternalCard((await call('card_update', { id, patch, expected_version })).card);
     },
     async cardMove(id, toState, { order, expected_version } = {}) {
