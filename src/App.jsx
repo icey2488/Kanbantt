@@ -34,7 +34,7 @@ import { driveSync } from './lib/sync-instance.js';
 import { store, bootError, subscribe, getSnapshot, readLegacyDump, STORAGE_KEY } from './lib/store-instance.js';
 import { orderBetween, compareCards } from './lib/card-store.js';
 import { readKanbanttConfig, hasMcpTarget } from './lib/spine-config.js';
-import { createdAtLabel } from './lib/date-chip.js';
+import { createdAtLabel, isOverdue } from './lib/date-chip.js';
 
 /* global __APP_VERSION__, __GIT_COMMIT__ */
 // Injected by Vite's define() as string literals (see vite.config.js). In dev the
@@ -210,9 +210,6 @@ const startOfDay = (d) => {
   return x;
 };
 const uid = (prefix) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-const isOverdue = (task) => {
-  return startOfDay(new Date(task.dueDate)) < startOfDay(new Date()) && task.status !== 'done';
-};
 
 /* ============================================================
    STORAGE
@@ -1052,15 +1049,19 @@ function FilterBar({ tags, filters, setFilters, showArchived, onToggleShowArchiv
    ============================================================ */
 function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, dropIndicator, onMoveRequest, readOnly }) {
   const C = useTheme();
-  const due = startOfDay(new Date(task.dueDate));
+  const hasDue = task.dueDate != null;
+  const due = hasDue ? startOfDay(new Date(task.dueDate)) : null;
   const now = startOfDay(new Date());
-  const daysOut = Math.round((due - now) / 86400000);
-  const overdue = daysOut < 0 && task.status !== 'done';
+  const daysOut = hasDue ? Math.round((due - now) / 86400000) : null;
+  const overdue = hasDue && daysOut < 0 && task.status !== 'done';
 
-  let dueLabel = due.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-  if (daysOut === 0) dueLabel = 'Today';
-  else if (daysOut === 1) dueLabel = 'Tomorrow';
-  else if (daysOut === -1) dueLabel = 'Yesterday';
+  let dueLabel = null;
+  if (hasDue) {
+    dueLabel = due.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    if (daysOut === 0) dueLabel = 'Today';
+    else if (daysOut === 1) dueLabel = 'Tomorrow';
+    else if (daysOut === -1) dueLabel = 'Yesterday';
+  }
   const createdLabel = task.created_at ? createdAtLabel(task.created_at) : null;
 
   const priorityColor = C[PRIORITY[task.priority].key];
@@ -1228,14 +1229,16 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
           marginLeft: 14,
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <div style={{
-              fontFamily: F.mono, fontSize: 10.5,
-              color: overdue ? C.coral : C.textDim,
-              letterSpacing: '0.05em', textTransform: 'uppercase',
-              fontWeight: overdue ? 600 : 400,
-            }}>
-              {overdue ? '◆ ' : ''}{dueLabel}
-            </div>
+            {hasDue && (
+              <div style={{
+                fontFamily: F.mono, fontSize: 10.5,
+                color: overdue ? C.coral : C.textDim,
+                letterSpacing: '0.05em', textTransform: 'uppercase',
+                fontWeight: overdue ? 600 : 400,
+              }}>
+                {overdue ? '◆ ' : ''}{dueLabel}
+              </div>
+            )}
             {createdLabel && (
               <div style={{
                 fontFamily: F.mono, fontSize: 10.5,
@@ -5028,7 +5031,7 @@ export default function App() {
   // the polled spine model in place of the local store — a READ-ONLY mirror
   // (writes are gated below; the next poll is the source of truth). Spine Tasks
   // carry no board tags or dates, so map them to the view's task shape with
-  // neutral display defaults (today's date keeps cards out of a false "overdue").
+  // neutral display defaults (null due = no chip; never fabricate a date).
   const mcpActive = !!(spineState && spineState.provider === 'mcp' && spineModel);
   // canWrite is capability-detected by the provider (all four card_* write tools
   // advertised) and threaded through the connection state. It splits a live spine
@@ -5069,7 +5072,7 @@ export default function App() {
         status: c.column_id, // same column_id→status alias cardToTask applies
         description: c.description || '',
         startDate: c.startDate || today,
-        dueDate: c.dueDate || c.due || today, // spec Card uses `due`; local uses `dueDate`
+        dueDate: c.due ?? null, // spec Card uses `due`; null = no chip, never fabricate
         effort: c.effort,
         impact: c.impact,
         priority: c.priority || 'med',
