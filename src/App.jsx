@@ -621,17 +621,24 @@ function SyncChip({ status, onSyncNow, onReconnect }) {
 }
 
 // Live-spine (MCP) connection indicator. A pure view of the controller's state:
-// MCP active → mint "MCP: <name>"; graceful fallback → amber "Local (MCP
-// unavailable)"; clean local → dim. Rendered only when a spine target is
-// configured, so a purely-local board shows no chip at all.
-function SpineChip({ state }) {
+// MCP active → mint "MCP: <name>"; reconnecting (mid-session or initial-load) →
+// amber with "retry now" affordance; graceful fallback → amber "Local (MCP
+// unavailable)"; server-reachable (pending local-edit switch) → amber "switch?";
+// clean local → dim. Rendered only when a spine target is configured.
+function SpineChip({ state, onRetryNow }) {
   const C = useTheme();
   const narrow = useNarrow();
   if (!state) return null;
   const active = state.provider === 'mcp';
+  const reconnecting = !!state.reconnecting;
+  const serverReachable = !!state.serverReachable;
   const fallback = !!state.fallback;
-  const tint = active ? C.mint : fallback ? C.amber : C.textDim;
-  const Icon = active ? Cloud : fallback ? AlertTriangle : Cloud;
+  // Amber when: mid-session reconnecting, initial-load retrying, server-reachable prompt
+  const isAmber = (active && reconnecting) || (!active && (fallback || serverReachable));
+  const tint = active && !reconnecting ? C.mint : isAmber ? C.amber : C.textDim;
+  const Icon = reconnecting ? RefreshCw : active ? Cloud : (fallback || serverReachable) ? AlertTriangle : Cloud;
+  // "retry now" appears during any retry-loop state (mid-session reconnecting or initial-load retrying)
+  const canRetry = (reconnecting || (fallback && !serverReachable)) && onRetryNow;
   return (
     <span title={state.error ? `${state.error.code}: ${state.error.message}` : state.indicator}
       style={{
@@ -640,8 +647,16 @@ function SpineChip({ state }) {
         color: C.text, fontFamily: F.mono, fontSize: 10, letterSpacing: '0.06em',
         textTransform: 'uppercase', whiteSpace: 'nowrap',
       }}>
-      <Icon size={12} strokeWidth={2} color={tint} />
+      <Icon size={12} strokeWidth={2} color={tint} style={reconnecting ? { animation: 'spin 1.5s linear infinite' } : undefined} />
       {!narrow && state.indicator}
+      {canRetry && (
+        <button onClick={(e) => { e.stopPropagation(); onRetryNow(); }}
+          style={{
+            background: 'transparent', border: `1px solid ${tint}88`, borderRadius: 4,
+            color: tint, padding: '1px 6px', cursor: 'pointer', fontFamily: 'inherit',
+            fontSize: 'inherit', letterSpacing: 'inherit', textTransform: 'inherit', marginLeft: 4,
+          }}>retry</button>
+      )}
     </span>
   );
 }
@@ -693,7 +708,7 @@ function CollisionDialog({ onResolve, busy }) {
   );
 }
 
-function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTask, onOpenSettings, theme, setTheme, syncEnabled, syncStatus, onSyncNow, onReconnect, spineState, canCreate }) {
+function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTask, onOpenSettings, theme, setTheme, syncEnabled, syncStatus, onSyncNow, onReconnect, spineState, onSpineRetry, canCreate }) {
   const C = useTheme();
   const narrow = useNarrow();
   const tabs = [
@@ -755,7 +770,7 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
       </nav>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <SpineChip state={spineState} />
+        <SpineChip state={spineState} onRetryNow={onSpineRetry} />
         {user && syncEnabled && (
           <SyncChip status={syncStatus} onSyncNow={onSyncNow} onReconnect={onReconnect} />
         )}
@@ -5046,6 +5061,10 @@ export default function App() {
   // The active MCP connection (provider + pollNow), captured so the escalation-resolve
   // handler can reach the provider without re-deriving it. Set in the connection effect.
   const spineConnRef = useRef(null);
+  // Tracks whether the user made local card mutations during an initial-load retry loop.
+  // Prevents auto-switching to MCP (which would clobber in-progress local work) when
+  // a background retry succeeds. Reset on each new connection attempt.
+  const localEditedRef = useRef(false);
   // In-memory Bearer token (spec Auth v1: "Token held in memory by default"). Set by
   // handleSpineConnect when remember_token is false; null on page load so only a
   // remembered (persisted) token auto-connects on reload. Cleared on disconnect.
@@ -5085,6 +5104,11 @@ export default function App() {
   // carry no board tags or dates, so map them to the view's task shape with
   // neutral display defaults (null due = no chip; never fabricate a date).
   const mcpActive = !!(spineState && spineState.provider === 'mcp' && spineModel);
+  // True while the controller is in RECONNECTING state (mid-session drop with backoff
+  // retry active). In this state: provider stays 'mcp' (mcpActive remains true, board
+  // keeps rendering last-known cards), but ALL writes are suppressed — same mechanics
+  // as the existing read-only mode — and a stale banner is shown.
+  const mcpReconnecting = !!(spineState && spineState.provider === 'mcp' && spineState.reconnecting);
   // canWrite is capability-detected by the provider (all four card_* write tools
   // advertised) and threaded through the connection state. It splits a live spine
   // into two modes that the write handlers below branch on:
@@ -5092,13 +5116,14 @@ export default function App() {
   //     provider and reconcile from the spine; they NEVER touch the local store.
   //   mcpReadOnly — a read pair only (board_get + card_list); the board is a
   //     read-only mirror and every write affordance is gated off (drag/edit/delete).
+  // During RECONNECTING both are treated as read-only (writes blocked, stale banner shown).
   // SPLIT-BRAIN: in BOTH MCP modes the local canonical store is left untouched — a
   // writable spine reconciles into transient React state (spineModel), so a later
   // disconnected boot can never mistake a stale mirror for local truth (see the
   // connection effect's guard). card_create stays deferred — see canCreate below.
   const mcpCanWrite = !!(spineState && spineState.capabilities && spineState.capabilities.canWrite);
-  const mcpReadOnly = mcpActive && !mcpCanWrite;
-  const mcpWritable = mcpActive && mcpCanWrite;
+  const mcpReadOnly = (mcpActive && !mcpCanWrite) || mcpReconnecting;
+  const mcpWritable = mcpActive && mcpCanWrite && !mcpReconnecting;
   // canResolve gates the ONE permitted mutation in MCP mode (escalation approve/deny),
   // threaded via state.capabilities exactly like canWrite. It is INDEPENDENT of
   // mcpReadOnly: a read-only board mirror can still resolve escalations.
@@ -5270,6 +5295,7 @@ export default function App() {
         // authority over archived cards requires an include_archived:true fetch —
         // which the poll runs exactly when "Show archived" is on (the ref-backed
         // getter below, re-read every tick).
+        localEditedRef.current = false; // reset per-connection local-edit tracking
         conn = createMcpConnectionFromConfig({
           config,
           // Auth v1: in-memory token (remember_token: false) passed explicitly; null on
@@ -5281,7 +5307,15 @@ export default function App() {
         spineConnRef.current = conn; // expose to the escalation-resolve handler
         unsub = conn.subscribe((st) => {
           setSpineState(st);
-          if (st.provider !== 'mcp') setSpineModel(null); // degrade → revert to local
+          // Mid-session reconnecting: provider stays 'mcp', keep last-known spineModel.
+          // Initial-load failure/retrying: provider is 'local', clear to avoid stale data.
+          if (st.provider !== 'mcp') setSpineModel(null);
+          // Auto-switch on initial-load recovery — but ONLY if no local edits were made
+          // (prevents clobbering in-progress local work). If local edits exist, we let the
+          // "server reachable — switch?" affordance (rendered below) handle it explicitly.
+          if (st.serverReachable && !localEditedRef.current) {
+            conn.switchToMcp().catch(() => {});
+          }
         });
         conn.connect();
       })
@@ -5354,6 +5388,15 @@ export default function App() {
     await safeSet('kanbantt_config', { ...cfg, data_source: 'local', mcp: {} });
     setSpineConfigNonce((n) => n + 1);
   };
+  // Manual retry: resets backoff and fires an immediate reconnect attempt.
+  // Works in both mid-session reconnecting and initial-load retrying states.
+  const handleSpineRetry = () => { spineConnRef.current?.retryNow?.(); };
+  // Accept the pending initial-load MCP switch (user clicked the "switch?" affordance
+  // after local edits prevented the auto-switch).
+  const handleSpineSwitchToMcp = () => {
+    localEditedRef.current = false;
+    spineConnRef.current?.switchToMcp?.().catch(() => {});
+  };
   const handleResolveCollision = async (choice) => {
     if (!driveSync) return;
     setCollisionBusy(true);
@@ -5382,6 +5425,14 @@ export default function App() {
   };
   /* ---- mutation plumbing ------------------------------------------------ */
   const surface = (msg) => setNotice(msg);
+  // Mark that the user made a local card mutation while the initial-load retry loop
+  // is active. Prevents auto-switching to MCP when a background retry succeeds —
+  // no rug-pulls while the user has in-progress local work.
+  const markLocalEdited = () => {
+    if (spineState && spineState.provider === 'local' && spineState.reconnecting) {
+      localEditedRef.current = true;
+    }
+  };
   // TRANSIENT variant — the SAME banner slot/component as surface() (one notice
   // surface, two dismissal policies; no new component), auto-dismissing after ~4s.
   // Success-class messages only (the bulk/auto sweep's "Archived N of N."); anything
@@ -5867,6 +5918,7 @@ export default function App() {
   const saveTask = (task) => {
     if (mcpWritable) { saveTaskMcp(task); return; }
     if (mcpActive) { surface(READONLY_MSG); return; }
+    markLocalEdited();
     if (!task.title.trim()) return;
     if (isNew) {
       const { id, status, ...rest } = task; // drop the 'new' placeholder id + status alias
@@ -5893,6 +5945,7 @@ export default function App() {
   const deleteTask = (id) => {
     if (mcpWritable) { deleteTaskMcp(id); return; }
     if (mcpActive) { surface(READONLY_MSG); return; }
+    markLocalEdited();
     withConflict(() => {
       const cur = store.get(id);
       if (!cur) return;
@@ -5936,6 +5989,7 @@ export default function App() {
   // The mcpActive backstop keeps a stray call inert. Local behavior is unchanged.
   const quickAdd = (colId, title) => {
     if (mcpActive) { surface(READONLY_MSG); return; }
+    markLocalEdited();
     const t = new Date();
     store.create({
       title, description: '', column_id: colId,
@@ -5950,6 +6004,7 @@ export default function App() {
   const moveTask = (draggedId, target) => {
     if (mcpWritable) { moveTaskMcp(draggedId, target); return; }
     if (mcpActive) { surface(READONLY_MSG); return; }
+    markLocalEdited();
     withConflict(() => {
       const dragged = store.get(draggedId);
       if (!dragged || dragged.deleted_at) { surface('That card was deleted'); return; }
@@ -6145,10 +6200,46 @@ export default function App() {
           theme={theme} setTheme={setTheme}
           syncEnabled={syncEnabled} syncStatus={syncStatus}
           onSyncNow={handleSyncNow} onReconnect={handleReconnect}
-          spineState={spineState} canCreate={!mcpActive} />
+          spineState={spineState} onSpineRetry={handleSpineRetry} canCreate={!mcpActive} />
         <FilterBar tags={activeTags} filters={filters} setFilters={setFilters}
           showArchived={showArchived}
           onToggleShowArchived={mcpActive ? () => updateArchiveConfig({ showArchived: !showArchived }) : undefined} />
+        {/* RECONNECTING banner: mid-session drop — board shows last-known data, writes blocked */}
+        {mcpReconnecting && (
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '8px 20px', background: `${C.amber}18`, borderBottom: `1px solid ${C.amber}44`,
+            fontFamily: F.body, fontSize: 12, color: C.amber, gap: 12,
+          }}>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <AlertTriangle size={12} strokeWidth={2} color={C.amber} />
+              Connection lost — showing last-known data. Writes disabled until reconnected.
+            </span>
+            <button onClick={handleSpineRetry} style={{
+              background: 'transparent', border: `1px solid ${C.amber}88`, borderRadius: 4,
+              color: C.amber, padding: '2px 8px', cursor: 'pointer',
+              fontFamily: F.mono, fontSize: 10, letterSpacing: '0.05em', textTransform: 'uppercase',
+            }}>Retry now</button>
+          </div>
+        )}
+        {/* SERVER REACHABLE banner: initial-load recovery, user made local edits → switch? */}
+        {spineState && spineState.serverReachable && !mcpActive && (
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '8px 20px', background: `${C.amber}18`, borderBottom: `1px solid ${C.amber}44`,
+            fontFamily: F.body, fontSize: 12, color: C.amber, gap: 12,
+          }}>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <AlertTriangle size={12} strokeWidth={2} color={C.amber} />
+              MCP server is reachable. Switch to live view? (local edits will be kept locally)
+            </span>
+            <button onClick={handleSpineSwitchToMcp} style={{
+              background: 'transparent', border: `1px solid ${C.amber}88`, borderRadius: 4,
+              color: C.amber, padding: '2px 8px', cursor: 'pointer',
+              fontFamily: F.mono, fontSize: 10, letterSpacing: '0.05em', textTransform: 'uppercase',
+            }}>Switch</button>
+          </div>
+        )}
         {view === 'board' && (
           <BoardView tasks={filteredTasks} tags={activeTags} columns={activeColumns}
             onTaskClick={openEdit} onMove={moveTask} onQuickAdd={quickAdd}

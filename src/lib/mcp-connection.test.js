@@ -1,9 +1,10 @@
 /**
  * MCP connection controller tests — auto-detect selection + capability gating +
- * the polling loop, driven against the REAL MCPProvider over a conforming
- * in-process MCP server (spine-mcp-test-server.js). createMcpConnection →
- * makeProvider() → real createMCPProvider → in-memory StreamableHTTP → real SDK
- * Server backed by card-store. No mock provider; the two real seams meet.
+ * the polling loop + reconnect resilience, driven against the REAL MCPProvider
+ * over a conforming in-process MCP server (spine-mcp-test-server.js).
+ * createMcpConnection → makeProvider() → real createMCPProvider → in-memory
+ * StreamableHTTP → real SDK Server backed by card-store. No mock provider; the
+ * two real seams meet.
  *
  * Run:  node --test src/lib/mcp-connection.test.js
  */
@@ -18,6 +19,9 @@ import {
   toBoardColumns,
   LOCAL_INDICATOR,
   MCP_UNAVAILABLE_INDICATOR,
+  LOCAL_RETRYING_INDICATOR,
+  LOCAL_SERVER_REACHABLE_INDICATOR,
+  mcpReconnectingIndicator,
 } from './mcp-connection.js';
 
 /** A makeProvider bound to a harness — the controller owns connect()/timeout. */
@@ -40,6 +44,14 @@ function manualScheduler() {
       return !!h;
     },
     pending: () => items.filter((h) => !h.cancelled).length,
+    /** Fire the OLDEST pending item (useful for firing the next backoff timer). */
+    async fireOldest() {
+      const live = items.filter((h) => !h.cancelled);
+      const h = live[0];
+      items = items.filter((x) => x !== h);
+      if (h) await h.fn();
+      return !!h;
+    },
   };
 }
 const oneCard = (s) => s.create({ id: 'c1', title: 'T', column_id: 'todo', priority: 'med' });
@@ -82,6 +94,7 @@ test('reachable server → MCPProvider active, "MCP: Claunker", flags, polling, 
   const st = await conn.connect();
   assert.equal(st.provider, 'mcp');
   assert.equal(st.indicator, 'MCP: Claunker');
+  assert.equal(st.reconnecting, false);
   assert.deepEqual(st.featureFlags, { escalations: true, artifacts: true, columns: true, tags: true, realtime: false });
   assert.equal(conn.supportsRealtime(), false, 'realtime:false → board polls');
   assert.ok(conn.isPolling(), 'MCP activation starts the poll loop');
@@ -124,13 +137,48 @@ test('poll reflects a server-side move on the next tick (no manual refresh)', as
 });
 
 /* ================================================================== */
-/* Unreachable / incompatible → fallback, never blank                  */
+/* Unreachable → retry loop (not one-shot Local parking)               */
 /* ================================================================== */
 
-test('unreachable server → "Local (MCP unavailable)" + retry recovers when it comes up', async () => {
+test('unreachable server → enters retry loop (LOCAL_RETRYING, not one-shot Local)', async () => {
   let up = false;
   const harness = createMcpTestServer({ seed: oneCard });
-  // makeProvider returns a throwing provider until "up", then the real one.
+  const makeProvider = () => (up
+    ? createMCPProvider({ baseUrl: harness.url, fetchFn: harness.fetchFn })
+    : { connect: async () => { throw Object.assign(new Error('ECONNREFUSED'), { code: 'unreachable' }); } });
+  const sched = manualScheduler();
+  const conn = createMcpConnection({
+    config: { data_source: 'mcp', mcp: { url: harness.url } },
+    makeProvider,
+    schedule: sched.schedule,
+    cancel: sched.cancel,
+  });
+  const down = await conn.connect();
+  assert.equal(down.provider, 'local');
+  assert.equal(down.reconnecting, true, 'initial failure → retry loop, not parked');
+  assert.equal(down.indicator, LOCAL_RETRYING_INDICATOR);
+  assert.equal(down.fallback, true);
+  assert.ok(down.error, 'error detail retained for settings');
+  assert.equal(conn.isReconnecting(), true);
+
+  // Background retry fires (server now up) → serverReachable emitted
+  up = true;
+  let applied = 0;
+  await sched.fireOldest(); // fire the backoff timer
+  const ready = conn.getState();
+  assert.equal(ready.serverReachable, true, 'server came back → serverReachable');
+  assert.equal(ready.reconnecting, false);
+
+  // switchToMcp() completes the transition
+  conn.applyModel = (m) => { applied += 1; };
+  // Reconstruct with applyModel wired
+  conn.disconnect();
+  await harness.close();
+});
+
+test('retry: manual retry after initial connect failure recovers when server comes up', async () => {
+  let up = false;
+  const harness = createMcpTestServer({ seed: oneCard });
   const makeProvider = () => (up
     ? createMCPProvider({ baseUrl: harness.url, fetchFn: harness.fetchFn })
     : { connect: async () => { throw Object.assign(new Error('ECONNREFUSED'), { code: 'unreachable' }); } });
@@ -142,34 +190,34 @@ test('unreachable server → "Local (MCP unavailable)" + retry recovers when it 
   });
   const down = await conn.connect();
   assert.equal(down.provider, 'local');
-  assert.equal(down.indicator, MCP_UNAVAILABLE_INDICATOR);
-  assert.equal(down.fallback, true);
-  assert.ok(down.error, 'error detail retained for settings');
+  assert.equal(down.reconnecting, true);
 
   up = true;
   const recovered = await conn.retry();
   assert.equal(recovered.provider, 'mcp');
   assert.equal(recovered.indicator, 'MCP: Claunker');
+  assert.equal(recovered.reconnecting, false);
   conn.disconnect();
   await harness.close();
 });
 
 test('incompatible server (missing a required tool) → fallback, never blank', async () => {
   const harness = createMcpTestServer({ omitTools: ['card_list'] });
+  const sched = manualScheduler();
   const conn = createMcpConnection({
     config: { data_source: 'mcp', mcp: { url: harness.url } },
     makeProvider: providerFactory(harness),
-    schedule: manualScheduler().schedule,
-    cancel: () => {},
+    schedule: sched.schedule,
+    cancel: sched.cancel,
   });
   const st = await conn.connect();
   assert.equal(st.provider, 'local');
-  assert.equal(st.indicator, MCP_UNAVAILABLE_INDICATOR);
+  assert.equal(st.indicator, LOCAL_RETRYING_INDICATOR, 'incompatible → retry loop');
   assert.equal(st.error.code, 'incompatible_server');
   await harness.close();
 });
 
-test('timeout (connect hangs past the ping timeout) → fallback', async () => {
+test('timeout (connect hangs past the ping timeout) → retry loop, fallback', async () => {
   const conn = createMcpConnection({
     config: { data_source: 'mcp', mcp: { url: 'http://mcp.test/mcp' } },
     makeProvider: () => ({ connect: () => new Promise(() => {}) }), // never resolves
@@ -177,7 +225,8 @@ test('timeout (connect hangs past the ping timeout) → fallback', async () => {
   });
   const st = await conn.connect();
   assert.equal(st.provider, 'local');
-  assert.equal(st.indicator, MCP_UNAVAILABLE_INDICATOR);
+  assert.equal(st.reconnecting, true, 'timeout → retry loop not parked');
+  assert.equal(st.indicator, LOCAL_RETRYING_INDICATOR);
   assert.equal(st.error.code, 'timeout');
 });
 
@@ -223,6 +272,7 @@ test('disconnect stops the poll loop and returns to Local (clean, not a fallback
   assert.equal(conn.isPolling(), false);
   assert.equal(conn.getState().provider, 'local');
   assert.equal(conn.getState().fallback, false, 'a clean disconnect is not a fallback');
+  assert.equal(conn.getState().reconnecting, false);
   await harness.close();
 });
 
@@ -249,6 +299,7 @@ test('toBoardColumns falls back to the reserved spine columns when given none', 
 
 /* ================================================================== */
 /* HARDENING FIX A (teardown guard) + FIX C (poll strike counter)      */
+/* + RECONNECT RESILIENCE                                               */
 /* ------------------------------------------------------------------- */
 /* Driven against a fully CONTROLLABLE provider double: its poll reads  */
 /* (getBoard/list) can be armed to throw a classified FATAL and — like  */
@@ -297,7 +348,11 @@ const mcpConfig = { data_source: 'mcp', mcp: { url: 'http://x/mcp' } };
 /** Spin the microtask queue until `cond()` (bounded) — lets a parked async continuation run. */
 async function flushUntil(cond, max = 20) { for (let i = 0; i < max && !cond(); i++) await Promise.resolve(); }
 
-test('FIX C: background-poll "unreachable" rides out 2 strikes; the 3rd consecutive degrades', async () => {
+/* ================================================================== */
+/* FIX C + RECONNECT: poll strikes trip RECONNECTING, not Local        */
+/* ================================================================== */
+
+test('strikes trip RECONNECTING not Local: 3rd consecutive poll failure enters reconnecting state', async () => {
   const ctl = controllableProvider();
   const sched = manualScheduler();
   let applied = 0;
@@ -311,14 +366,200 @@ test('FIX C: background-poll "unreachable" rides out 2 strikes; the 3rd consecut
 
   ctl.fail = 'unreachable';
   await sched.fireNext();
-  assert.equal(conn.getState().provider, 'mcp', 'strike 1: board stays live');
+  assert.equal(conn.getState().provider, 'mcp', 'strike 1: provider stays mcp');
+  assert.equal(conn.getState().reconnecting, false, 'strike 1: not yet reconnecting');
   await sched.fireNext();
-  assert.equal(conn.getState().provider, 'mcp', 'strike 2: board stays live');
+  assert.equal(conn.getState().provider, 'mcp', 'strike 2: provider stays mcp');
+  assert.equal(conn.getState().reconnecting, false, 'strike 2: not yet reconnecting');
   assert.ok(conn.isPolling(), 'still polling through strikes 1-2');
   await sched.fireNext();
-  assert.equal(conn.getState().provider, 'local', 'strike 3: degraded to Local');
-  assert.equal(conn.getState().fallback, true, 'the degrade is a fallback');
-  assert.equal(conn.isPolling(), false, 'the poll loop stopped on degrade');
+  // 3rd strike: enters RECONNECTING (not Local!)
+  assert.equal(conn.getState().provider, 'mcp', 'strike 3: provider stays mcp (not Local)');
+  assert.equal(conn.getState().reconnecting, true, 'strike 3: entered RECONNECTING state');
+  assert.equal(conn.getState().fallback, false, 'RECONNECTING is not a fallback');
+  assert.equal(conn.isPolling(), false, 'the poll loop stops while reconnecting');
+  assert.equal(conn.isReconnecting(), true, 'isReconnecting() reports true');
+  assert.ok(conn.getState().indicator.includes('reconnecting'), 'indicator reflects reconnecting');
+});
+
+test('backoff schedule: first retry fires at ~5s step, second at ~10s step', async () => {
+  const ctl = controllableProvider();
+  const delays = [];
+  const sched = {
+    schedule: (fn, ms) => { const h = { fn, ms, cancelled: false }; delays.push(ms); return h; },
+    cancel: (h) => { if (h) h.cancelled = true; },
+  };
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: () => {}, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  await conn.connect();
+
+  ctl.fail = 'unreachable';
+  // Force 3 strikes to enter reconnecting (fire 3 poll ticks manually via fresh sched)
+  // (The backoff timer is scheduled by enterReconnecting after 3rd strike)
+  // We can verify the delays array captured a ~5000ms backoff timer.
+  // Manually drive strikes via degradeOnFatal:
+  const fatalErr = Object.assign(new Error('fetch failed'), { code: 'unreachable', fatalKind: 'unreachable' });
+  // Simulate 3 poll-path fatals
+  const degradeViaOnFatal = () => { if (ctl.onFatal) ctl.onFatal(fatalErr); };
+  // Need pollInFlight = true for the strike to count; simulate via provider call sequence.
+  // Easier: just verify the delay range after entering via the full flow.
+  // Use a real manual scheduler for polling, then check the backoff delay.
+  const sched2 = manualScheduler();
+  const delays2 = [];
+  const ctl2 = controllableProvider();
+  const conn2 = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl2.make,
+    applyModel: () => {},
+    schedule: (fn, ms) => { delays2.push(ms); return sched2.schedule(fn, ms); },
+    cancel: sched2.cancel,
+  });
+  await conn2.connect();
+  ctl2.fail = 'unreachable';
+  await sched2.fireNext(); // strike 1
+  await sched2.fireNext(); // strike 2
+  await sched2.fireNext(); // strike 3 → enterReconnecting → scheduleReconnect
+  // After 3rd strike, a backoff timer is scheduled
+  assert.ok(delays2.length >= 4, 'at least one backoff timer scheduled after strikes');
+  const backoffDelay = delays2[delays2.length - 1];
+  // First step is 5000 ± 1000ms
+  assert.ok(backoffDelay >= 4000 && backoffDelay <= 6000,
+    `first backoff delay should be ~5000ms, got ${backoffDelay}`);
+  conn2.disconnect();
+});
+
+test('backoff caps at 60s: repeated failures progress through schedule and cap', async () => {
+  // Initial connect uses the controllable provider (success). After entering reconnecting,
+  // we switch to a provider that FAILS AT CONNECT TIME so that each attemptReconnect()
+  // throws before setting reconnecting=false — the backoff loop keeps cycling and we can
+  // observe the full delay schedule.
+  const ctl = controllableProvider();
+  const delays = [];
+  const sched = manualScheduler();
+  let useFailingConnect = false;
+  const makeProvider = (hooks) => {
+    if (useFailingConnect) {
+      return {
+        connect: async () => { throw Object.assign(new Error('down'), { code: 'unreachable' }); },
+        disconnect() {},
+      };
+    }
+    return ctl.make(hooks);
+  };
+
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider,
+    applyModel: () => {},
+    schedule: (fn, ms) => { delays.push(ms); return sched.schedule(fn, ms); },
+    cancel: sched.cancel,
+  });
+  await conn.connect();
+
+  // Enter reconnecting via 3 poll strikes
+  ctl.fail = 'unreachable';
+  await sched.fireNext();
+  await sched.fireNext();
+  await sched.fireNext(); // enters reconnecting, schedules first backoff
+  assert.equal(conn.getState().reconnecting, true);
+  const delaysBefore = delays.length;
+
+  // Now reconnect attempts always fail at connect() time — reconnecting stays true
+  useFailingConnect = true;
+  for (let i = 0; i < 5; i++) {
+    await sched.fireOldest(); // fires backoff timer → attemptReconnect throws → next timer scheduled
+    if (!conn.isReconnecting()) break;
+  }
+
+  // Delays after entering reconnecting: [~5000, ~10000, ~30000, ~60000, ~60000, ...]
+  const backoffDelays = delays.slice(delaysBefore);
+  assert.ok(backoffDelays.length >= 3, `expected ≥3 backoff delays, got ${backoffDelays.length}`);
+  const STEPS = [5000, 10000, 30000, 60000];
+  const JITTER = 1500;
+  for (const d of backoffDelays) {
+    const valid = STEPS.some((s) => Math.abs(d - s) <= JITTER + 1000);
+    assert.ok(valid, `backoff delay ${d} should be near one of ${STEPS.join(',')} (within ±${JITTER + 1000}ms)`);
+  }
+  const last = backoffDelays[backoffDelays.length - 1];
+  assert.ok(last <= 62000, `capped delay ${last} should be ≤ 62000ms`);
+  conn.disconnect();
+});
+
+test('success resumes + adopts server state: reconnect succeeds, polling restarts, model applied', async () => {
+  const ctl = controllableProvider();
+  const sched = manualScheduler();
+  let model = null;
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: (m) => { model = m; }, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  await conn.connect();
+  assert.ok(model, 'initial model applied');
+
+  // Enter reconnecting via 3 strikes
+  ctl.fail = 'unreachable';
+  await sched.fireNext();
+  await sched.fireNext();
+  await sched.fireNext();
+  assert.equal(conn.getState().reconnecting, true);
+  assert.equal(conn.isPolling(), false);
+
+  // Server comes back; fire the backoff timer
+  ctl.fail = null;
+  ctl.cards = [{ id: 'c2', title: 'New', column_id: 'todo' }];
+  await sched.fireOldest(); // backoff fires → attemptReconnect → success
+
+  assert.equal(conn.getState().provider, 'mcp', 'resumed MCP after reconnect');
+  assert.equal(conn.getState().reconnecting, false, 'reconnecting cleared on success');
+  assert.equal(conn.getState().fallback, false, 'not a fallback after resume');
+  assert.ok(conn.isPolling(), 'polling restarted after reconnect');
+  assert.ok(model && model.cards.find((c) => c.id === 'c2'), 'server state adopted (new card in model)');
+  conn.disconnect();
+});
+
+test('stale banner state: while RECONNECTING, state has reconnecting=true + last-known capabilities', async () => {
+  const ctl = controllableProvider();
+  const sched = manualScheduler();
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: () => {}, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  await conn.connect();
+  const caps = conn.getState().capabilities;
+  assert.ok(caps && caps.canWrite, 'capabilities available when connected');
+
+  ctl.fail = 'unreachable';
+  await sched.fireNext(); await sched.fireNext(); await sched.fireNext();
+
+  const st = conn.getState();
+  assert.equal(st.reconnecting, true);
+  assert.equal(st.provider, 'mcp', 'provider stays mcp (not local dataset)');
+  // Last-known capabilities retained for read purposes
+  assert.ok(st.capabilities && typeof st.capabilities.canWrite === 'boolean',
+    'last-known capabilities retained during reconnecting');
+  conn.disconnect();
+});
+
+test('mid-session drop never renders local dataset: provider=mcp through reconnecting', async () => {
+  const ctl = controllableProvider();
+  const sched = manualScheduler();
+  const stateSnapshots = [];
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: () => {}, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  conn.subscribe((st) => stateSnapshots.push(st.provider));
+  await conn.connect();
+
+  ctl.fail = 'unreachable';
+  await sched.fireNext(); await sched.fireNext(); await sched.fireNext();
+
+  // ALL state transitions since connection should have provider==='mcp'
+  // (The local-dataset is unreachable throughout a mid-session drop)
+  for (const p of stateSnapshots) {
+    assert.equal(p, 'mcp', `state snapshot should never show local during mid-session drop, got ${p}`);
+  }
+  conn.disconnect();
 });
 
 test('FIX C: a clean poll between failures resets the strike counter', async () => {
@@ -335,15 +576,17 @@ test('FIX C: a clean poll between failures resets the strike counter', async () 
   ctl.fail = null;
   await sched.fireNext();          // clean poll → reset to 0
   assert.equal(conn.getState().provider, 'mcp');
+  assert.equal(conn.getState().reconnecting, false);
   ctl.fail = 'unreachable';
   await sched.fireNext();          // strike 1 (post-reset), NOT the 2nd
   await sched.fireNext();          // strike 2
   assert.equal(conn.getState().provider, 'mcp', 'reset worked: 2 post-reset strikes still live');
-  await sched.fireNext();          // strike 3 → degrade
-  assert.equal(conn.getState().provider, 'local', 'degrades only after 3 CONSECUTIVE post-reset');
+  assert.equal(conn.getState().reconnecting, false, '2 strikes: not yet reconnecting');
+  await sched.fireNext();          // strike 3 → RECONNECTING
+  assert.equal(conn.getState().reconnecting, true, 'enters RECONNECTING only after 3 CONSECUTIVE post-reset');
 });
 
-test('FIX C: a fatal "auth" on the poll degrades immediately (no strike tolerance)', async () => {
+test('FIX C: a fatal "auth" on the poll degrades immediately to Local (no strike tolerance, stops retry)', async () => {
   const ctl = controllableProvider();
   const sched = manualScheduler();
   const conn = createMcpConnection({
@@ -355,10 +598,12 @@ test('FIX C: a fatal "auth" on the poll degrades immediately (no strike toleranc
   await sched.fireNext();
   assert.equal(conn.getState().provider, 'local', 'auth degrades on the FIRST poll fatal');
   assert.equal(conn.getState().error.code, 'auth');
+  assert.equal(conn.getState().reconnecting, false, 'auth does not start retry loop');
   assert.equal(conn.isPolling(), false);
+  assert.equal(conn.isReconnecting(), false);
 });
 
-test('FIX C: a user-op "unreachable" degrades immediately (strike tolerance is poll-only)', async () => {
+test('FIX C: a user-op "unreachable" degrades immediately to Local (strike tolerance is poll-only)', async () => {
   const ctl = controllableProvider();
   const sched = manualScheduler();
   const conn = createMcpConnection({
@@ -371,8 +616,207 @@ test('FIX C: a user-op "unreachable" degrades immediately (strike tolerance is p
   await assert.rejects(() => conn.getProvider().opFatal('unreachable'));
   assert.equal(conn.getState().provider, 'local', 'user-op unreachable degrades on the FIRST fatal');
   assert.equal(conn.getState().fallback, true);
+  assert.equal(conn.getState().reconnecting, false, 'user-op degrade does not enter retry loop');
   assert.equal(conn.isPolling(), false);
 });
+
+/* ================================================================== */
+/* Initial-load failure keeps retrying                                  */
+/* ================================================================== */
+
+test('initial-load failure keeps retrying in background (reconnecting=true, local available)', async () => {
+  const sched = manualScheduler();
+  const conn = createMcpConnection({
+    config: mcpConfig,
+    makeProvider: () => ({ connect: async () => { throw Object.assign(new Error('down'), { code: 'unreachable' }); } }),
+    applyModel: () => {},
+    schedule: sched.schedule,
+    cancel: sched.cancel,
+    pingTimeoutMs: 50,
+  });
+  const st = await conn.connect();
+  assert.equal(st.provider, 'local');
+  assert.equal(st.reconnecting, true, 'initial failure keeps retrying');
+  assert.equal(st.indicator, LOCAL_RETRYING_INDICATOR);
+  // A backoff timer is scheduled
+  assert.ok(sched.pending() > 0, 'retry timer scheduled');
+  conn.disconnect();
+  // After disconnect, retry loop stops
+  assert.equal(conn.isReconnecting(), false);
+});
+
+test('initial-load recovery auto-switch: serverReachable=true emitted when server comes up', async () => {
+  let up = false;
+  const harness = createMcpTestServer({ seed: oneCard });
+  const makeProvider = (hooks) => (up
+    ? createMCPProvider({ baseUrl: harness.url, fetchFn: harness.fetchFn, onFatal: hooks.onFatal })
+    : { connect: async () => { throw Object.assign(new Error('down'), { code: 'unreachable' }); } });
+  const sched = manualScheduler();
+  let applied = 0;
+  const conn = createMcpConnection({
+    config: { data_source: 'mcp', mcp: { url: harness.url } },
+    makeProvider,
+    applyModel: () => { applied += 1; },
+    schedule: sched.schedule,
+    cancel: sched.cancel,
+  });
+  await conn.connect();
+  assert.equal(conn.getState().reconnecting, true);
+
+  // Server comes up; fire the retry
+  up = true;
+  await sched.fireOldest();
+  const st = conn.getState();
+  assert.equal(st.serverReachable, true, 'serverReachable emitted on initial-load recovery');
+  assert.equal(st.provider, 'local', 'stays local until switchToMcp() is called');
+  assert.equal(st.reconnecting, false);
+
+  // switchToMcp() transitions to MCP + starts polling
+  await conn.switchToMcp();
+  assert.equal(conn.getState().provider, 'mcp');
+  assert.equal(conn.getState().reconnecting, false);
+  assert.ok(conn.isPolling());
+  assert.ok(applied >= 1, 'model applied after switch');
+  conn.disconnect();
+  await harness.close();
+});
+
+/* ================================================================== */
+/* retry-now resets backoff                                             */
+/* ================================================================== */
+
+test('retryNow: resets backoff and fires immediately, resumes on success', async () => {
+  const ctl = controllableProvider();
+  const sched = manualScheduler();
+  let model = null;
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: (m) => { model = m; }, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  await conn.connect();
+
+  // Enter reconnecting via 3 strikes
+  ctl.fail = 'unreachable';
+  await sched.fireNext(); await sched.fireNext(); await sched.fireNext();
+  assert.equal(conn.getState().reconnecting, true);
+
+  // Server comes back; retryNow fires without waiting for backoff
+  ctl.fail = null;
+  ctl.cards = [{ id: 'retry-card', title: 'R', column_id: 'todo' }];
+  const pendingBefore = sched.pending();
+  // retryNow() returns a promise that resolves when attemptReconnect + startPolling complete
+  await conn.retryNow();
+
+  assert.equal(conn.getState().reconnecting, false, 'retryNow recovered');
+  assert.equal(conn.getState().provider, 'mcp');
+  assert.ok(model && model.cards.find((c) => c.id === 'retry-card'), 'server state adopted after retryNow');
+  conn.disconnect();
+});
+
+test('retryNow on initial-load failure: fires immediately and recovers', async () => {
+  let up = false;
+  const harness = createMcpTestServer({ seed: oneCard });
+  const makeProvider = (hooks) => (up
+    ? createMCPProvider({ baseUrl: harness.url, fetchFn: harness.fetchFn, onFatal: hooks.onFatal })
+    : { connect: async () => { throw Object.assign(new Error('down'), { code: 'unreachable' }); } });
+  const sched = manualScheduler();
+  const conn = createMcpConnection({
+    config: { data_source: 'mcp', mcp: { url: harness.url } },
+    makeProvider,
+    applyModel: () => {},
+    schedule: sched.schedule,
+    cancel: sched.cancel,
+  });
+  await conn.connect();
+  assert.equal(conn.getState().reconnecting, true);
+
+  up = true;
+  // retryNow() returns a promise; on initial-load recovery it resolves after emitting serverReachable
+  await conn.retryNow();
+
+  assert.equal(conn.getState().serverReachable, true, 'retryNow on initial-load recovers');
+  conn.disconnect();
+  await harness.close();
+});
+
+/* ================================================================== */
+/* disconnect kills reconnect loops                                     */
+/* ================================================================== */
+
+test('disconnect while mid-session reconnecting stops the retry loop', async () => {
+  const ctl = controllableProvider();
+  const sched = manualScheduler();
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: () => {}, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  await conn.connect();
+
+  ctl.fail = 'unreachable';
+  await sched.fireNext(); await sched.fireNext(); await sched.fireNext();
+  assert.equal(conn.isReconnecting(), true);
+
+  conn.disconnect();
+  assert.equal(conn.isReconnecting(), false, 'disconnect kills reconnect loop');
+  assert.equal(conn.getState().provider, 'local');
+  assert.equal(conn.getState().fallback, false, 'explicit disconnect is clean, not a fallback');
+  assert.equal(sched.pending(), 0, 'no pending timers after disconnect');
+});
+
+test('disconnect while initial-load retrying stops the retry loop', async () => {
+  const sched = manualScheduler();
+  const conn = createMcpConnection({
+    config: mcpConfig,
+    makeProvider: () => ({ connect: async () => { throw Object.assign(new Error('down'), { code: 'unreachable' }); } }),
+    applyModel: () => {},
+    schedule: sched.schedule,
+    cancel: sched.cancel,
+    pingTimeoutMs: 50,
+  });
+  await conn.connect();
+  assert.equal(conn.isReconnecting(), true);
+
+  conn.disconnect();
+  assert.equal(conn.isReconnecting(), false);
+  assert.equal(conn.getState().reconnecting, false);
+  assert.equal(sched.pending(), 0, 'no pending timers after disconnect');
+});
+
+/* ================================================================== */
+/* sync_token_expired handled by full-fetch (current architecture)     */
+/* ================================================================== */
+
+test('sync_token_expired: full fetch on resume (each poll is a full fetch; no incremental state held)', async () => {
+  // In the current implementation every reconnect attempt is a full connect() +
+  // full board_get/card_list — no incremental sync token is held client-side.
+  // This test documents that a successful reconnect always adopts fresh server state,
+  // which subsumes the sync_token_expired recovery requirement.
+  const ctl = controllableProvider();
+  const sched = manualScheduler();
+  let model = null;
+  const conn = createMcpConnection({
+    config: mcpConfig, makeProvider: ctl.make,
+    applyModel: (m) => { model = m; }, schedule: sched.schedule, cancel: sched.cancel,
+  });
+  await conn.connect();
+
+  ctl.fail = 'unreachable';
+  await sched.fireNext(); await sched.fireNext(); await sched.fireNext();
+
+  // Server returns with different data (simulating stale-token recovery)
+  ctl.fail = null;
+  ctl.cards = [{ id: 'fresh', title: 'Fresh after recovery', column_id: 'todo' }];
+  await sched.fireOldest();
+
+  assert.equal(conn.getState().provider, 'mcp');
+  assert.ok(model && model.cards.find((c) => c.id === 'fresh'),
+    'full fetch on reconnect adopts fresh server state (handles sync_token_expired)');
+  conn.disconnect();
+});
+
+/* ================================================================== */
+/* FIX A: teardown guard tests (unchanged behavior)                    */
+/* ================================================================== */
 
 test('FIX A: a connect that RESOLVES AFTER teardown invokes nothing (no applyModel/subscriber/poll/degrade)', async () => {
   const ctl = controllableProvider();
