@@ -18,10 +18,7 @@ import {
   createMcpConnectionFromConfig,
   toBoardColumns,
   LOCAL_INDICATOR,
-  MCP_UNAVAILABLE_INDICATOR,
   LOCAL_RETRYING_INDICATOR,
-  LOCAL_SERVER_REACHABLE_INDICATOR,
-  mcpReconnectingIndicator,
 } from './mcp-connection.js';
 
 /** A makeProvider bound to a harness — the controller owns connect()/timeout. */
@@ -163,14 +160,13 @@ test('unreachable server → enters retry loop (LOCAL_RETRYING, not one-shot Loc
 
   // Background retry fires (server now up) → serverReachable emitted
   up = true;
-  let applied = 0;
   await sched.fireOldest(); // fire the backoff timer
   const ready = conn.getState();
   assert.equal(ready.serverReachable, true, 'server came back → serverReachable');
   assert.equal(ready.reconnecting, false);
 
   // switchToMcp() completes the transition
-  conn.applyModel = (m) => { applied += 1; };
+  conn.applyModel = () => {};
   // Reconstruct with applyModel wired
   conn.disconnect();
   await harness.close();
@@ -400,9 +396,7 @@ test('backoff schedule: first retry fires at ~5s step, second at ~10s step', asy
   // (The backoff timer is scheduled by enterReconnecting after 3rd strike)
   // We can verify the delays array captured a ~5000ms backoff timer.
   // Manually drive strikes via degradeOnFatal:
-  const fatalErr = Object.assign(new Error('fetch failed'), { code: 'unreachable', fatalKind: 'unreachable' });
   // Simulate 3 poll-path fatals
-  const degradeViaOnFatal = () => { if (ctl.onFatal) ctl.onFatal(fatalErr); };
   // Need pollInFlight = true for the strike to count; simulate via provider call sequence.
   // Easier: just verify the delay range after entering via the full flow.
   // Use a real manual scheduler for polling, then check the backoff delay.
@@ -703,7 +697,6 @@ test('retryNow: resets backoff and fires immediately, resumes on success', async
   // Server comes back; retryNow fires without waiting for backoff
   ctl.fail = null;
   ctl.cards = [{ id: 'retry-card', title: 'R', column_id: 'todo' }];
-  const pendingBefore = sched.pending();
   // retryNow() returns a promise that resolves when attemptReconnect + startPolling complete
   await conn.retryNow();
 
