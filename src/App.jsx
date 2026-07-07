@@ -1062,7 +1062,7 @@ function FilterBar({ tags, filters, setFilters, showArchived, onToggleShowArchiv
 /* ============================================================
    TASK CARD
    ============================================================ */
-function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, dropIndicator, onMoveRequest, readOnly }) {
+function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, dropIndicator, onMoveRequest, readOnly, allTasks }) {
   const C = useTheme();
   const hasDue = task.dueDate != null;
   const due = hasDue ? startOfDay(new Date(task.dueDate)) : null;
@@ -1097,6 +1097,13 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
   const badge = task.badge && task.badge.kind === 'escalation' ? task.badge : null;
   const escalated = !!badge;
   const denied = !!badge && badge.status === 'denied';
+
+  // depends_on badge: "waiting on N" with tooltip listing dep titles.
+  const deps = task.depends_on || [];
+  const depInfos = deps.map((id) => {
+    const dep = (allTasks || []).find((t) => t.id === id);
+    return { id, dep };
+  });
 
   // Long-press → move (narrow board ONLY). These Pointer Event handlers attach only
   // when BoardView passes onMoveRequest; Matrix and desktop omit it, so nothing is
@@ -1272,6 +1279,22 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
                 <span>{checklistDone}/{checklist.length}</span>
               </div>
             )}
+            {depInfos.length > 0 && (
+              <div
+                title={depInfos.map(({ id, dep }) =>
+                  dep
+                    ? (dep.status === 'done' || dep.status === 'delivered' ? `✓ ${dep.title}` : dep.title)
+                    : `? ${id}`
+                ).join('\n')}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 3,
+                  fontFamily: F.mono, fontSize: 10, color: C.textDim,
+                  letterSpacing: '0.04em',
+                }}>
+                <span style={{ opacity: 0.7 }}>⏳</span>
+                <span>waiting on {depInfos.length}</span>
+              </div>
+            )}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             {qDef && (
@@ -1385,7 +1408,7 @@ function QuickAdd({ colId, onAdd }) {
 /* ============================================================
    BOARD VIEW
    ============================================================ */
-function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, readOnly, canCreate, sweep }) {
+function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, readOnly, canCreate, sweep, allTasks }) {
   const C = useTheme();
   const narrow = useNarrow();
   const [draggedId, setDraggedId] = useState(null);
@@ -1567,6 +1590,7 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, read
                   dropIndicator={dropTarget?.type === 'card' && dropTarget.id === t.id}
                   onMoveRequest={(narrow && !readOnly) ? setMoveTask : undefined}
                   readOnly={readOnly}
+                  allTasks={allTasks}
                 />
               ))}
               {isDropCol && (
@@ -2548,6 +2572,108 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
                 </div>
               );
             })}
+            {/* Dependency edges SVG overlay — arrows from required card's bar right
+                edge to dependent card's bar left edge, for cards visible in the current
+                window. Dangling refs (dep not in rows): greyed stub. Cycles (DFS
+                back-edge): coral + dashed. pointerEvents:none so bars stay clickable. */}
+            {(() => {
+              const hasDeps = rows.some((r) => (r.t.depends_on || []).length > 0);
+              if (!hasDeps) return null;
+
+              const idToIdx = new Map(rows.map((r, i) => [r.t.id, i]));
+
+              // DFS cycle detection over visible rows (depends_on graph).
+              const inCycle = new Set();
+              const visited = new Set();
+              const recStack = new Set();
+              function dfsCycle(i) {
+                if (recStack.has(i)) { inCycle.add(i); return true; }
+                if (visited.has(i)) return inCycle.has(i);
+                visited.add(i); recStack.add(i);
+                let cyclic = false;
+                for (const depId of (rows[i].t.depends_on || [])) {
+                  const j = idToIdx.get(depId);
+                  if (j !== undefined && dfsCycle(j)) { inCycle.add(i); cyclic = true; }
+                }
+                recStack.delete(i);
+                return cyclic;
+              }
+              rows.forEach((_, i) => { if (!visited.has(i)) dfsCycle(i); });
+
+              // For each visible dependent card, draw edges FROM each dep TO this card.
+              const edges = [];
+              rows.forEach((depRow, depIdx) => {
+                const deps = depRow.t.depends_on || [];
+                if (!deps.length) return;
+                const toBarLeft = Math.max(depRow.startIdx, 0) * dayW;
+                const toY = depIdx * ROW_H + ROW_H / 2;
+                const toX = toBarLeft + 2; // left edge of this card's bar
+
+                deps.forEach((reqId) => {
+                  const reqIdx = idToIdx.get(reqId);
+                  const cyclic = inCycle.has(depIdx) || (reqIdx !== undefined && inCycle.has(reqIdx));
+                  if (reqIdx === undefined) {
+                    // Dangling ref — greyed stub at the dependent bar's left
+                    edges.push({ type: 'dangling', toX, toY, cyclic, key: `${depRow.t.id}-${reqId}` });
+                    return;
+                  }
+                  const reqRow = rows[reqIdx];
+                  const fromBarLeft = Math.max(reqRow.startIdx, 0) * dayW;
+                  const reqClipL = reqRow.startIdx < 0 ? -reqRow.startIdx : 0;
+                  const reqClipR = Math.max(0, reqRow.startIdx + reqRow.duration - numDays);
+                  const reqBarW = Math.max(8, (reqRow.duration - reqClipL - reqClipR) * dayW - 4);
+                  const fromX = fromBarLeft + 2 + reqBarW; // right edge of required card's bar
+                  const fromY = reqIdx * ROW_H + ROW_H / 2;
+                  edges.push({ type: 'edge', fromX, fromY, toX, toY, cyclic, key: `${depRow.t.id}-${reqId}` });
+                });
+              });
+
+              if (!edges.length) return null;
+              const svgH = rows.length * ROW_H;
+              const svgW = numDays * dayW;
+
+              return (
+                <svg style={{
+                  position: 'absolute', left: labelW, top: 0,
+                  width: svgW, height: svgH,
+                  pointerEvents: 'none', overflow: 'visible', zIndex: 2,
+                }}>
+                  <defs>
+                    <marker id="dep-arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+                      <path d="M0,0 L6,3 L0,6 Z" fill={C.textDim} fillOpacity="0.6" />
+                    </marker>
+                    <marker id="dep-arrow-cycle" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+                      <path d="M0,0 L6,3 L0,6 Z" fill={C.coral} fillOpacity="0.8" />
+                    </marker>
+                  </defs>
+                  {edges.map((e) => {
+                    const color = e.cyclic ? C.coral : C.textDim;
+                    const opacity = e.cyclic ? 0.7 : 0.45;
+                    const markerId = e.cyclic ? 'dep-arrow-cycle' : 'dep-arrow';
+                    if (e.type === 'dangling') {
+                      return (
+                        <line key={e.key}
+                          x1={e.toX - 4} y1={e.toY - 6}
+                          x2={e.toX - 4} y2={e.toY + 6}
+                          stroke={color} strokeWidth={1.5}
+                          strokeDasharray="2,2" opacity={opacity * 0.6}
+                        />
+                      );
+                    }
+                    const mx = (e.fromX + e.toX) / 2;
+                    return (
+                      <path key={e.key}
+                        d={`M ${e.fromX} ${e.fromY} C ${mx} ${e.fromY}, ${mx} ${e.toY}, ${e.toX} ${e.toY}`}
+                        fill="none" stroke={color} strokeWidth={1.5}
+                        strokeDasharray={e.cyclic ? '4,2' : 'none'}
+                        opacity={opacity}
+                        markerEnd={`url(#${markerId})`}
+                      />
+                    );
+                  })}
+                </svg>
+              );
+            })()}
           </div>
         </div>
       </div>
@@ -2558,13 +2684,14 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
 /* ============================================================
    TASK MODAL
    ============================================================ */
-function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCreateTag, readOnly, mcpWritable, canRetier, onRetier, canResolve, onResolveEscalation, canArchive, canUnarchive, onArchive, onUnarchive }) {
+function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCreateTag, readOnly, mcpWritable, canRetier, onRetier, canResolve, onResolveEscalation, canArchive, canUnarchive, onArchive, onUnarchive, allTasks }) {
   const C = useTheme();
   const [draft, setDraft] = useState(task);
   const [newTagInput, setNewTagInput] = useState(false);
   const [newTagName, setNewTagName] = useState('');
   const [newChecklistText, setNewChecklistText] = useState('');
   const [notesPreview, setNotesPreview] = useState(false);
+  const depsSearchState = useState('');
   // Two-step delete confirm — the MCP-writable tombstone guard (a stray click must
   // not delete a card). Only the MCP path arms it; local delete stays immediate.
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -3123,14 +3250,30 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
               )}
             </div>
 
+            <div>
+              <label style={fieldLabel}>Due</label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input type="date" value={draft.due ? draft.due.slice(0, 10) : ''}
+                  onChange={(e) => setDraft({ ...draft, due: e.target.value || null })}
+                  style={{ ...input, flex: 1, fontFamily: F.mono }} />
+                {draft.due && (
+                  <button type="button" onClick={() => setDraft({ ...draft, due: null })}
+                    style={{
+                      flexShrink: 0, background: 'transparent', border: `1px solid ${C.border}`,
+                      color: C.textMuted, padding: '9px 12px', borderRadius: 7, cursor: 'pointer',
+                      fontFamily: F.mono, fontSize: 11, letterSpacing: '0.06em', textTransform: 'uppercase',
+                    }}>Clear</button>
+                )}
+              </div>
+            </div>
+
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
               <div>
                 <label style={fieldLabel}>Effort</label>
-                <select value={draft.effort || ''}
-                  onChange={(e) => setDraft({ ...draft, effort: e.target.value || undefined })}
+                <select value={draft.effort ?? ''}
+                  onChange={(e) => setDraft({ ...draft, effort: e.target.value || null })}
                   style={{ ...input, cursor: 'pointer' }}>
-                  {/* SET-ONLY: placeholder only while unset; null-clear deferred to card_update null-sentinel pass */}
-                  {!draft.effort && <option value="">—</option>}
+                  <option value="">—</option>
                   <option value="low">Low</option>
                   <option value="med">Med</option>
                   <option value="high">High</option>
@@ -3138,11 +3281,10 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
               </div>
               <div>
                 <label style={fieldLabel}>Impact</label>
-                <select value={draft.impact || ''}
-                  onChange={(e) => setDraft({ ...draft, impact: e.target.value || undefined })}
+                <select value={draft.impact ?? ''}
+                  onChange={(e) => setDraft({ ...draft, impact: e.target.value || null })}
                   style={{ ...input, cursor: 'pointer' }}>
-                  {/* SET-ONLY: same — once impact is set, no return to derived-from-priority */}
-                  {!draft.impact && <option value="">—</option>}
+                  <option value="">—</option>
                   <option value="low">Low</option>
                   <option value="med">Med</option>
                   <option value="high">High</option>
@@ -3169,6 +3311,82 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
                 );
               })()}
             </div>
+
+            {/* Dependencies editor — searchable multi-select over live (non-tombstoned,
+                non-archived) cards, excluding this card itself. Writes full list via
+                card_update depends_on; [] = clear. */}
+            {(() => {
+              const curDeps = draft.depends_on || [];
+              const [depsSearch, setDepsSearch] = depsSearchState;
+              const candidates = (allTasks || []).filter((t) =>
+                t.id !== draft.id &&
+                !t.deleted_at &&
+                !t.archived_at
+              );
+              const q = depsSearch.trim().toLowerCase();
+              const filtered = q
+                ? candidates.filter((t) => t.title.toLowerCase().includes(q))
+                : candidates;
+              const removeDep = (id) => setDraft({ ...draft, depends_on: curDeps.filter((d) => d !== id) });
+              const addDep = (id) => {
+                if (!curDeps.includes(id)) setDraft({ ...draft, depends_on: [...curDeps, id] });
+              };
+              return (
+                <div>
+                  <label style={fieldLabel}>Dependencies</label>
+                  {curDeps.length > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 8 }}>
+                      {curDeps.map((id) => {
+                        const dep = (allTasks || []).find((t) => t.id === id);
+                        return (
+                          <span key={id} style={{
+                            display: 'inline-flex', alignItems: 'center', gap: 4,
+                            padding: '3px 8px', borderRadius: 5,
+                            background: dep ? `${C.ice}18` : `${C.textDim}18`,
+                            border: `1px solid ${dep ? C.ice : C.border}`,
+                            color: dep ? C.ice : C.textDim,
+                            fontFamily: F.mono, fontSize: 10,
+                          }}>
+                            {dep ? dep.title : `${id} (removed)`}
+                            <button type="button" onClick={() => removeDep(id)} style={{
+                              background: 'transparent', border: 'none', color: 'inherit',
+                              cursor: 'pointer', padding: 0, lineHeight: 1, display: 'flex',
+                            }}><X size={10} strokeWidth={1.75} /></button>
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                  <input type="text" value={depsSearch}
+                    onChange={(e) => setDepsSearch(e.target.value)}
+                    placeholder="Search cards to add…"
+                    style={{ ...input, marginBottom: filtered.length ? 4 : 0 }} />
+                  {depsSearch && filtered.length > 0 && (
+                    <div style={{
+                      maxHeight: 140, overflowY: 'auto',
+                      border: `1px solid ${C.border}`, borderRadius: 7,
+                      background: C.bg,
+                    }}>
+                      {filtered.slice(0, 12).map((t) => {
+                        const selected = curDeps.includes(t.id);
+                        return (
+                          <div key={t.id} onClick={() => selected ? removeDep(t.id) : addDep(t.id)} style={{
+                            padding: '7px 12px', cursor: 'pointer', fontSize: 13,
+                            color: selected ? C.ice : C.text,
+                            background: selected ? `${C.ice}12` : 'transparent',
+                            borderBottom: `1px solid ${C.border}30`,
+                            display: 'flex', alignItems: 'center', gap: 6,
+                          }}>
+                            {selected && <span style={{ fontSize: 10, color: C.ice }}>✓</span>}
+                            {t.title}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </fieldset>
         ) : (
         <fieldset disabled={readOnly} style={{
@@ -3243,11 +3461,10 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
             <div>
               <label style={fieldLabel}>Effort</label>
-              <select value={draft.effort || ''}
-                onChange={(e) => setDraft({ ...draft, effort: e.target.value || undefined })}
+              <select value={draft.effort ?? ''}
+                onChange={(e) => setDraft({ ...draft, effort: e.target.value || null })}
                 style={{ ...input, cursor: 'pointer' }}>
-                {/* SET-ONLY: placeholder only while unset; null-clear deferred to card_update null-sentinel pass */}
-                {!draft.effort && <option value="">—</option>}
+                <option value="">—</option>
                 <option value="low">Low</option>
                 <option value="med">Med</option>
                 <option value="high">High</option>
@@ -3255,11 +3472,10 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
             </div>
             <div>
               <label style={fieldLabel}>Impact</label>
-              <select value={draft.impact || ''}
-                onChange={(e) => setDraft({ ...draft, impact: e.target.value || undefined })}
+              <select value={draft.impact ?? ''}
+                onChange={(e) => setDraft({ ...draft, impact: e.target.value || null })}
                 style={{ ...input, cursor: 'pointer' }}>
-                {/* SET-ONLY: same — once impact is set, no return to derived-from-priority */}
-                {!draft.impact && <option value="">—</option>}
+                <option value="">—</option>
                 <option value="low">Low</option>
                 <option value="med">Med</option>
                 <option value="high">High</option>
@@ -3286,6 +3502,80 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
               );
             })()}
           </div>
+
+          {/* Dependencies editor for local/read-only form */}
+          {(() => {
+            const curDeps = draft.depends_on || [];
+            const [depsSearch, setDepsSearch] = depsSearchState;
+            const candidates = (allTasks || []).filter((t) =>
+              t.id !== draft.id &&
+              !t.deleted_at &&
+              !t.archived_at
+            );
+            const q = depsSearch.trim().toLowerCase();
+            const filtered = q
+              ? candidates.filter((t) => t.title.toLowerCase().includes(q))
+              : candidates;
+            const removeDep = (id) => setDraft({ ...draft, depends_on: curDeps.filter((d) => d !== id) });
+            const addDep = (id) => {
+              if (!curDeps.includes(id)) setDraft({ ...draft, depends_on: [...curDeps, id] });
+            };
+            return (
+              <div>
+                <label style={fieldLabel}>Dependencies</label>
+                {curDeps.length > 0 && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 8 }}>
+                    {curDeps.map((id) => {
+                      const dep = (allTasks || []).find((t) => t.id === id);
+                      return (
+                        <span key={id} style={{
+                          display: 'inline-flex', alignItems: 'center', gap: 4,
+                          padding: '3px 8px', borderRadius: 5,
+                          background: dep ? `${C.ice}18` : `${C.textDim}18`,
+                          border: `1px solid ${dep ? C.ice : C.border}`,
+                          color: dep ? C.ice : C.textDim,
+                          fontFamily: F.mono, fontSize: 10,
+                        }}>
+                          {dep ? dep.title : `${id} (removed)`}
+                          <button type="button" onClick={() => removeDep(id)} style={{
+                            background: 'transparent', border: 'none', color: 'inherit',
+                            cursor: 'pointer', padding: 0, lineHeight: 1, display: 'flex',
+                          }}><X size={10} strokeWidth={1.75} /></button>
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+                <input type="text" value={depsSearch}
+                  onChange={(e) => setDepsSearch(e.target.value)}
+                  placeholder="Search cards to add…"
+                  style={{ ...input, marginBottom: filtered.length ? 4 : 0 }} />
+                {depsSearch && filtered.length > 0 && (
+                  <div style={{
+                    maxHeight: 140, overflowY: 'auto',
+                    border: `1px solid ${C.border}`, borderRadius: 7,
+                    background: C.bg,
+                  }}>
+                    {filtered.slice(0, 12).map((t) => {
+                      const selected = curDeps.includes(t.id);
+                      return (
+                        <div key={t.id} onClick={() => selected ? removeDep(t.id) : addDep(t.id)} style={{
+                          padding: '7px 12px', cursor: 'pointer', fontSize: 13,
+                          color: selected ? C.ice : C.text,
+                          background: selected ? `${C.ice}12` : 'transparent',
+                          borderBottom: `1px solid ${C.border}30`,
+                          display: 'flex', alignItems: 'center', gap: 6,
+                        }}>
+                          {selected && <span style={{ fontSize: 10, color: C.ice }}>✓</span>}
+                          {t.title}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
 
           <div>
             <label style={fieldLabel}>Tags</label>
@@ -3468,7 +3758,7 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
 /* ============================================================
    MATRIX VIEW (2x2 effort/impact prioritization)
    ============================================================ */
-function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly }) {
+function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly, allTasks }) {
   const C = useTheme();
   const narrow = useNarrow();
   const [draggedId, setDraggedId] = useState(null);
@@ -3503,7 +3793,7 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly }) {
     e.preventDefault();
     if (!draggedId) return;
     if (target === 'unsorted') {
-      onClassify(draggedId, { effort: undefined, impact: undefined });
+      onClassify(draggedId, { effort: null, impact: null });
     } else {
       const def = QUADRANT_DEFS[target];
       onClassify(draggedId, { effort: def.effort, impact: def.impact });
@@ -3531,6 +3821,7 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly }) {
         isDragging={draggedId === t.id}
         dropIndicator={false}
         readOnly={readOnly}
+        allTasks={allTasks}
       />
     ));
 
@@ -5601,19 +5892,22 @@ export default function App() {
     if (!provider || !model) { surface('No live spine connection — changes not sent.'); return; }
     const cur = model.cards.find((c) => c.id === task.id && !c.deleted_at);
     if (!cur) { surface('That card was deleted'); setEditing(null); return; }
-    // Patch only the spine-Card fields the modal edits (title, acceptance_criteria,
-    // tier, effort, impact) and only those that actually changed. A column change is
-    // a move, not an update — it never travels through here. effort/impact are plain
-    // ungoverned fields on the spine (same as title/AC) — no special validation.
+    // Patch only the spine-Card fields the modal edits and only those that actually
+    // changed. A column change is a move, not an update — it never travels here.
     const patch = {};
     if (task.title !== cur.title) patch.title = task.title;
     if ((task.acceptance_criteria || '') !== (cur.acceptance_criteria || '')) patch.acceptance_criteria = task.acceptance_criteria || '';
     if ((task.tier ?? null) !== (cur.tier ?? null)) patch.tier = task.tier ?? null;
     if ((task.effort ?? null) !== (cur.effort ?? null)) patch.effort = task.effort ?? null;
     if ((task.impact ?? null) !== (cur.impact ?? null)) patch.impact = task.impact ?? null;
+    if ((task.due ?? null) !== (cur.due ?? null)) patch.due = task.due ?? null;
+    // depends_on: order-insensitive diff; [] = clear per spec (null → validation_failed).
+    const taskDepsKey = JSON.stringify([...(task.depends_on || [])].sort());
+    const curDepsKey = JSON.stringify([...(cur.depends_on || [])].sort());
+    if (taskDepsKey !== curDepsKey) patch.depends_on = task.depends_on || [];
     setEditing(null); // close immediately; the edit shows optimistically behind it
     if (Object.keys(patch).length === 0) return; // nothing changed → no write
-    const prior = { title: cur.title, acceptance_criteria: cur.acceptance_criteria, tier: cur.tier, effort: cur.effort, impact: cur.impact }; // CAPTURE
+    const prior = { title: cur.title, acceptance_criteria: cur.acceptance_criteria, tier: cur.tier, effort: cur.effort, impact: cur.impact, due: cur.due ?? null, depends_on: cur.depends_on || [] }; // CAPTURE
     const expected_version = cur.version;
     setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
       c.id === task.id ? { ...c, ...patch } : c) } : m));
@@ -5623,18 +5917,16 @@ export default function App() {
         c.id === task.id ? { ...c, ...card } : c) } : m));
       reconcileSpine();
     } catch (e) {
-      // CONFLICT vs TRANSPORT divergence. A `conflict` means the server already
-      // moved on and carries its fresh card under meta.current — restoring our
-      // captured `prior` would paint a SECOND stale state over a stale one, so we
-      // snap the card TO the server's truth (its values + fresh version, so the
-      // next edit retries with the right expected_version). Any other error
-      // (network/transport) means the write never landed → restore prior.
+      // CONFLICT vs TRANSPORT divergence. A `conflict` snaps the card TO the
+      // server's truth (fresh values + version, so the next edit retries with the
+      // right expected_version). Any other error (network/transport) means the write
+      // never landed → restore prior.
       const fresh = e?.code === 'conflict' && e.meta?.current;
       setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // RECONCILE-or-REVERT (synchronous)
         c.id === task.id
           ? (fresh
             ? { ...c, ...e.meta.current } // SNAP-BACK to server truth
-            : { ...c, title: prior.title, acceptance_criteria: prior.acceptance_criteria, tier: prior.tier, effort: prior.effort, impact: prior.impact }) // REVERT prior
+            : { ...c, title: prior.title, acceptance_criteria: prior.acceptance_criteria, tier: prior.tier, effort: prior.effort, impact: prior.impact, due: prior.due, depends_on: prior.depends_on }) // REVERT prior
           : c) } : m));
       surface(writeError('save', e));
     }
@@ -5929,6 +6221,10 @@ export default function App() {
         if (!cur || cur.deleted_at) { surface('That card was deleted'); return; }
         // Content via update (minimal patch); column change via move.
         const patch = diffPatch(cur, task);
+        // depends_on: order-insensitive diff, not in EDITABLE_FIELDS (JSON.stringify is order-sensitive).
+        const taskDepsKey = JSON.stringify([...(task.depends_on || [])].sort());
+        const curDepsKey = JSON.stringify([...(cur.depends_on || [])].sort());
+        if (taskDepsKey !== curDepsKey) patch.depends_on = task.depends_on || [];
         let version = cur.version;
         if (Object.keys(patch).length) {
           version = store.update(task.id, patch, { expected_version: version }).version;
@@ -6099,8 +6395,8 @@ export default function App() {
       const cur = store.get(taskId);
       if (!cur || cur.deleted_at) { surface('That card was deleted'); return; }
       const patch = {};
-      if ('effort' in update) patch.effort = update.effort; // undefined => unset
-      if ('impact' in update) patch.impact = update.impact;
+      if ('effort' in update) patch.effort = update.effort ?? null;
+      if ('impact' in update) patch.impact = update.impact ?? null;
       store.update(taskId, patch, { expected_version: cur.version });
     });
   };
@@ -6244,6 +6540,7 @@ export default function App() {
           <BoardView tasks={filteredTasks} tags={activeTags} columns={activeColumns}
             onTaskClick={openEdit} onMove={moveTask} onQuickAdd={quickAdd}
             readOnly={mcpReadOnly} canCreate={!mcpActive}
+            allTasks={baseTasks}
             sweep={mcpActive && mcpCanArchive ? {
               columnId: 'delivered',
               count: filteredTasks.filter((t) => t.status === 'delivered' && t.archived_at == null && !t.deleted_at).length,
@@ -6262,7 +6559,8 @@ export default function App() {
           // (effort/impact) now rides the same plain card_update write-through as
           // every other board write — gated on write capability, not on connection.
           <MatrixView tasks={filteredTasks} tags={activeTags}
-            onTaskClick={openEdit} onClassify={classifyTask} readOnly={mcpReadOnly} />
+            onTaskClick={openEdit} onClassify={classifyTask} readOnly={mcpReadOnly}
+            allTasks={baseTasks} />
         )}
         {editing && (
           <TaskModal task={editing} tags={activeTags} columns={activeColumns} isNew={isNew}
@@ -6272,7 +6570,8 @@ export default function App() {
             canRetier={mcpCanRetier} onRetier={retierTaskMcp}
             canArchive={mcpCanArchive} canUnarchive={mcpCanUnarchive}
             onArchive={archiveTaskMcp} onUnarchive={unarchiveTaskMcp}
-            canResolve={mcpCanResolve} onResolveEscalation={handleResolveEscalation} />
+            canResolve={mcpCanResolve} onResolveEscalation={handleResolveEscalation}
+            allTasks={baseTasks} />
         )}
         {/* SettingsModal readOnly=mcpActive (NOT mcpReadOnly): board-config
             (columns/tags) is NOT part of the Pass 2b card write-through, so it stays

@@ -554,7 +554,7 @@ export function createMCPProvider({
      *
      *  card_create is DEFERRED (it needs project-targeting plumbing that does not
      *  exist yet) — intentionally NOT added here; the next slice wires it. */
-    async cardUpdate(id, { title, acceptance_criteria, tier, effort, impact, expected_version } = {}) {
+    async cardUpdate(id, { title, acceptance_criteria, tier, effort, impact, due, depends_on, expected_version } = {}) {
       requireCapability('canWrite');
       // Field-scoped patch: only the keys actually supplied, so an unset field is
       // never clobbered with `undefined`. column_id/order are NOT update fields — a
@@ -563,18 +563,19 @@ export function createMCPProvider({
       if (title !== undefined) patch.title = title;
       if (acceptance_criteria !== undefined) patch.acceptance_criteria = acceptance_criteria;
       // Tier crosses the wire in COLON form; the board edits it in internal HYPHEN
-      // form. Map internal → wire HERE so the spine's strict validator accepts it —
-      // the failing edit sent patch.tier="tier-3" and was rejected validation_failed.
+      // form. Map internal → wire HERE so the spine's strict validator accepts it.
       // A null tier is OMITTED (not forwarded): tier=None means "leave unchanged" on
-      // the spine and _patch_tier_to_int(None) → validation_failed. With read-from-tags
-      // restoring write-once tierLock, untier is unreachable by design anyway — this is
-      // belt-and-suspenders, and keeps the patch consistent with toWirePatch.
+      // the spine. With read-from-tags restoring write-once tierLock, untier is
+      // unreachable by design anyway — belt-and-suspenders.
       if (tier !== undefined && tier !== null) patch.tier = tierInternalToWire(tier);
-      // effort/impact are plain ungoverned fields on the spine — forwarded verbatim
-      // (no wire remap, unlike tier), including an explicit null (unset), since the
-      // spine treats them as ordinary Card fields, not a write-once/validated one.
+      // effort/impact: plain ungoverned fields, forwarded verbatim including null
+      // (key-presence semantics: null = clear, per RFC 7386 / v0.5.0 spec).
       if (effort !== undefined) patch.effort = effort;
       if (impact !== undefined) patch.impact = impact;
+      // due: nullable ISO 8601; null = clear (key-presence semantics).
+      if (due !== undefined) patch.due = due;
+      // depends_on: [] = clear (type-strict per spec; null → validation_failed).
+      if (depends_on !== undefined) patch.depends_on = depends_on;
       return toInternalCard((await call('card_update', { id, patch, expected_version })).card);
     },
     async cardMove(id, toState, { order, expected_version } = {}) {

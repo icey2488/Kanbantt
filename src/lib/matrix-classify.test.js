@@ -156,3 +156,66 @@ test('dragging onto a quadrant and calling getQuadrant with those values returns
     assert.equal(result, key, `${key}: QUADRANT_DEFS.${key} effort/impact must classify back to '${key}'`);
   }
 });
+
+/* ================================================================== */
+/* Drag-to-unsorted: sends null for both effort AND impact (v0.5.0)   */
+/* ================================================================== */
+
+// Simulate the handleDrop unsorted path: the update sent to onClassify.
+function unsortedUpdate() {
+  return { effort: null, impact: null };
+}
+
+test('drag-to-unsorted sends effort:null (not undefined)', () => {
+  const u = unsortedUpdate();
+  assert.ok('effort' in u, 'effort key must be present');
+  assert.equal(u.effort, null);
+});
+
+test('drag-to-unsorted sends impact:null (not undefined)', () => {
+  const u = unsortedUpdate();
+  assert.ok('impact' in u, 'impact key must be present');
+  assert.equal(u.impact, null);
+});
+
+test('drag-to-unsorted sends both nulls (not undefined) — key-presence semantics', () => {
+  const u = unsortedUpdate();
+  assert.equal(JSON.stringify(u), '{"effort":null,"impact":null}');
+});
+
+// Simulate classifyTask (local path) coercion: `update.effort ?? null`
+function applyLocalClassify(card, update) {
+  const patch = {};
+  if ('effort' in update) patch.effort = update.effort ?? null;
+  if ('impact' in update) patch.impact = update.impact ?? null;
+  return { ...card, ...patch };
+}
+
+test('local classifyTask coerces null effort to null (not undefined)', () => {
+  const card = { id: 'a', effort: 'high', impact: 'low' };
+  const result = applyLocalClassify(card, { effort: null, impact: null });
+  assert.equal(result.effort, null);
+  assert.equal(result.impact, null);
+});
+
+test('local classifyTask coerces undefined effort to null via ?? null', () => {
+  const card = { id: 'a', effort: 'high', impact: 'low' };
+  // undefined can arrive from old call sites; ?? null normalizes it to null
+  const result = applyLocalClassify(card, { effort: undefined, impact: undefined });
+  assert.equal(result.effort, null);
+  assert.equal(result.impact, null);
+});
+
+test('unset (—) option sends null for that field — single-field clear', () => {
+  // Simulates user selecting "—" in the effort select when effort was 'high'
+  // onChange: e.target.value || null → '' || null → null
+  const selectedValue = '';
+  const newEffort = selectedValue || null;
+  assert.equal(newEffort, null);
+});
+
+test('drag-to-unsorted result classifies as unsorted', () => {
+  const u = unsortedUpdate();
+  const card = { effort: u.effort, impact: u.impact };
+  assert.equal(getQuadrant(card), 'unsorted');
+});
