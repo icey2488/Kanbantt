@@ -1,15 +1,17 @@
-<!-- CANONICAL. Home of this contract (kanbantt-app owns it); the Claunker spine keeps a synced copy at claunker-hermes/docs/kanbantt-mcp-spec.md. Bodies verified byte-identical outside this comment 2026-07-03. v0.4.0 (the archive surface) ORIGINATED spine-side on 2026-07-02 — the documented reverse-flow exception — and was back-synced FROM that spine copy VERBATIM on 2026-07-02, closing the drift. Normal flow (kanbantt → spine re-sync on change) resumes from here. -->
+<!-- CANONICAL. Home of this contract (kanbantt-app owns it); the Claunker spine keeps a synced copy at claunker-hermes/docs/kanbantt-mcp-spec.md. Bodies verified byte-identical outside this comment 2026-07-03. v0.4.0 (the archive surface) ORIGINATED spine-side on 2026-07-02 — the documented reverse-flow exception — and was back-synced FROM that spine copy VERBATIM on 2026-07-02, closing the drift. Normal flow (kanbantt → spine re-sync on change) resumes from here. Canonical edited at v0.5.0 on 2026-07-06; re-synced to the claunker copy same day. Normal flow applies. -->
 
 # Kanbantt MCP Specification
 
-**Version:** 0.4.0
-**Date:** 2026-07-02
+**Version:** 0.5.0
+**Date:** 2026-07-06
 **Author:** Erick M. Gonzales
 **Schema Version:** 1
 **Status:** Private draft — breaking changes permitted until public release
 **Supersedes:** kanbantt-provider-spec.md v0.1.0 (REST contract, retired)
 **Parent Doc:** claunker-foundation.md
 **MCP Revision Pinned:** 2025-06-18 (verify latest before public release)
+
+**Changes in v0.5.0:** (a) `card_update` patch adopts RFC 7386 key-presence semantics: key absent = unchanged, key present with `null` = CLEAR; clearable set enumerated: `due`, `effort`, `impact`; `depends_on` clears via `[]` (type-strict; `null` → `validation_failed`); guarded set: `tier`, `archived_at`, `deleted_at` — present-null → `validation_failed` naming the governed tool (`card_retier`, `card_archive`/`card_unarchive`, `card_delete`). (b) Card gains `depends_on: [card-id]`, empty default — display-only dependency metadata (no server-side transition gating); dangling refs render greyed and are never stripped from storage; self-reference rejected at write; cycles flagged at render, never blocked at write; clears via `[]`. (c) Reserves the append-only generic card-edit audit ledger `{ card_id, field, old, new, actor, ts }` covering `due`, `effort`, `impact`, `depends_on` mutations, recorded server-side atomically with each set/change/clear; no read API this version (same stance as the tier- and archive-audit ledgers). Data `schema_version` unchanged: new fields are additive (nullable or empty-default).
 
 **Changes in v0.4.0:** Adds the governed, audited archive pair `card_archive` / `card_unarchive`, gated on the new `canArchive` capability (derived from `card_archive` alone); adds the nullable `archived_at` Card field — an orthogonal flag mirroring `deleted_at`'s shape, NOT a lifecycle state (an archived card keeps its `column_id`); adds `include_archived` to `card_list` (archived cards omitted from full fetches by default, composing with `include_deleted`); and reserves the append-only archive-audit ledger (recorded server-side, no read API this version, same stance as the tier-audit ledger). Data `schema_version` is unchanged: `archived_at` is nullable-with-null-default, so v1 blobs load untouched.
 
@@ -67,6 +69,7 @@ A single schema serves as the wire shape, the Drive blob shape, and the localSto
   "priority": "low | med | high",
   "effort": "low | med | high | null",
   "impact": "low | med | high | null",
+  "depends_on": ["card-id"],
   "version": "opaque string",
   "deleted_at": "ISO 8601 | null",
   "archived_at": "ISO 8601 | null",
@@ -85,6 +88,7 @@ Field rules:
 - **`version`** — opaque token minted by the authority (server, or LocalProvider) on every mutation. Clients MUST NOT generate, parse, or compare these except for equality. This is the sole concurrency primitive.
 - **`deleted_at`** — non-null marks a tombstone. Tombstoned cards are soft-deleted; hard deletion is server housekeeping outside this protocol (see Tombstones).
 - **`archived_at`** — non-null marks an ARCHIVED card: an orthogonal nullable flag mirroring `deleted_at`'s shape, NOT a lifecycle state. An archived card keeps its `column_id` and all other fields; it is merely omitted from default `card_list` full fetches (see `include_archived`). Set/cleared ONLY through the governed `card_archive` / `card_unarchive` pair — never via `card_update` patch. Archived ≠ deleted: an archived card is live, mutable, and unarchivable; the two flags are independent and compose.
+- **`depends_on`** — list of card ids this card depends on; empty list by default. Display-only in v1: the server does NOT gate state transitions on dependency state — the field is stored, projected, and rendered (timeline edges, board badge "waiting on") but enforces no ordering. Plain refs; the merge never rewrites them. Dangling refs (tombstoned or unknown card ids) render greyed at the client and are NEVER stripped from storage. Self-reference (a card depending on itself) is rejected at write (`validation_failed`). Cycles are flagged at render, never blocked at write. Clears via `[]` (sending `null` → `validation_failed` per the patch guarded-set rule).
 - **`created_at` / `updated_at`** — display metadata ONLY. MUST NOT be used for synchronization, conflict detection, or ordering decisions.
 - **`created_by` / `updated_by`** — stamped by the authority on mutation. Servers SHOULD derive actor identity from the authenticated context; agents SHOULD identify with a stable id.
 - **`attachments`** — reserved shape, optional in v1. Large objects live in external storage; the blob carries references only. No v1 tool operates on attachments beyond round-tripping the field.
@@ -238,7 +242,8 @@ Escalations and artifacts referencing a **tombstoned** card remain valid and ret
 - `expected_version` is REQUIRED. On mismatch the server returns a `conflict` error carrying the current card so the client can re-merge without an extra round trip.
 - `force: true` (update/move only) skips the version check. Clients MUST NOT default to force.
 - **Tombstoned cards are immutable.** Any `card_update`, `card_move`, or `card_delete` targeting a tombstone MUST fail with `conflict` (meta carries the tombstone), even with `force: true`. There is no undelete in v1; resurrection, if ever supported, is a v2 tool with its own semantics.
-- **Tier is write-once on `card_update`.** A `patch.tier` that DIFFERS from the card's current set tier MUST fail with `validation_failed` — a set tier changes only through the governed `card_retier`. The free initial classification (an untiered card → its first tier) is allowed; a same-value `patch.tier`, or a patch with no `tier` key, is unaffected. Enforced server-side, so it holds even if a client bypasses any UI lock; `force` does NOT bypass it (force gates only the version check). The check runs AFTER the not-found / tombstone / version gate, so a tombstoned or stale target is still a `conflict`, not a validation error.
+- **Patch semantics — RFC 7386 key-presence (`card_update` only):** key ABSENT → field unchanged; key PRESENT with `null` → **clear the field**. Clearable set (all nullable): `due`, `effort`, `impact`. `depends_on` clears via `[]` (type-strict: sending `null` for `depends_on` → `validation_failed`). **Guarded set** — `tier`, `archived_at`, `deleted_at`: a key present with `null` → `validation_failed`, naming the governed tool that owns that field (`card_retier`, `card_archive`/`card_unarchive`, `card_delete` respectively). These fields move only through their governed tools; the back-door lifecycle mutation via patch-null is explicitly closed. **Client obligation:** never send a key you do not mean — a key's presence IS the intent signal.
+- **Tier is write-once on `card_update`.** A `patch.tier` that DIFFERS from the card's current set tier MUST fail with `validation_failed` — a set tier changes only through the governed `card_retier`. The free initial classification (an untiered card → its first tier) is allowed; a same-value `patch.tier`, or a patch with no `tier` key, is unaffected. Enforced server-side, so it holds even if a client bypasses any UI lock; `force` does NOT bypass it (force gates only the version check). The check runs AFTER the not-found / tombstone / version gate, so a tombstoned or stale target is still a `conflict`, not a validation error. This value-change guard is separate from and additive to the null guard above: both apply independently.
 
 **Deletion:**
 - Soft-delete only at the protocol level: `card_delete` sets `deleted_at` and mints a new `version`.
@@ -356,7 +361,7 @@ Client handling:
 - **Batch operations** — `card_batch` as a future optional tool.
 - **OAuth 2.1** — release-gating item.
 - **Attachment transfer** — schema shape reserved; no transfer tools.
-- **Audit log API** — actor fields make it buildable server-side, and `card_retier` / `card_archive` / `card_unarchive` now WRITE append-only tier- and archive-audit ledgers; there is still no protocol READ surface (record now, render later — a history tool is a later version).
+- **Audit log API** — actor fields make it buildable server-side, and `card_retier` / `card_archive` / `card_unarchive` now WRITE append-only tier- and archive-audit ledgers; a generic card-edit audit ledger also now WRITES on every `due`, `effort`, `impact`, `depends_on` set/change/clear via `card_update`; there is still no protocol READ surface for any of these (record now, render later — a history tool is a later version).
 - **CRDT / collaborative editing** — version tokens + fractional ordering cover current scenarios; CRDT is the escalation path only if live co-editing becomes a goal.
 
 ---
