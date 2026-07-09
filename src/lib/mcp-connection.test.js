@@ -19,6 +19,8 @@ import {
   toBoardColumns,
   LOCAL_INDICATOR,
   LOCAL_RETRYING_INDICATOR,
+  MCP_UNAVAILABLE_INDICATOR,
+  AUTH_REJECTED_INDICATOR,
 } from './mcp-connection.js';
 
 /** A makeProvider bound to a harness — the controller owns connect()/timeout. */
@@ -595,6 +597,12 @@ test('FIX C: a fatal "auth" on the poll degrades immediately to Local (no strike
   assert.equal(conn.getState().reconnecting, false, 'auth does not start retry loop');
   assert.equal(conn.isPolling(), false);
   assert.equal(conn.isReconnecting(), false);
+  // Indicator must be distinct from unreachable (the live-incident same-signal defect)
+  assert.equal(conn.getState().indicator, AUTH_REJECTED_INDICATOR,
+    'mid-session auth degrades to AUTH_REJECTED indicator, not MCP_UNAVAILABLE');
+  assert.notEqual(conn.getState().indicator, MCP_UNAVAILABLE_INDICATOR,
+    'AUTH_REJECTED and UNREACHABLE must not emit the same signal');
+  assert.equal(sched.pending(), 0, 'no retry timer scheduled after mid-session auth rejection');
 });
 
 test('FIX C: a user-op "unreachable" degrades immediately to Local (strike tolerance is poll-only)', async () => {
@@ -936,6 +944,121 @@ test('Auth v1: reload without remembered token → no Authorization header (no a
   });
   await conn.connect();
   assert.equal(getAuth(), null, 'no token provided → no Authorization header');
+  conn.disconnect();
+  await harness.close();
+});
+
+/* ================================================================== */
+/* AUTH_REJECTED state — distinguishes 401 from unreachable           */
+/* ================================================================== */
+
+test('AUTH_REJECTED: 401 at initial connect → AUTH_REJECTED state, no retry timer scheduled', async () => {
+  const sched = manualScheduler();
+  const conn = createMcpConnection({
+    config: mcpConfig,
+    makeProvider: () => ({
+      connect: async () => { throw Object.assign(new Error('Unauthorized'), { code: 'auth' }); },
+    }),
+    applyModel: () => {},
+    schedule: sched.schedule,
+    cancel: sched.cancel,
+  });
+  const st = await conn.connect();
+  assert.equal(st.indicator, AUTH_REJECTED_INDICATOR, '401 at connect → AUTH_REJECTED indicator');
+  assert.equal(st.provider, 'local');
+  assert.equal(st.fallback, true);
+  assert.equal(st.reconnecting, false, '401 does not start retry loop');
+  assert.equal(st.error && st.error.code, 'auth');
+  assert.equal(conn.isReconnecting(), false);
+  // Removing the auth guard in activate() would call enterInitialFailureRetrying,
+  // which schedules a backoff timer → this assertion goes RED.
+  assert.equal(sched.pending(), 0, 'no retry timer scheduled — removing the halt makes this RED');
+});
+
+test('UNREACHABLE: network failure at initial connect → retry IS scheduled (regression guard)', async () => {
+  const sched = manualScheduler();
+  const conn = createMcpConnection({
+    config: mcpConfig,
+    makeProvider: () => ({
+      connect: async () => { throw Object.assign(new Error('Failed to fetch'), { code: 'unreachable' }); },
+    }),
+    applyModel: () => {},
+    schedule: sched.schedule,
+    cancel: sched.cancel,
+  });
+  const st = await conn.connect();
+  assert.equal(st.indicator, LOCAL_RETRYING_INDICATOR, 'unreachable at connect → RETRYING indicator');
+  assert.equal(st.reconnecting, true, 'unreachable enters retry loop');
+  // Removing the retry for unreachable would leave pending() === 0 → this goes RED.
+  assert.ok(sched.pending() > 0, 'retry timer IS scheduled for unreachable — removing it makes this RED');
+  conn.disconnect();
+});
+
+test('AUTH_REJECTED and UNREACHABLE emit distinct indicator strings (same-signal defect guard)', () => {
+  // Removing AUTH_REJECTED_INDICATOR or collapsing it to MCP_UNAVAILABLE_INDICATOR
+  // makes this assertion RED — the test exists specifically for the live incident.
+  assert.notEqual(AUTH_REJECTED_INDICATOR, LOCAL_RETRYING_INDICATOR,
+    'auth-rejected and retrying must not emit the same signal');
+  assert.notEqual(AUTH_REJECTED_INDICATOR, MCP_UNAVAILABLE_INDICATOR,
+    'auth-rejected and unavailable must not emit the same signal');
+});
+
+test('AUTH_REJECTED: retryNow() from auth-rejected fires a fresh connect (explicit manual retry)', async () => {
+  let calls = 0;
+  const sched = manualScheduler();
+  const harness = createMcpTestServer({ seed: oneCard });
+  // First attempt: 401. Second attempt (after retryNow): succeeds.
+  const makeProvider = (hooks) => {
+    calls += 1;
+    if (calls === 1) {
+      return { connect: async () => { throw Object.assign(new Error('Unauthorized'), { code: 'auth' }); } };
+    }
+    return createMCPProvider({ baseUrl: harness.url, fetchFn: harness.fetchFn, onFatal: hooks.onFatal });
+  };
+  const conn = createMcpConnection({
+    config: mcpConfig,
+    makeProvider,
+    applyModel: () => {},
+    schedule: sched.schedule,
+    cancel: sched.cancel,
+  });
+  const st = await conn.connect();
+  assert.equal(st.indicator, AUTH_REJECTED_INDICATOR, 'starts in AUTH_REJECTED');
+  assert.equal(sched.pending(), 0, 'no auto-retry scheduled');
+
+  // Explicit manual retry (user clicks RETRY chip or saves connection settings)
+  const st2 = await conn.retryNow();
+  assert.equal(st2.provider, 'mcp', 'retryNow from AUTH_REJECTED fires a fresh connect');
+  assert.equal(st2.reconnecting, false);
+  conn.disconnect();
+  await harness.close();
+});
+
+test('AUTH_REJECTED: saving connection settings (retry()) triggers a fresh connect attempt', async () => {
+  let calls = 0;
+  const harness = createMcpTestServer({ seed: oneCard });
+  const makeProvider = (hooks) => {
+    calls += 1;
+    if (calls === 1) {
+      return { connect: async () => { throw Object.assign(new Error('Unauthorized'), { code: 'auth' }); } };
+    }
+    return createMCPProvider({ baseUrl: harness.url, fetchFn: harness.fetchFn, onFatal: hooks.onFatal });
+  };
+  const conn = createMcpConnection({
+    config: mcpConfig,
+    makeProvider,
+    applyModel: () => {},
+    schedule: manualScheduler().schedule,
+    cancel: () => {},
+  });
+  await conn.connect();
+  assert.equal(conn.getState().indicator, AUTH_REJECTED_INDICATOR);
+
+  // conn.retry() == conn.connect() == activate() — the path handleSpineConnect takes
+  // (it re-creates the whole connection, which calls activate() on the new instance).
+  // Here we call retry() directly as the equivalent re-connect entry point.
+  const st = await conn.retry();
+  assert.equal(st.provider, 'mcp', 'retry() from AUTH_REJECTED re-connects successfully');
   conn.disconnect();
   await harness.close();
 });

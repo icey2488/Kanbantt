@@ -35,6 +35,7 @@ export const LOCAL_INDICATOR = 'Local';
 export const MCP_UNAVAILABLE_INDICATOR = 'Local (MCP unavailable)';
 export const LOCAL_RETRYING_INDICATOR = 'Local (MCP unavailable · retrying…)';
 export const LOCAL_SERVER_REACHABLE_INDICATOR = 'Local (MCP unavailable · server reachable)';
+export const AUTH_REJECTED_INDICATOR = 'Local (MCP auth rejected)';
 export const mcpIndicator = (name) => `MCP: ${name}`;
 export const mcpReconnectingIndicator = (name) => `MCP: ${name} (reconnecting…)`;
 
@@ -156,6 +157,7 @@ export function createMcpConnection({
   let savedCaps = null;           // last capabilities (kept for reads during reconnecting)
   let savedFlags = null;          // last featureFlags
   let wasConnected = false;       // did we ever reach a live MCP state?
+  let authRejected = false;       // true while in AUTH_REJECTED state (no auto-retry; explicit only)
   // Initial-load recovery: when the background retry succeeds but local edits were
   // made, we park the new provider here and surface a "switch?" affordance instead of
   // auto-switching. App.jsx checks its own localEdited tracking and may call switchToMcp().
@@ -169,6 +171,21 @@ export function createMcpConnection({
       serverReachable: false,
       indicator: fallback ? MCP_UNAVAILABLE_INDICATOR : LOCAL_INDICATOR,
       fallback: !!fallback,
+      server: null,
+      capabilities: null,
+      featureFlags: LOCAL_FLAGS,
+      error: error || null,
+    };
+  }
+
+  function authRejectedState(error) {
+    return {
+      provider: 'local',
+      reconnecting: false,
+      authRejected: true,
+      serverReachable: false,
+      indicator: AUTH_REJECTED_INDICATOR,
+      fallback: true,
       server: null,
       capabilities: null,
       featureFlags: LOCAL_FLAGS,
@@ -343,7 +360,7 @@ export function createMcpConnection({
 
     if (kind === 'auth') {
       // Deterministic: a rejected token never heals. Stop any retry loop and
-      // fall back to Local permanently regardless of current state.
+      // fall back to AUTH_REJECTED permanently regardless of current state.
       stopReconnect();
       unreachableStrikes = 0;
       stopPolling();
@@ -352,7 +369,8 @@ export function createMcpConnection({
         try { provider.disconnect(); } catch { /* best effort */ }
       }
       provider = null;
-      state = localState(true, { code: 'auth', message: (err && err.message) || 'authentication failed' });
+      authRejected = true;
+      state = authRejectedState({ code: 'auth', message: (err && err.message) || 'authentication failed' });
       emit();
       return;
     }
@@ -451,6 +469,7 @@ export function createMcpConnection({
   async function activate() {
     // Reset any in-progress reconnect loop (manual retry or fresh connect).
     stopReconnect();
+    authRejected = false;
     // Discard any pending initial-load provider that the user hasn't accepted yet.
     if (pendingMcpProvider) {
       try { pendingMcpProvider.disconnect(); } catch { /* best effort */ }
@@ -501,11 +520,19 @@ export function createMcpConnection({
       await startPolling();
       return getState();
     } catch (e) {
-      console.warn('MCP connect failed; entering retry loop:', (e && e.message) || e, e);
-      // Instead of one-shot parking in Local, enter a background retry loop.
-      // The user can use Local mode (or read the local board) while retrying.
       if (!disposed) {
-        enterInitialFailureRetrying({ code: e.code || 'unreachable', message: e.message });
+        if (e.code === 'auth') {
+          // A 401 at connect time is a deterministic verdict: retrying with the same
+          // credential cannot succeed. Enter AUTH_REJECTED immediately — no backoff loop.
+          authRejected = true;
+          state = authRejectedState({ code: 'auth', message: e.message });
+          emit();
+        } else {
+          // Network / unreachable / incompatible — enter a background retry loop so the
+          // user can keep using Local mode while the spine recovers.
+          console.warn('MCP connect failed; entering retry loop:', (e && e.message) || e, e);
+          enterInitialFailureRetrying({ code: e.code || 'unreachable', message: e.message });
+        }
       }
       return getState();
     }
@@ -521,6 +548,7 @@ export function createMcpConnection({
       // double unmount/remount — a second call is a no-op.
       if (disposed) return;
       disposed = true;
+      authRejected = false;
       // Kill the reconnect backoff loop before anything else.
       stopReconnect();
       if (pendingMcpProvider) {
@@ -545,8 +573,12 @@ export function createMcpConnection({
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
 
     /** Manual "retry now" affordance on the reconnect indicator. Cancels any pending
-     *  backoff timer and fires an immediate reconnect attempt, resetting the step count. */
+     *  backoff timer and fires an immediate reconnect attempt, resetting the step count.
+     *  Also serves as the explicit manual retry from AUTH_REJECTED state: the token may
+     *  have been updated in memory (e.g. the user pasted a new token elsewhere), so an
+     *  explicit retry is always honoured — it calls activate() fresh. */
     retryNow() {
+      if (authRejected) return activate(); // explicit retry from AUTH_REJECTED: fresh connect
       if (!reconnecting || disposed) return Promise.resolve();
       if (reconnectHandle != null) { cancel(reconnectHandle); reconnectHandle = null; }
       reconnectAttempt = 0;

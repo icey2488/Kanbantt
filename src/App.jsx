@@ -633,14 +633,20 @@ function SpineChip({ state, onRetryNow }) {
   const reconnecting = !!state.reconnecting;
   const serverReachable = !!state.serverReachable;
   const fallback = !!state.fallback;
+  const isAuthRejected = fallback && !!(state.error && state.error.code === 'auth');
   // Amber when: mid-session reconnecting, initial-load retrying, server-reachable prompt
-  const isAmber = (active && reconnecting) || (!active && (fallback || serverReachable));
-  const tint = active && !reconnecting ? C.mint : isAmber ? C.amber : C.textDim;
+  // Coral when: auth rejected (credential failure — distinct from unreachable)
+  const isAmber = !isAuthRejected && ((active && reconnecting) || (!active && (fallback || serverReachable)));
+  const tint = active && !reconnecting ? C.mint : isAuthRejected ? C.coral : isAmber ? C.amber : C.textDim;
   const Icon = reconnecting ? RefreshCw : active ? Cloud : (fallback || serverReachable) ? AlertTriangle : Cloud;
-  // "retry now" appears during any retry-loop state (mid-session reconnecting or initial-load retrying)
+  // "retry now" appears during any retry-loop state (mid-session reconnecting, initial-load
+  // retrying, or auth-rejected — auth-rejected retry is explicit-only, never auto).
   const canRetry = (reconnecting || (fallback && !serverReachable)) && onRetryNow;
+  const chipTitle = isAuthRejected
+    ? 'Spine rejected the token. Re-enter it in Connection settings.'
+    : state.error ? `${state.error.code}: ${state.error.message}` : state.indicator;
   return (
-    <span title={state.error ? `${state.error.code}: ${state.error.message}` : state.indicator}
+    <span title={chipTitle}
       style={{
         display: 'flex', alignItems: 'center', gap: narrow ? 0 : 6, padding: '5px 9px',
         background: `${tint}1f`, border: `1px solid ${tint}55`, borderRadius: 8,
