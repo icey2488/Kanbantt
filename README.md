@@ -1,48 +1,37 @@
 # Kanbantt
 
-Local-first kanban board with calendar, timeline, Gantt, and matrix views. All board data lives in the browser; Google Drive JSON sync is available as an opt-in persistence layer. An MCP spine can be connected to use any conforming remote server as the backend instead.
+A client-side kanban board with four views and three storage modes. No accounts, no backend required.
 
-## Views
+- **Board / Calendar / Timeline / Matrix** — four views over the same cards
+- **Local mode** (default): all data lives in your browser's localStorage; works offline, zero setup
+- **Google Drive sync** (optional): convergent sync across devices and browsers via your own Drive
+- **MCP mode** (optional): the board becomes a live client of any MCP server implementing the Kanbantt board contract
 
-| View | Description |
-|------|-------------|
-| Board | Drag-and-drop columns with quick-add and card filtering |
-| Calendar | Monthly/weekly/daily layout with due dates |
-| Timeline | Rolling agenda |
-| Gantt | Duration bars over a scrollable date axis |
-| Matrix | Effort × impact quadrant (Do/Schedule/Delegate/Drop) |
+Live instance: https://kanbantt.icehunter.net
 
-## Storage
+## Quickstart (dev)
 
-**Local (default).** Cards, columns, and tags are stored in `localStorage` as a versioned blob (`kanbantt:v1`). No account or server required.
-
-**Google Drive sync.** Sign in with Google from the header. The board blob is stored as a JSON file in your Drive and synced on a configurable interval. Conflict resolution is deterministic and CRDTish (last-write-wins on a per-card basis with a content hash for identical-state fast-path).
-
-## MCP spine (BYO backend)
-
-Open **Settings → Connection** and enter the URL of any MCP server that implements the Kanbantt card contract. The contract is defined in [`docs/kanbantt-mcp-spec.md`](docs/kanbantt-mcp-spec.md) (v0.4.0). Any server speaking that protocol can serve as the backend — the UI has no dependency on a specific implementation.
-
-Capabilities are negotiated at connection time; the UI degrades gracefully when a server advertises a subset (e.g. read-only, no archive support).
-
-## Dev commands
-
-```sh
-npm install        # install dependencies
-npm run dev        # Vite dev server (http://localhost:5173)
-npm test           # Node test runner — src/lib/*.test.js
-npm run build      # production build → dist/
-npm run lint       # ESLint
-npm run preview    # preview the production build locally
+```
+npm install
+npm run dev
 ```
 
-## Deployment
+Tests: `npm test` · Lint: `npm run lint` · Production build: `npm run build`
 
-Deployed on Cloudflare Pages. The `functions/api/auth/exchange.js` Pages Function handles the Google OAuth authorization-code exchange server-side (PKCE, keeps the client secret off the browser). Set the `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` environment variables in the Cloudflare Pages dashboard.
+## Storage modes
 
-The `public/_headers` file configures the Content Security Policy and security headers; it is copied into the build output as `/_headers` by Vite's `publicDir` passthrough.
+**Local.** The default. One localStorage blob per browser profile. Nothing leaves your machine. No connection required, ever.
 
-Build command: `npm run build`. Output directory: `dist`.
+**Google Drive sync.** Click Connect Google in the toolbar. Uses the `drive.file` scope, so the app can only see the file it creates. Concurrent edits from multiple devices merge convergently; a genuine same-card conflict surfaces as a blocking choice in the UI, never a silent auto-merge.
 
-## License
+**MCP.** Point the board at an MCP server (a "spine") in Connection settings: server URL plus Bearer token. The board polls the server and renders its state as the source of truth; Local mode remains available as a fallback if the server is unreachable.
 
-[PolyForm Noncommercial 1.0.0](LICENSE). Non-commercial use only. Contact for commercial licensing.
+## Bring your own spine (MCP mode)
+
+The board speaks a documented MCP contract: [docs/kanbantt-mcp-spec.md](docs/kanbantt-mcp-spec.md). Any server that conforms can drive the board.
+
+Implementing a server? Start with [docs/BYO-SPINE.md](docs/BYO-SPINE.md): the short list of requirements that make a spec-conformant server actually work from a browser client (CORS, session headers, version tokens), plus how the board reports failures while you debug.
+
+## Token handling
+
+Bearer tokens are held in memory by default and forgotten on reload. "Remember on this device" is opt-in and stores the token in this browser's localStorage. Tokens are only ever sent to the spine URL you configured.
