@@ -27,3 +27,14 @@ dist-ssr
 # Scratch / migration backups
 *.bak
 *.bak.*
+
+# Secrets / credentials (repo is public — never commit these)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*secret*
+credentials*.json
+client_secret*.json
+service-account*.json
