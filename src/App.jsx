@@ -789,9 +789,10 @@ function Header({ view, setView, user, onSignOut, onConnect, gisStatus, onNewTas
         }} title="Settings">
           <Settings size={15} strokeWidth={1.5} />
         </button>
-        {/* New task is a create — shown only in local mode (canCreate). Hidden on
-            ANY live spine: a read-only mirror can't write, and MCP card_create is
-            deferred to the next slice (project-targeting). */}
+        {/* New task (the full modal create) — shown only in local mode (canCreate).
+            Hidden on ANY live spine: a read-only mirror can't write, and on a
+            writable spine board creates are the title-only QUICK-ADD on the intake
+            column (human intake — see createTaskMcp), not this richer modal. */}
         {canCreate && (
         <button onClick={onNewTask} title="New task" aria-label="New task" style={{
           display: 'flex', alignItems: 'center', gap: narrow ? 0 : 6,
@@ -1326,21 +1327,35 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
 /* ============================================================
    QUICK ADD
    ============================================================ */
-function QuickAdd({ colId, onAdd }) {
+function QuickAdd({ colId, onAdd, projects }) {
   const C = useTheme();
   const [active, setActive] = useState(false);
   const [title, setTitle] = useState('');
+  // Project targeting (MCP mode, spec v0.6.0 §Projects): when the spine enumerates
+  // live projects the create MUST land in one — a single project auto-targets, and
+  // multiple get the footer picker. Local mode passes no `projects`, so the third
+  // onAdd argument stays undefined (the wire key is then omitted, never sent null).
+  const targeted = Array.isArray(projects) && projects.length > 0;
+  const [projectId, setProjectId] = useState(null);
   const inputRef = useRef(null);
+  const boxRef = useRef(null);
 
   const submit = () => {
     const t = title.trim();
-    if (t) onAdd(colId, t);
+    if (t) onAdd(colId, t, targeted ? (projectId ?? projects[0].id) : undefined);
     setTitle('');
     setActive(false);
   };
   const cancel = () => {
     setTitle('');
     setActive(false);
+  };
+  // Submit-on-blur, but only when focus actually LEAVES the widget — clicking the
+  // project picker moves focus within it and must not fire the half-typed create.
+  const blurGuard = (e) => {
+    if (e.relatedTarget && boxRef.current && boxRef.current.contains(e.relatedTarget)) return;
+    if (title.trim()) submit();
+    else cancel();
   };
 
   if (!active) {
@@ -1376,7 +1391,7 @@ function QuickAdd({ colId, onAdd }) {
       background: C.surface, border: `1px solid ${C.ice}80`,
       borderRadius: 8, padding: 10,
       boxShadow: `0 0 0 3px ${C.ice}15`,
-    }}>
+    }} ref={boxRef}>
       <input
         ref={inputRef}
         autoFocus
@@ -1387,10 +1402,7 @@ function QuickAdd({ colId, onAdd }) {
           if (e.key === 'Enter') submit();
           if (e.key === 'Escape') cancel();
         }}
-        onBlur={() => {
-          if (title.trim()) submit();
-          else cancel();
-        }}
+        onBlur={blurGuard}
         placeholder="Card title..."
         style={{
           width: '100%', background: 'transparent', border: 'none',
@@ -1406,6 +1418,21 @@ function QuickAdd({ colId, onAdd }) {
           fontFamily: F.mono, fontSize: 9, color: C.textDim,
           letterSpacing: '0.08em', textTransform: 'uppercase',
         }}>↵ save · esc cancel</span>
+        {targeted && projects.length > 1 && (
+          <select
+            value={projectId ?? projects[0].id}
+            onChange={(e) => { setProjectId(e.target.value); if (inputRef.current) inputRef.current.focus(); }}
+            onBlur={blurGuard}
+            title="Target project"
+            style={{
+              background: C.surfaceHi, color: C.textMuted, border: `1px solid ${C.border}`,
+              borderRadius: 4, fontFamily: F.mono, fontSize: 9, padding: '1px 2px',
+              maxWidth: 120, cursor: 'pointer',
+            }}
+          >
+            {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        )}
       </div>
     </div>
   );
@@ -1414,7 +1441,7 @@ function QuickAdd({ colId, onAdd }) {
 /* ============================================================
    BOARD VIEW
    ============================================================ */
-function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, readOnly, canCreate, sweep, allTasks }) {
+function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, readOnly, canCreate, quickAddColumnId, quickAddProjects, sweep, allTasks }) {
   const C = useTheme();
   const narrow = useNarrow();
   const [draggedId, setDraggedId] = useState(null);
@@ -1607,11 +1634,15 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, read
                   boxShadow: `0 0 8px ${C.ice}`,
                 }} />
               )}
-              {/* Quick-add is a create — shown only in local mode (canCreate). On a
-                  writable spine, drag/edit/delete work but card_create is deferred,
-                  so the affordance is hidden (STEP 6), distinct from the readOnly
-                  drag gate above. */}
-              {canCreate && <QuickAdd colId={col.id} onAdd={onQuickAdd} />}
+              {/* Quick-add is a create. Local mode: every column. On a writable
+                  spine it is HUMAN INTAKE — pinned to the intake column alone
+                  (quickAddColumnId, the first served column: 'created' on the
+                  Claunker spine) so a board create can never enter mid-ladder,
+                  and carrying the project targeting the picker resolved. Distinct
+                  from the readOnly drag gate above. */}
+              {canCreate && (quickAddColumnId == null || col.id === quickAddColumnId) && (
+                <QuickAdd colId={col.id} onAdd={onQuickAdd} projects={quickAddProjects} />
+              )}
             </div>
           </div>
         );
@@ -5436,6 +5467,11 @@ export default function App() {
   // render, unarchive stays hidden).
   const mcpCanArchive = !!(spineState && spineState.capabilities && spineState.capabilities.canArchive);
   const mcpCanUnarchive = !!(spineState && spineState.capabilities && spineState.capabilities.canUnarchive);
+  // canTargetProjects gates the project-targeting read (project_list, spec v0.6.0
+  // §Projects) — derived from its own advertised tool exactly like canRetier,
+  // independent of canWrite. On such a spine a board create MUST name a live
+  // project; the enumeration below feeds the QuickAdd picker.
+  const mcpCanTargetProjects = !!(spineState && spineState.capabilities && spineState.capabilities.canTargetProjects);
   const spineTasks = useMemo(() => {
     if (!spineModel) return null;
     const today = iso(new Date());
@@ -5764,6 +5800,32 @@ export default function App() {
     const conn = spineConnRef.current;
     if (conn && conn.pollNow) Promise.resolve(conn.pollNow()).catch(() => {});
   };
+  // The project-targeting read (spec v0.6.0 §Projects): enumerate the spine's live
+  // projects once per WRITABLE session so creates can target one. null = not yet
+  // fetched / unavailable — on a project-aware spine the create affordance stays
+  // hidden until the enumeration lands (an untargeted create there would only fail
+  // loudly server-side, so the board never offers one it cannot land). Refetches
+  // when mcpWritable re-flips true after a reconnect cycle.
+  const [spineProjects, setSpineProjects] = useState(null);
+  useEffect(() => {
+    if (!(mcpWritable && mcpCanTargetProjects)) { setSpineProjects(null); return undefined; }
+    const conn = spineConnRef.current;
+    const provider = (conn && conn.getProvider && conn.getProvider()) || null;
+    if (!provider) return undefined;
+    let stale = false;
+    provider.projectList().then(
+      (projects) => { if (!stale) setSpineProjects(projects); },
+      () => { if (!stale) setSpineProjects(null); },
+    );
+    return () => { stale = true; };
+  }, [mcpWritable, mcpCanTargetProjects]);
+  // The board-create affordance in MCP mode: rides canWrite (card_create is part of
+  // the four-tool write set behind it), and on a project-aware spine ALSO needs at
+  // least one live project to target.
+  const mcpCanCreate = mcpWritable && (!mcpCanTargetProjects || !!(spineProjects && spineProjects.length));
+  // HUMAN-INTAKE pinning: a board-side create enters the spine's intake column — the
+  // FIRST served column ('created' on the Claunker spine) — never an arbitrary rung.
+  const mcpIntakeColumnId = (mcpActive && spineModel && spineModel.columns.length) ? spineModel.columns[0].id : null;
   // Persistent-banner copy for a failed spine write. A stale write (code
   // 'conflict') and a deleted target get clearer lines; everything else carries
   // the provider's message/code so a failure is never silent. (surface() does NOT
@@ -6210,6 +6272,40 @@ export default function App() {
     }
   };
 
+  // Board-side create — HUMAN INTAKE into the spine. The board mints the client id
+  // (so a retry replays idempotently per spec §Create) and the append-at-end order,
+  // pins the intake column, sends NO tier (creation is intent capture: an intake
+  // card is untiered, exactly like a hand-written one — classification and dispatch
+  // are later, separate rungs the board never skips), and targets the project the
+  // QuickAdd resolved. SAME OPTIMISTIC → call → RECONCILE / REVERT shape as the
+  // writes above, minus the CAPTURE (no prior card) and minus a conflict branch:
+  // card_create carries no expected_version — a duplicate id is idempotent success —
+  // so ANY failure means the create never landed → remove the ghost + surface.
+  const createTaskMcp = async (colId, title, projectId) => {
+    const provider = spineProvider();
+    const model = spineModel;
+    if (!provider || !model) { surface('No live spine connection — card not created.'); return; }
+    const id = globalThis.crypto.randomUUID();
+    const inCol = model.cards.filter((c) => c.column_id === colId && !c.deleted_at).sort(compareCards);
+    const order = orderBetween(inCol.length ? inCol[inCol.length - 1].order : null, null); // append to end
+    // The optimistic ghost: enough Card shape to render (spineTasks defaults the
+    // rest); created_at is display-only here and NEVER sent — the authority stamps
+    // its own. The canonical returned card replaces it wholesale.
+    const optimistic = { id, title, column_id: colId, order, tags: [], tier: null, created_at: new Date().toISOString() };
+    setSpineModel((m) => (m ? { ...m, cards: [...m.cards, optimistic] } : m)); // OPTIMISTIC insert
+    try {
+      const card = await provider.cardCreate(
+        { id, title, column_id: colId, order },
+        projectId != null ? { project_id: projectId } : {},
+      );
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => (c.id === id ? card : c)) } : m)); // ADOPT canonical
+      reconcileSpine();
+    } catch (e) {
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.filter((c) => c.id !== id) } : m)); // REVERT: never landed
+      surface(writeError('create', e));
+    }
+  };
+
   // ── Public write handlers — the split-brain routing (Pass 2b STEP f) ─────
   // Each branches on mode: mcpWritable → provider write-through; mcpActive but
   // read-only → blocked (the mirror stays read-only); else local → the card store.
@@ -6285,11 +6381,12 @@ export default function App() {
     if (conn && conn.pollNow) Promise.resolve(conn.pollNow()).catch(() => {});
   };
 
-  // card_create is DEFERRED in MCP mode (it needs project-targeting plumbing that
-  // is the NEXT slice); the board's quick-add / "New" affordances are hidden while
-  // a spine is connected (canCreate below), so this only ever runs in local mode.
-  // The mcpActive backstop keeps a stray call inert. Local behavior is unchanged.
-  const quickAdd = (colId, title) => {
+  // Quick-add routing. MCP-writable → createTaskMcp (the once-deferred slice: human
+  // intake, project-targeted); read-only mirror → blocked; local unchanged. The
+  // modal "New task" stays LOCAL-ONLY (Header canCreate) — in MCP mode intake is
+  // the title-only quick-add on the intake column, nothing richer.
+  const quickAdd = (colId, title, projectId) => {
+    if (mcpWritable) { createTaskMcp(colId, title, projectId); return; }
     if (mcpActive) { surface(READONLY_MSG); return; }
     markLocalEdited();
     const t = new Date();
@@ -6545,7 +6642,9 @@ export default function App() {
         {view === 'board' && (
           <BoardView tasks={filteredTasks} tags={activeTags} columns={activeColumns}
             onTaskClick={openEdit} onMove={moveTask} onQuickAdd={quickAdd}
-            readOnly={mcpReadOnly} canCreate={!mcpActive}
+            readOnly={mcpReadOnly} canCreate={mcpActive ? mcpCanCreate : true}
+            quickAddColumnId={mcpActive ? mcpIntakeColumnId : null}
+            quickAddProjects={mcpActive && mcpCanTargetProjects ? (spineProjects || undefined) : undefined}
             allTasks={baseTasks}
             sweep={mcpActive && mcpCanArchive ? {
               columnId: 'delivered',
