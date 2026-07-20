@@ -1,15 +1,17 @@
-<!-- CANONICAL. Home of this contract (kanbantt-app owns it); the Claunker spine keeps a synced copy at claunker-hermes/docs/kanbantt-mcp-spec.md. Bodies verified byte-identical outside this comment 2026-07-03. v0.4.0 (the archive surface) ORIGINATED spine-side on 2026-07-02 — the documented reverse-flow exception — and was back-synced FROM that spine copy VERBATIM on 2026-07-02, closing the drift. Normal flow (kanbantt → spine re-sync on change) resumes from here. Canonical edited at v0.5.0 on 2026-07-06; re-synced to the claunker copy same day. Normal flow applies. -->
+<!-- CANONICAL. Home of this contract (kanbantt-app owns it); the Claunker spine keeps a synced copy at claunker-hermes/docs/kanbantt-mcp-spec.md. Bodies verified byte-identical outside this comment 2026-07-03. v0.4.0 (the archive surface) ORIGINATED spine-side on 2026-07-02 — the documented reverse-flow exception — and was back-synced FROM that spine copy VERBATIM on 2026-07-02, closing the drift. Normal flow (kanbantt → spine re-sync on change) resumes from here. Canonical edited at v0.5.0 on 2026-07-06; re-synced to the claunker copy same day. Normal flow applies. Canonical edited at v0.6.0 (draft) on 2026-07-20 on branch feat/board-card-create — claunker-copy re-sync PENDING review/merge (the spine's v0.6.0 implementation landed the same day on its own feat/board-card-create). -->
 
 # Kanbantt MCP Specification
 
-**Version:** 0.5.0
-**Date:** 2026-07-06
+**Version:** 0.6.0 (draft)
+**Date:** 2026-07-20
 **Author:** Erick M. Gonzales
 **Schema Version:** 1
 **Status:** Private draft — breaking changes permitted until public release
 **Supersedes:** kanbantt-provider-spec.md v0.1.0 (REST contract, retired)
 **Parent Doc:** claunker-foundation.md
 **MCP Revision Pinned:** 2025-06-18 (verify latest before public release)
+
+**Changes in v0.6.0 (draft):** (a) Adds `project_list` — the optional project-targeting read, `{ "projects": [{ id, name, created_at }] }`, live projects only in deterministic `(created_at, id)` order — gated on the new `canTargetProjects` capability, derived from that one tool ALONE, independent of `canWrite`. (b) `card_create` input gains an optional top-level `project_id` riding NEXT TO the card (CardInput stays a pure Card subset). A server advertising `project_list` is **project-aware**: `project_id` is REQUIRED there — absent → `validation_failed` naming `project_list`; unknown or tombstoned project → `not_found`; there is NO default-project fallback. Idempotent replay of a known id runs BEFORE the targeting requirement, so a retry of a landed create never trips targeting. A server without `project_list` MUST ignore a sent `project_id`. (c) CardInput requiredness relaxes to human-intake defaults: `title` becomes the ONE required field; absent `id` → server-minted, absent `column_id` → the server's intake column (its first Board column — the `created` semantic state on a governance spine), absent `order` → append at end. A create is INTAKE ONLY: servers MUST NOT auto-tier (the card is untiered unless the input itself carries a tier) and MUST NOT trigger downstream automation. Data `schema_version` unchanged: no Card shape change.
 
 **Changes in v0.5.0:** (a) `card_update` patch adopts RFC 7386 key-presence semantics: key absent = unchanged, key present with `null` = CLEAR; clearable set enumerated: `due`, `effort`, `impact`; `depends_on` clears via `[]` (type-strict; `null` → `validation_failed`); guarded set: `tier`, `archived_at`, `deleted_at` — present-null → `validation_failed` naming the governed tool (`card_retier`, `card_archive`/`card_unarchive`, `card_delete`). (b) Card gains `depends_on: [card-id]`, empty default — display-only dependency metadata (no server-side transition gating); dangling refs render greyed and are never stripped from storage; self-reference rejected at write; cycles flagged at render, never blocked at write; clears via `[]`. (c) Reserves the append-only generic card-edit audit ledger `{ card_id, field, old, new, actor, ts }` covering `due`, `effort`, `impact`, `depends_on` mutations, recorded server-side atomically with each set/change/clear; no read API this version (same stance as the tier- and archive-audit ledgers). Data `schema_version` unchanged: new fields are additive (nullable or empty-default).
 
@@ -159,7 +161,7 @@ A client receiving cards with a `column_id` it cannot map MUST render them in a 
 There is no custom capabilities endpoint. Standard MCP mechanisms only:
 
 1. **`initialize`** handshake — server identity (name, version) arrives in `serverInfo`. Kanbantt displays this as the connection indicator (`MCP: Claunker`, `MCP: <name>`).
-2. **`tools/list`** — feature gating keys off advertised tool names. The escalations column renders iff `escalation_list` and `escalation_resolve` are advertised. Column-mutation tools absent ⇒ server board config is read-only to the client and column edits stay local. The governed re-tier affordance renders iff `card_retier` is advertised (`canRetier`) — derived from that one tool ALONE, independent of the `card_*` write set (`canWrite`): a server may govern re-tier without offering the full board writes, or vice versa. Likewise the archive affordance: `canArchive` derives true iff `card_archive` is advertised — that one tool ALONE, independent of `canWrite` and `canRetier` (a server advertising `card_archive` without `card_unarchive` is one-way: the client shows archive but no unarchive affordance).
+2. **`tools/list`** — feature gating keys off advertised tool names. The escalations column renders iff `escalation_list` and `escalation_resolve` are advertised. Column-mutation tools absent ⇒ server board config is read-only to the client and column edits stay local. The governed re-tier affordance renders iff `card_retier` is advertised (`canRetier`) — derived from that one tool ALONE, independent of the `card_*` write set (`canWrite`): a server may govern re-tier without offering the full board writes, or vice versa. Likewise the archive affordance: `canArchive` derives true iff `card_archive` is advertised — that one tool ALONE, independent of `canWrite` and `canRetier` (a server advertising `card_archive` without `card_unarchive` is one-way: the client shows archive but no unarchive affordance). And the project picker: `canTargetProjects` derives true iff `project_list` is advertised — that one tool ALONE, the same rule — and marks the server project-aware for `card_create` (see Create semantics).
 3. `board_get` returns `kanbantt_schema_version` — the data schema version, deliberately separate from the MCP protocol revision.
 
 Connection flow and indicators (`Local`, `MCP: <name>`, `Local (MCP unavailable)` with retry) carry over from v0.1.0 unchanged.
@@ -189,7 +191,7 @@ All tool results use `structuredContent` with a **top-level object wrapper** (MC
 | `board_get` | — | `{ "board": Board, "kanbantt_schema_version": 1 }` |
 | `card_list` | `{ "updated_since?": sync_token, "column_id?": string, "tag?": string, "include_deleted?": bool, "include_archived?": bool }` | `{ "cards": [Card], "sync_token": string }` |
 | `card_get` | `{ "id": string }` | `{ "card": Card }` |
-| `card_create` | `{ "card": CardInput }` | `{ "card": Card }` |
+| `card_create` | `{ "card": CardInput, "project_id?": string }` | `{ "card": Card }` |
 | `card_update` | `{ "id": string, "patch": object, "expected_version": string, "force?": bool }` | `{ "card": Card }` |
 | `card_move` | `{ "id": string, "column_id": string, "order": string, "expected_version": string, "force?": bool }` | `{ "card": Card }` |
 | `card_delete` | `{ "id": string, "expected_version": string }` | `{ "card": Card }` (the tombstone) |
@@ -201,6 +203,7 @@ All tool results use `structuredContent` with a **top-level object wrapper** (MC
 | `card_retier` | `{ "id": string, "new_tier": "tier:N", "expected_version": string, "reason": string }` | `{ "card": Card }` |
 | `card_archive` | `{ "id": string, "expected_version": string, "reason?": string }` | `{ "card": Card }` |
 | `card_unarchive` | `{ "id": string, "expected_version": string, "reason?": string }` | `{ "card": Card }` |
+| `project_list` | `{}` | `{ "projects": [{ "id": string, "name": string, "created_at": string }] }` |
 | `escalation_list` | `{ "status?": "pending" \| "resolved" }` | `{ "escalations": [Escalation] }` |
 | `escalation_resolve` | `{ "id": string, "resolution": string }` | `{ "escalation": Escalation }` |
 | `artifact_list` | `{ "card_id": string }` | `{ "artifacts": [Artifact] }` |
@@ -208,6 +211,8 @@ All tool results use `structuredContent` with a **top-level object wrapper** (MC
 `card_retier` is the GOVERNED, audited tier change — gated on its own capability (`canRetier`), distinct from `canWrite`. It changes an already-set tier and is the ONLY way to change a set tier (see Re-tier semantics and the `card_update` write-once rule). It has NO `force`. See Re-tier below.
 
 `card_archive` / `card_unarchive` are the GOVERNED, audited archive pair — gated on `canArchive` (derived from `card_archive` alone), distinct from `canWrite` and `canRetier`. They are the ONLY way to set/clear `archived_at`. Neither has `force`; `reason` is optional on the wire but every audit row records one (see Archive below).
+
+`project_list` is the PROJECT-TARGETING read — gated on `canTargetProjects`, derived from that one tool alone, independent of `canWrite` (a server may expose the enumeration read-only, or accept untargeted creates without it). Live projects only, deterministic `(created_at, id)` order. Its advertisement is what makes a server **project-aware**: `card_create.project_id` becomes REQUIRED there (see Create semantics), and the client's project picker feeds from this enumeration.
 
 Escalations and artifacts referencing a **tombstoned** card remain valid and retrievable (deleted work still has an audit trail). A `card_id` the server has never known returns `not_found`.
 | `column_create` / `column_update` | column shape / patch | `{ "board": Board }` |
@@ -234,8 +239,10 @@ Escalations and artifacts referencing a **tombstoned** card remain valid and ret
 - A card with unsynced local edits whose id is absent from a full fetch MUST surface as user-visible reconciliation, never a silent purge and never a silent re-create.
 
 **Create (`card_create`):**
-- `CardInput` is a Card minus the authority-owned fields: no `version`, `created_at`, `updated_at`, `created_by`, `updated_by`, `deleted_at`. Required: `id`, `title`, `column_id`, `order`. All other fields optional with documented defaults (`priority: "med"`, empty collections, nulls). Authority-owned fields supplied by a client MUST be ignored, not errored.
+- `CardInput` is a Card minus the authority-owned fields: no `version`, `created_at`, `updated_at`, `created_by`, `updated_by`, `deleted_at`. Required: `title` (non-empty). Optional with authority defaults (v0.6.0 — the human-intake defaults): `id` (absent → server-minted; supply one to make retries idempotent), `column_id` (absent → the server's intake column: its first Board column, the `created` semantic state on a governance spine), `order` (absent → append at the end of that column). All other fields optional with documented defaults (`priority: "med"`, empty collections, nulls). Authority-owned fields supplied by a client MUST be ignored, not errored; fields a server does not model flatten away at its boundary, and the projection re-emits their Card defaults.
 - If the id already exists (including tombstoned), the server returns the existing card as success. Create is safe to retry.
+- **Project targeting (v0.6.0):** `project_id` rides at the top level NEXT TO `card`. A server advertising `project_list` is project-aware: `project_id` is REQUIRED — absent → `validation_failed` with a message naming `project_list`; a project the server does not know LIVE → `not_found`. There is NO default-project fallback: a typo must not mint or borrow a project, and a tombstoned project is not a create target. The idempotency rule above runs FIRST — a duplicate `id` returns the existing card as success even with no `project_id` (a retry of a landed create never trips targeting). A server without `project_list` MUST ignore a sent `project_id`. Clients with no target OMIT the key — it is never sent `null`.
+- **A create is human intake.** It captures intent and nothing more: the server MUST NOT auto-tier (the card is untiered unless the input itself carries a tier) and MUST NOT dispatch or trigger downstream automation. Classification and dispatch are later, separately governed steps (`card_update`'s free initial tier, then `card_retier`).
 - **The card returned by `card_create` is canonical.** The client MUST adopt it wholesale — including its `version` — replacing local state. This single rule covers retry replays, concurrent-edit races, and local→server migration (where the client discards the LocalProvider-minted version in favor of the server's).
 
 **Concurrency (`card_update`, `card_move`, `card_delete`):**

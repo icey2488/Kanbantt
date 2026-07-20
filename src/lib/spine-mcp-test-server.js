@@ -306,6 +306,12 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
         }
         case 'card_create': {
           const input = a.card || {};
+          // INPUT HYGIENE first (the spine's validate-before-lookup order): a create
+          // is operator intent and intent needs words — title is the ONE required
+          // CardInput field (v0.6.0; id/column_id/order all have authority defaults).
+          if (typeof input.title !== 'string' || !input.title.trim()) {
+            return domainError('validation_failed', 'card.title must be a non-empty string', {});
+          }
           // IDEMPOTENT CREATE runs FIRST (spec §Create + the real spine's order): an
           // id the store already knows returns the existing card as success BEFORE
           // the project-targeting requirement — a retry of a landed create never
