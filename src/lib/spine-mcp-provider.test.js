@@ -62,6 +62,7 @@ test('connect → initialize + tools/list; server name and capabilities from adv
     hasCardCreate: true, hasCardUpdate: true, hasCardMove: true, hasCardDelete: true, canWrite: true,
     canRetier: true,
     canArchive: true, canUnarchive: true,
+    canTargetProjects: true,
     escalations: true, canResolve: true, artifacts: true, columns: true, tags: true, realtime: false,
   });
   assert.equal(provider.supportsRealtime(), false, 'v1 is tools-only → board polls');
@@ -773,6 +774,127 @@ test('cardUpdate effort/impact null: explicit null round-trips (unset sentinel);
   assert.equal(updated.effort, null, 'effort null stored');
   assert.equal(updated.impact, null, 'impact null stored');
   assert.equal(updated.version, 2);
+  await provider.disconnect();
+  await harness.close();
+});
+
+/* ================================================================== */
+/* Project targeting + cardCreate (spec v0.6.0) — the board-create     */
+/* slice: project_list feeds the picker; card_create lands the intake. */
+/* ================================================================== */
+
+const TWO_PROJECTS = [
+  { id: 'p2', name: 'Dispatch Log', created_at: '2026-02-01T00:00:00Z' },
+  { id: 'p1', name: 'Claunker First Light', created_at: '2026-01-01T00:00:00Z' },
+  { id: 'p3', name: 'Retired', created_at: '2026-03-01T00:00:00Z', deleted_at: '2026-04-01T00:00:00Z' },
+];
+
+test('projectList: live projects only, server (created_at, id) order preserved, gated on canTargetProjects', async () => {
+  const { provider, harness } = await connected({ projects: TWO_PROJECTS });
+  assert.equal(provider.getCapabilities().capabilities.canTargetProjects, true);
+  const projects = await provider.projectList();
+  // The tombstoned fixture entry is omitted; the harness serves (created_at, id)
+  // ascending and the provider preserves that order verbatim (never re-sorts).
+  assert.deepEqual(projects, [
+    { id: 'p1', name: 'Claunker First Light', created_at: '2026-01-01T00:00:00Z' },
+    { id: 'p2', name: 'Dispatch Log', created_at: '2026-02-01T00:00:00Z' },
+  ]);
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('projectList is unsupported when project_list is not advertised (canTargetProjects false)', async () => {
+  const { provider, harness } = await connected({ omitTools: ['project_list'] });
+  assert.equal(provider.getCapabilities().capabilities.canTargetProjects, false);
+  await assert.rejects(() => provider.projectList(), (e) => e instanceof MCPProviderError && e.code === 'unsupported_capability');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardCreate targets a project and adopts the returned card wholesale (canonical, untiered intake)', async () => {
+  const { provider, harness } = await connected({ projects: TWO_PROJECTS });
+  const card = await provider.cardCreate(
+    { id: 'n1', title: 'Board intake', column_id: 'todo', order: 'm' },
+    { project_id: 'p1' },
+  );
+  // Canonical adoption (spec §Create): the returned card IS the state — client id
+  // honored, server-minted version present, and NO tier (human intake is untiered;
+  // toInternalCard derives tier:null from the tag-free card).
+  assert.equal(card.id, 'n1');
+  assert.equal(card.title, 'Board intake');
+  assert.ok(card.version != null, 'server-minted version adopted');
+  assert.equal(card.tier, null, 'untiered — no tier derived from tags');
+  assert.deepEqual(card.tags, [], 'no tier tag on an intake card');
+  // The harness recorded which project the create landed in (Task.project_id
+  // never rides the Card lens — this is the test-side observability).
+  assert.equal(harness.createdProjects().get('n1'), 'p1');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardCreate without project_id on a project-aware spine: validation_failed naming project_list', async () => {
+  const { provider, harness } = await connected({ projects: TWO_PROJECTS });
+  await assert.rejects(
+    () => provider.cardCreate({ title: 'untargeted' }),
+    (e) => e instanceof MCPProviderError && e.code === 'validation_failed' && /project_list/.test(e.message),
+  );
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardCreate against an unknown or tombstoned project is not_found', async () => {
+  const { provider, harness } = await connected({ projects: TWO_PROJECTS });
+  await assert.rejects(
+    () => provider.cardCreate({ title: 'orphan' }, { project_id: 'ghost' }),
+    (e) => e instanceof MCPProviderError && e.code === 'not_found',
+  );
+  await assert.rejects(
+    () => provider.cardCreate({ title: 'orphan' }, { project_id: 'p3' }), // tombstoned
+    (e) => e instanceof MCPProviderError && e.code === 'not_found',
+  );
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardCreate duplicate id is idempotent and runs BEFORE the targeting requirement', async () => {
+  const { provider, harness } = await connected({ projects: TWO_PROJECTS });
+  harness.store.create({ id: 'c1', title: 'First', column_id: 'todo', priority: 'med' });
+  // A retry replaying a landed id returns the EXISTING card as success even with NO
+  // project_id — the spine's order (idempotency precedes targeting validation).
+  const card = await provider.cardCreate({ id: 'c1', title: 'totally different' });
+  assert.equal(card.title, 'First', 'existing card returned untouched');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardCreate on a projectless conforming server needs no project_id', async () => {
+  const { provider, harness } = await connected(); // no projects fixture — the generic server
+  assert.equal(provider.getCapabilities().capabilities.canTargetProjects, true, 'the full harness still advertises project_list');
+  const card = await provider.cardCreate({ id: 'n2', title: 'Generic create', column_id: 'todo', order: 'm' });
+  assert.equal(card.id, 'n2');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardCreate maps an internal hyphen tier to the wire colon form (non-board callers)', async () => {
+  // The board never sends a tier on create (human intake) — but the provider seam
+  // stays uniform: an internal "tier-N" crossing this boundary rides as "tier:N",
+  // and the returned card re-projects to internal (tier derived from its tag).
+  const { provider, harness } = await connected({ projects: TWO_PROJECTS });
+  const card = await provider.cardCreate(
+    { id: 'n3', title: 'Pre-tiered', column_id: 'todo', order: 'm', tier: 'tier-2' },
+    { project_id: 'p2' },
+  );
+  assert.deepEqual(card.tags, ['tier:2'], 'tier folded into tags on the wire');
+  assert.equal(card.tier, 'tier-2', 'internal tier derived back from the tag');
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('cardCreate is unsupported when the card_* write set is incomplete (canWrite false)', async () => {
+  const { provider, harness } = await connected({ omitTools: ['card_create'] });
+  assert.equal(provider.getCapabilities().capabilities.canWrite, false);
+  await assert.rejects(() => provider.cardCreate({ title: 'x' }), (e) => e instanceof MCPProviderError && e.code === 'unsupported_capability');
   await provider.disconnect();
   await harness.close();
 });

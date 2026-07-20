@@ -37,6 +37,7 @@ const ALL_TOOLS = [
   'column_create', 'column_update', 'column_delete',
   'tag_create', 'tag_update', 'tag_delete',
   'escalation_list', 'escalation_resolve', 'artifact_list',
+  'project_list',
 ];
 
 /** Actor stamped on every tier_audit row — the authenticated-client PLACEHOLDER,
@@ -94,6 +95,14 @@ function tierFoldPatch(patch, current) {
   rest.tags = foldTierIntoTags(patch.tier, baseTags);
   return rest;
 }
+
+/** Emit-side projection parity: the real spine's Card lens (projection.to_card, and
+ *  tombstone_card which reuses it) ALWAYS emits a `tags` ARRAY — [] when untiered
+ *  (projection._tags_for) — on EVERY card that crosses the wire, conflict meta.card
+ *  included. The store, by contrast, preserves client fields verbatim, so a tagless
+ *  create stores no `tags` key at all. Normalize at the wire boundary, never in the
+ *  store (LocalProvider shares card-store and its cards are not wire Cards). */
+const emitCard = (c) => (c && typeof c === 'object' && !Array.isArray(c.tags) ? { ...c, tags: [] } : c);
 
 /* ---- tier as an INTEGER (re-tier governance: range, no-op, write-once checks) ----
  *  The spine reasons over tier as an int (1..4); on this side tier lives as a
@@ -176,9 +185,20 @@ function patchTierToInt(value) {
  *        (resolved_at == null) — the spine's _has_open_escalation predicate verbatim;
  *        a resolved escalation (even a DENIED one) does NOT block. Tests mutate the
  *        exposed `escalations` handle (or use escalation_resolve) to flip states.
- * @returns {{ url, fetchFn, store, server, escalations, close }}
+ * @param {Array<object>|null} [opts.projects]  MINIMAL project fixture, mirroring the
+ *        real spine's project model (spec v0.6.0 §Projects). Entries:
+ *        { id, name, created_at?, deleted_at? }. PROVIDED (even []) ⇒ the harness is a
+ *        PROJECT-AWARE spine: project_list serves the live entries and card_create
+ *        REQUIRES a live project_id — absent → validation_failed naming project_list,
+ *        unknown/tombstoned → not_found — with the duplicate-id idempotency check
+ *        running BEFORE the requirement (the real spine's order: a retry of a landed
+ *        create never trips targeting). OMITTED (null) ⇒ the projectless conforming
+ *        server: project_list serves an empty enumeration and card_create ignores
+ *        project targeting entirely. The card_list projection carries NO project field
+ *        either way (project is server-side semantics, exactly as the real lens).
+ * @returns {{ url, fetchFn, store, server, escalations, createdProjects, close }}
  */
-export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], payloadStyle = 'structured', schemaVersion = 1, errorOn = {}, escalations = [] } = {}) {
+export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], payloadStyle = 'structured', schemaVersion = 1, errorOn = {}, escalations = [], projects = null } = {}) {
   const store = createStore({ storage: memStorage(), actor: { type: 'agent', id: 'spine' } });
   store.load();
   if (typeof seed === 'function') seed(store);
@@ -192,6 +212,17 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
   // archive_audit table (one row per successful archive/unarchive; NO rejection branch
   // writes a row). Read back via the exposed `archiveAudit()` accessor.
   const archiveAuditLog = [];
+
+  // The project fixture (see opts.projects above). `projectAware` distinguishes a
+  // project-aware spine (fixture provided, even empty) from the projectless
+  // conforming server (null) — the two card_create stances.
+  const projectAware = projects != null;
+  const projectFixture = (projects || []).map((p) => ({ ...p }));
+  const liveProject = (id) => projectFixture.find((p) => p.id === id && p.deleted_at == null);
+  // card id → the project_id its create targeted (the spine stores project_id on the
+  // Task but never projects it onto the Card; this is the test-side observability
+  // for "which project did the create land in").
+  const createdProjects = new Map();
 
   // The live escalation fixture (see opts.escalations above). A mutable array handle:
   // the archive gate reads it, escalation_list serves it, escalation_resolve resolves
@@ -214,7 +245,7 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
   /** Map a card-store StoreError onto a spec domain-error payload (conflict carries
    *  the current card under meta.card — the provider remaps it to meta.current). */
   function fromStoreError(e) {
-    if (e && e.code === 'conflict') return domainError('conflict', e.message, { card: e.meta && e.meta.current });
+    if (e && e.code === 'conflict') return domainError('conflict', e.message, { card: emitCard(e.meta && e.meta.current) });
     if (e && e.code) return domainError(e.code, e.message, e.meta || {});
     return domainError('request_failed', (e && e.message) || 'error');
   }
@@ -230,8 +261,8 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
     const card = store.get(id); // get() returns a clone, tombstones included, or null
     if (!card) return { error: domainError('not_found', `no card ${id}`, { id }) };
     // A tombstone is immutable — even force cannot resurrect it (checked before version).
-    if (card.deleted_at) return { error: domainError('conflict', 'version conflict', { card }) };
-    if (!force && expected_version !== card.version) return { error: domainError('conflict', 'version conflict', { card }) };
+    if (card.deleted_at) return { error: domainError('conflict', 'version conflict', { card: emitCard(card) }) };
+    if (!force && expected_version !== card.version) return { error: domainError('conflict', 'version conflict', { card: emitCard(card) }) };
     return { card };
   }
 
@@ -267,13 +298,40 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
           }
           if (a.column_id != null) cards = cards.filter((c) => c.column_id === a.column_id);
           if (a.tag != null) cards = cards.filter((c) => (c.tags || []).includes(a.tag));
-          return ok({ cards, sync_token: out.sync_token });
+          return ok({ cards: cards.map(emitCard), sync_token: out.sync_token });
         }
         case 'card_get': {
           const card = store.get(a.id);
-          return card ? ok({ card }) : domainError('not_found', `no card ${a.id}`, { id: a.id });
+          return card ? ok({ card: emitCard(card) }) : domainError('not_found', `no card ${a.id}`, { id: a.id });
         }
-        case 'card_create': return ok({ card: store.create(tierFoldCreate(a.card || {})) });
+        case 'card_create': {
+          const input = a.card || {};
+          // IDEMPOTENT CREATE runs FIRST (spec §Create + the real spine's order): an
+          // id the store already knows returns the existing card as success BEFORE
+          // the project-targeting requirement — a retry of a landed create never
+          // trips targeting. store.create dedupes internally too, but the check must
+          // precede the project gate for order parity.
+          if (input.id != null) {
+            const existing = store.get(input.id);
+            if (existing) return ok({ card: emitCard(existing) });
+          }
+          if (projectAware) {
+            // PROJECT-AWARE stance (the real spine, verbatim): required, explicit,
+            // live-only, no default-project fallback. Message parity with
+            // spine_server.server.card_create.
+            if (a.project_id == null) {
+              return domainError('validation_failed',
+                'card_create on this server requires project targeting: '
+                + 'pass project_id (enumerate live projects via project_list)', {});
+            }
+            if (!liveProject(a.project_id)) {
+              return domainError('not_found', `project ${pyRepr(a.project_id)} does not exist`, { project_id: a.project_id });
+            }
+          }
+          const card = store.create(tierFoldCreate(input));
+          if (projectAware) createdProjects.set(card.id, a.project_id);
+          return ok({ card: emitCard(card) });
+        }
         case 'card_update': {
           let patch = a.patch || {};
           // TIER hygiene → gate → WRITE-ONCE, in the SPINE's order (server._patch_tier_to_int
@@ -306,10 +364,10 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
             // "tier:N"). For the "tier:N" wire form this is a no-op.
             patch = { ...patch, tier: `tier:${newTier}` };
           }
-          return ok({ card: store.update(a.id, tierFoldPatch(patch, store.get(a.id)), { expected_version: a.expected_version, force: a.force }) });
+          return ok({ card: emitCard(store.update(a.id, tierFoldPatch(patch, store.get(a.id)), { expected_version: a.expected_version, force: a.force })) });
         }
-        case 'card_move': return ok({ card: store.move(a.id, { column_id: a.column_id, order: a.order }, { expected_version: a.expected_version, force: a.force }) });
-        case 'card_delete': return ok({ card: store.delete(a.id, { expected_version: a.expected_version }) });
+        case 'card_move': return ok({ card: emitCard(store.move(a.id, { column_id: a.column_id, order: a.order }, { expected_version: a.expected_version, force: a.force })) });
+        case 'card_delete': return ok({ card: emitCard(store.delete(a.id, { expected_version: a.expected_version })) });
         case 'card_retier': {
           // GOVERNED, audited tier change — IDENTICAL semantics AND ORDER to the spine's
           // card_retier path. The spine parses new_tier with _patch_tier_to_int in the TOOL
@@ -343,7 +401,7 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
           // passed, so it succeeds) and the row is appended AFTER it — no orphan row on a
           // failed write. reduces_control is a JS boolean (new < old); the spine records
           // the SAME fact as int 0/1 — an internal field that never crosses the wire.
-          const card = store.update(a.id, { tags: foldTierIntoTags(`tier:${newTier}`, current.tags) }, { expected_version: a.expected_version });
+          const card = emitCard(store.update(a.id, { tags: foldTierIntoTags(`tier:${newTier}`, current.tags) }, { expected_version: a.expected_version }));
           auditLog.push({
             card_id: a.id,
             old_tier: oldTier,
@@ -385,7 +443,7 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
           if (typeof reason !== 'string' || reason.trim() === '') {
             return domainError('validation_failed', 'archive_audit rows require a non-empty reason', { id: a.id });
           }
-          const card = store.update(a.id, { archived_at: new Date().toISOString() }, { expected_version: a.expected_version });
+          const card = emitCard(store.update(a.id, { archived_at: new Date().toISOString() }, { expected_version: a.expected_version }));
           archiveAuditLog.push({
             id: globalThis.crypto.randomUUID(),
             card_id: a.id,
@@ -411,7 +469,7 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
           if (typeof reason !== 'string' || reason.trim() === '') {
             return domainError('validation_failed', 'archive_audit rows require a non-empty reason', { id: a.id });
           }
-          const card = store.update(a.id, { archived_at: null }, { expected_version: a.expected_version });
+          const card = emitCard(store.update(a.id, { archived_at: null }, { expected_version: a.expected_version }));
           archiveAuditLog.push({
             id: globalThis.crypto.randomUUID(),
             card_id: a.id,
@@ -452,6 +510,18 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
           return ok({ escalation: { id: a.id, status: 'resolved', resolution: a.resolution, resolution_rationale: a.resolution_rationale } });
         }
         case 'artifact_list': return ok({ artifacts: [] });
+        case 'project_list': {
+          // The project-targeting read (spec v0.6.0 §Projects): live fixture entries
+          // only, minimal fields, deterministic (created_at, id) sort — the real
+          // spine's serving order, preserved by the provider verbatim.
+          const list = projectFixture
+            .filter((p) => p.deleted_at == null)
+            .map((p) => ({ id: p.id, name: p.name, created_at: p.created_at ?? null }))
+            .sort((x, y) => ((x.created_at || '') < (y.created_at || '') ? -1
+              : (x.created_at || '') > (y.created_at || '') ? 1
+                : (x.id < y.id ? -1 : x.id > y.id ? 1 : 0)));
+          return ok({ projects: list });
+        }
         default: return domainError('not_found', `no tool ${toolName}`);
       }
     } catch (e) {
@@ -496,6 +566,9 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
      *  entries directly (stamp resolved_at / deleted_at) or go through
      *  escalation_resolve; the card_archive gate reads this SAME array. */
     escalations: escalationFixture,
+    /** card id → the project_id its create targeted (project-aware harness only) —
+     *  the test-side analogue of Task.project_id, which the Card lens never emits. */
+    createdProjects: () => new Map(createdProjects),
     async close() {
       try { await transport.close(); } catch { /* best effort */ }
       try { await server.close(); } catch { /* best effort */ }

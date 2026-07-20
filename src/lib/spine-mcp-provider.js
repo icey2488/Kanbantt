@@ -410,6 +410,14 @@ export function createMCPProvider({
         // shows the archive affordance but no unarchive affordance (spec §Discovery).
         canArchive: toolNames.has('card_archive'),
         canUnarchive: toolNames.has('card_unarchive'),
+        // canTargetProjects gates the PROJECT-TARGETING READ (project_list) — the
+        // enumeration a project-aware create rides on (spec v0.6.0 §Projects). Per
+        // spec §Discovery it derives from project_list ALONE, independent of canWrite
+        // (a server may expose the enumeration read-only, or accept untargeted
+        // creates without it). The board's project picker gates on THIS flag; when
+        // false, cardCreate simply sends no project_id (a projectless conforming
+        // server accepts the bare CardInput).
+        canTargetProjects: toolNames.has('project_list'),
         escalations: toolNames.has('escalation_list') && toolNames.has('escalation_resolve'),
         // canResolve gates the SINGLE mutating control (escalation approve/deny)
         // independently of `escalations` (which also needs escalation_list — this slice
@@ -550,10 +558,32 @@ export function createMCPProvider({
      *  store rejects any other value with a conflict), so the caller supplies the
      *  card's captured prior version — it rides in the options object alongside the
      *  patch fields rather than being threaded separately. The board captures it as
-     *  part of the optimistic prior-state snapshot (see App's write handlers).
-     *
-     *  card_create is DEFERRED (it needs project-targeting plumbing that does not
-     *  exist yet) — intentionally NOT added here; the next slice wires it. */
+     *  part of the optimistic prior-state snapshot (see App's write handlers). */
+    /** cardCreate — the board's create write-through (the slice the DEFERRED note
+     *  here used to reserve; the project-targeting plumbing now exists). Sends the
+     *  spec's { card: CardInput } with the OPTIONAL top-level project_id extension
+     *  (spec v0.6.0): project_id rides NEXT TO the card, so CardInput stays a pure
+     *  Card subset. The caller resolves the target via projectList() when
+     *  canTargetProjects; when it passes none, the key is genuinely OMITTED (never
+     *  sent null) — a project-aware server then rejects loudly (validation_failed
+     *  naming project_list), a projectless server just creates. HUMAN-INTAKE
+     *  SEMANTICS LIVE AT THE CALL SITE: the board sends column_id 'created' and NO
+     *  tier (creation is intent capture; classification is a later rung) — this
+     *  method still maps a tier if a non-board caller supplies one (toWirePatch,
+     *  the single tier-translation seam, internal hyphen → wire colon; null tier
+     *  dropped). Gated on canWrite (card_create is one of the four-tool write set,
+     *  spec §Discovery). The returned card is CANONICAL (spec §Create): the caller
+     *  adopts it wholesale — server-minted version included — replacing any
+     *  optimistic local state; it re-projects to internal here (tier from tags)
+     *  like every Card crossing this boundary. */
+    async cardCreate(input = {}, { project_id } = {}) {
+      requireCapability('canWrite');
+      const out = await call('card_create', {
+        card: toWirePatch(input),
+        ...(project_id != null ? { project_id } : {}),
+      });
+      return toInternalCard(out.card);
+    },
     async cardUpdate(id, { title, acceptance_criteria, tier, effort, impact, due, depends_on, expected_version } = {}) {
       requireCapability('canWrite');
       // Field-scoped patch: only the keys actually supplied, so an unset field is
@@ -678,6 +708,17 @@ export function createMCPProvider({
     async escalationResolve(id, { resolution, resolution_rationale } = {}) {
       requireCapability('canResolve');
       return (await call('escalation_resolve', { id, resolution, resolution_rationale })).escalation;
+    },
+
+    /* ---- projects (optional capability — the project-targeting read) ---- */
+    /** project_list — enumerate the server's live projects ({ id, name, created_at })
+     *  so a create can be TARGETED (the id feeds cardCreate's project_id). Gated on
+     *  `canTargetProjects` (project_list advertised ALONE, independent of canWrite —
+     *  the exact canRetier pattern). Read-only; server order is preserved (the spine
+     *  serves a deterministic (created_at, id) sort — never re-sorted here). */
+    async projectList() {
+      requireCapability('canTargetProjects');
+      return (await call('project_list', {})).projects || [];
     },
 
     /* ---- artifacts (optional capability) ---- */
