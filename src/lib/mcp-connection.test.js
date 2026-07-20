@@ -212,6 +212,7 @@ test('incompatible server (missing a required tool) → fallback, never blank', 
   assert.equal(st.provider, 'local');
   assert.equal(st.indicator, LOCAL_RETRYING_INDICATOR, 'incompatible → retry loop');
   assert.equal(st.error.code, 'incompatible_server');
+  conn.disconnect();
   await harness.close();
 });
 
@@ -226,6 +227,9 @@ test('timeout (connect hangs past the ping timeout) → retry loop, fallback', a
   assert.equal(st.reconnecting, true, 'timeout → retry loop not parked');
   assert.equal(st.indicator, LOCAL_RETRYING_INDICATOR);
   assert.equal(st.error.code, 'timeout');
+  // This test runs on REAL timers: without teardown the pending backoff setTimeout
+  // (and its eternal retry chain) keeps the node --test process from ever exiting.
+  conn.disconnect();
 });
 
 /* ================================================================== */
@@ -378,6 +382,7 @@ test('strikes trip RECONNECTING not Local: 3rd consecutive poll failure enters r
   assert.equal(conn.isPolling(), false, 'the poll loop stops while reconnecting');
   assert.equal(conn.isReconnecting(), true, 'isReconnecting() reports true');
   assert.ok(conn.getState().indicator.includes('reconnecting'), 'indicator reflects reconnecting');
+  conn.disconnect();
 });
 
 test('backoff schedule: first retry fires at ~5s step, second at ~10s step', async () => {
@@ -422,6 +427,7 @@ test('backoff schedule: first retry fires at ~5s step, second at ~10s step', asy
   // First step is 5000 ± 1000ms
   assert.ok(backoffDelay >= 4000 && backoffDelay <= 6000,
     `first backoff delay should be ~5000ms, got ${backoffDelay}`);
+  conn.disconnect();
   conn2.disconnect();
 });
 
@@ -580,6 +586,7 @@ test('FIX C: a clean poll between failures resets the strike counter', async () 
   assert.equal(conn.getState().reconnecting, false, '2 strikes: not yet reconnecting');
   await sched.fireNext();          // strike 3 → RECONNECTING
   assert.equal(conn.getState().reconnecting, true, 'enters RECONNECTING only after 3 CONSECUTIVE post-reset');
+  conn.disconnect();
 });
 
 test('FIX C: a fatal "auth" on the poll degrades immediately to Local (no strike tolerance, stops retry)', async () => {
