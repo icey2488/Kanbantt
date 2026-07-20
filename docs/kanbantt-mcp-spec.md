@@ -2,7 +2,7 @@
 
 # Kanbantt MCP Specification
 
-**Version:** 0.6.0 (draft)
+**Version:** 0.6.0
 **Date:** 2026-07-20
 **Author:** Erick M. Gonzales
 **Schema Version:** 1
