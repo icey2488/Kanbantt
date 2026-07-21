@@ -1,8 +1,8 @@
-<!-- CANONICAL. Home of this contract (kanbantt-app owns it); the Claunker spine keeps a synced copy at claunker-hermes/docs/kanbantt-mcp-spec.md. Bodies verified byte-identical outside this comment 2026-07-03. v0.4.0 (the archive surface) ORIGINATED spine-side on 2026-07-02 — the documented reverse-flow exception — and was back-synced FROM that spine copy VERBATIM on 2026-07-02, closing the drift. Normal flow (kanbantt → spine re-sync on change) resumes from here. Canonical edited at v0.5.0 on 2026-07-06; re-synced to the claunker copy same day. Normal flow applies. Canonical edited at v0.6.0 (draft) on 2026-07-20 on branch feat/board-card-create — claunker-copy re-sync PENDING review/merge (the spine's v0.6.0 implementation landed the same day on its own feat/board-card-create). -->
+<!-- CANONICAL. Home of this contract (kanbantt-app owns it); the Claunker spine keeps a synced copy at claunker-hermes/docs/kanbantt-mcp-spec.md. Bodies verified byte-identical outside this comment 2026-07-03. v0.4.0 (the archive surface) ORIGINATED spine-side on 2026-07-02 — the documented reverse-flow exception — and was back-synced FROM that spine copy VERBATIM on 2026-07-02, closing the drift. Normal flow (kanbantt → spine re-sync on change) resumes from here. Canonical edited at v0.5.0 on 2026-07-06; re-synced to the claunker copy same day. Normal flow applies. Canonical edited at v0.6.0 (draft) on 2026-07-20 on branch feat/board-card-create — claunker-copy re-sync PENDING review/merge (the spine's v0.6.0 implementation landed the same day on its own feat/board-card-create); that re-sync COMPLETED 2026-07-20 (claunker-hermes d92ef6b). Canonical edited at v0.6.1 on 2026-07-20 (conflict-envelope key pinned to meta.current; doc-only, direct to main); re-synced to the claunker copy same day. Normal flow applies. -->
 
 # Kanbantt MCP Specification
 
-**Version:** 0.6.0
+**Version:** 0.6.1
 **Date:** 2026-07-20
 **Author:** Erick M. Gonzales
 **Schema Version:** 1
@@ -10,6 +10,8 @@
 **Supersedes:** kanbantt-provider-spec.md v0.1.0 (REST contract, retired)
 **Parent Doc:** claunker-foundation.md
 **MCP Revision Pinned:** 2025-06-18 (verify latest before public release)
+
+**Changes in v0.6.1:** Pins the conflict-envelope key: on `conflict`, the current card (or tombstone) travels under `meta.current` — canonical, matching what the reference implementation emits. `meta.card` is recognized as legacy client-side read tolerance ONLY; servers MUST NOT emit it. Doc-only clarification: no wire or schema change, the key was previously described but never named.
 
 **Changes in v0.6.0 (draft):** (a) Adds `project_list` — the optional project-targeting read, `{ "projects": [{ id, name, created_at }] }`, live projects only in deterministic `(created_at, id)` order — gated on the new `canTargetProjects` capability, derived from that one tool ALONE, independent of `canWrite`. (b) `card_create` input gains an optional top-level `project_id` riding NEXT TO the card (CardInput stays a pure Card subset). A server advertising `project_list` is **project-aware**: `project_id` is REQUIRED there — absent → `validation_failed` naming `project_list`; unknown or tombstoned project → `not_found`; there is NO default-project fallback. Idempotent replay of a known id runs BEFORE the targeting requirement, so a retry of a landed create never trips targeting. A server without `project_list` MUST ignore a sent `project_id`. (c) CardInput requiredness relaxes to human-intake defaults: `title` becomes the ONE required field; absent `id` → server-minted, absent `column_id` → the server's intake column (its first Board column — the `created` semantic state on a governance spine), absent `order` → append at end. A create is INTAKE ONLY: servers MUST NOT auto-tier (the card is untiered unless the input itself carries a tier) and MUST NOT trigger downstream automation. Data `schema_version` unchanged: no Card shape change.
 
@@ -246,9 +248,9 @@ Escalations and artifacts referencing a **tombstoned** card remain valid and ret
 - **The card returned by `card_create` is canonical.** The client MUST adopt it wholesale — including its `version` — replacing local state. This single rule covers retry replays, concurrent-edit races, and local→server migration (where the client discards the LocalProvider-minted version in favor of the server's).
 
 **Concurrency (`card_update`, `card_move`, `card_delete`):**
-- `expected_version` is REQUIRED. On mismatch the server returns a `conflict` error carrying the current card so the client can re-merge without an extra round trip.
+- `expected_version` is REQUIRED. On mismatch the server returns a `conflict` error carrying the current card under `meta.current` so the client can re-merge without an extra round trip.
 - `force: true` (update/move only) skips the version check. Clients MUST NOT default to force.
-- **Tombstoned cards are immutable.** Any `card_update`, `card_move`, or `card_delete` targeting a tombstone MUST fail with `conflict` (meta carries the tombstone), even with `force: true`. There is no undelete in v1; resurrection, if ever supported, is a v2 tool with its own semantics.
+- **Tombstoned cards are immutable.** Any `card_update`, `card_move`, or `card_delete` targeting a tombstone MUST fail with `conflict` (`meta.current` carries the tombstone), even with `force: true`. There is no undelete in v1; resurrection, if ever supported, is a v2 tool with its own semantics.
 - **Patch semantics — RFC 7386 key-presence (`card_update` only):** key ABSENT → field unchanged; key PRESENT with `null` → **clear the field**. Clearable set (all nullable): `due`, `effort`, `impact`. `depends_on` clears via `[]` (type-strict: sending `null` for `depends_on` → `validation_failed`). **Guarded set** — `tier`, `archived_at`, `deleted_at`: a key present with `null` → `validation_failed`, naming the governed tool that owns that field (`card_retier`, `card_archive`/`card_unarchive`, `card_delete` respectively). These fields move only through their governed tools; the back-door lifecycle mutation via patch-null is explicitly closed. **Client obligation:** never send a key you do not mean — a key's presence IS the intent signal.
 - **Tier is write-once on `card_update`.** A `patch.tier` that DIFFERS from the card's current set tier MUST fail with `validation_failed` — a set tier changes only through the governed `card_retier`. The free initial classification (an untiered card → its first tier) is allowed; a same-value `patch.tier`, or a patch with no `tier` key, is unaffected. Enforced server-side, so it holds even if a client bypasses any UI lock; `force` does NOT bypass it (force gates only the version check). The check runs AFTER the not-found / tombstone / version gate, so a tombstoned or stale target is still a `conflict`, not a validation error. This value-change guard is separate from and additive to the null guard above: both apply independently.
 
@@ -260,7 +262,7 @@ Escalations and artifacts referencing a **tombstoned** card remain valid and ret
 Tier is the one field with a control gradient (tier 1 = self-accept, weakest oversight … tier 4 = human, strongest), so changing a *set* tier is GOVERNED, not a free edit. `card_retier` is gated on `canRetier` (advertised iff the tool is present), independent of `canWrite`. Tier lives as a `tier:N` tag, not a native Card field — a re-tier rewrites that tag.
 
 - **Signature:** `{ id, new_tier, expected_version, reason }` → `{ card }`. `new_tier` is the `tier:N` tag id (the form the projection emits into `tags`; a client mapping an internal `tier-N` form does so at its own boundary). There is NO `column_id` and NO `force`.
-- **Concurrency:** `expected_version` is REQUIRED. A re-tier always runs against fresh state: on mismatch it returns `conflict` (meta carries the current card) — re-fetch and re-decide. There is deliberately NO `force`; a governed override never clobbers.
+- **Concurrency:** `expected_version` is REQUIRED. A re-tier always runs against fresh state: on mismatch it returns `conflict` (`meta.current` carries the current card) — re-fetch and re-decide. There is deliberately NO `force`; a governed override never clobbers.
 - **Invariants** (each → `validation_failed`), checked AFTER the not-found / tombstone / version gate (a tombstoned or stale target is a `conflict`, not a validation error):
   - the card MUST already be tiered — re-tier is N→M only; there is NO N→null clear in v1 (set the initial tier via `card_update`);
   - `new_tier` MUST be a valid tier (1..4);
@@ -273,7 +275,7 @@ Tier is the one field with a control gradient (tier 1 = self-accept, weakest ove
 Archiving takes a finished card out of the default working view without deleting anything. `archived_at` is an ORTHOGONAL nullable flag mirroring `deleted_at`'s shape — NOT a lifecycle state: the card keeps its `column_id`, its tags, and every other field, and stays fully readable and mutable. The pair is gated on `canArchive` (advertised iff `card_archive` is present), independent of `canWrite` and `canRetier`.
 
 - **Signature:** `{ id, expected_version, reason? }` → `{ card }` for both tools. There is NO `force`.
-- **Concurrency:** `expected_version` is REQUIRED. On mismatch the server returns `conflict` (meta carries the current card) — re-fetch and re-decide; a governed control never clobbers. Tombstoned cards are immutable as everywhere: either tool targeting one MUST fail with `conflict` (meta carries the tombstone). The not-found / tombstone / version gate runs FIRST — a tombstoned or stale target is a `conflict`, never a validation error.
+- **Concurrency:** `expected_version` is REQUIRED. On mismatch the server returns `conflict` (`meta.current` carries the current card) — re-fetch and re-decide; a governed control never clobbers. Tombstoned cards are immutable as everywhere: either tool targeting one MUST fail with `conflict` (`meta.current` carries the tombstone). The not-found / tombstone / version gate runs FIRST — a tombstoned or stale target is a `conflict`, never a validation error.
 - **Loud idempotency** (each → `validation_failed`, checked AFTER the gate): `card_archive` on an ALREADY-ARCHIVED card fails with "already archived"; `card_unarchive` on a NOT-ARCHIVED card fails with "not archived". Deliberately NOT idempotent-silent: a healthy operation and a broken caller must not emit the same signal — bulk sweepers filter their own targets rather than blind-firing.
 - **Escalation gate** (`card_archive` ONLY, → `validation_failed`): a card with an OPEN escalation (one that is live and not yet resolved) CANNOT be archived — "cannot archive a task with an unresolved escalation". Archiving would bury a card awaiting human attention; resolve the escalation first. `card_unarchive` is ungated (restoring a card to view never buries anything).
 - **Reason** — two layers, deliberately split:
@@ -296,13 +298,15 @@ Two layers, used per the protocols they belong to:
 {
   "code": "namespaced.string",
   "message": "human-readable",
-  "meta": { "retry_after?": seconds, "card?": Card }
+  "meta": { "retry_after?": seconds, "current?": Card }
 }
 ```
 
+**Conflict-envelope key (pinned v0.6.1):** on `conflict`, the current card — or the tombstone, for a tombstoned target — travels under `meta.current`. This is the canonical key and the one the reference implementation emits. `meta.card` is a LEGACY key: clients MAY tolerate it on read (e.g. `meta.current ?? meta.card`) for compatibility with pre-pin servers, but servers MUST NOT emit it.
+
 Reserved common codes (extensible; vendors namespace their own, e.g. `claunker.quota_exceeded`):
 
-`not_found` · `conflict` (meta carries current card) · `validation_failed` · `unauthorized` · `column_unknown` · `rate_limited` (meta carries retry_after) · `payload_too_large` · `schema_unsupported` · `sync_token_expired` (client response: full fetch) · `invalid_sync_token` (token is malformed or foreign, not merely old; client response: discard token, full fetch, and surface a diagnostic, since this indicates a bug or a backend switch rather than normal aging)
+`not_found` · `conflict` (`meta.current` carries the current card) · `validation_failed` · `unauthorized` · `column_unknown` · `rate_limited` (meta carries retry_after) · `payload_too_large` · `schema_unsupported` · `sync_token_expired` (client response: full fetch) · `invalid_sync_token` (token is malformed or foreign, not merely old; client response: discard token, full fetch, and surface a diagnostic, since this indicates a bug or a backend switch rather than normal aging)
 
 Unknown codes MUST be treated as non-retryable failures and surfaced, not swallowed, EXCEPT that clients MUST honor `meta.retry_after` whenever present on any code, known or vendor-defined.
 
