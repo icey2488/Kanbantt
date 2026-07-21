@@ -34,6 +34,7 @@ import { driveSync } from './lib/sync-instance.js';
 import { store, bootError, subscribe, getSnapshot, readLegacyDump, STORAGE_KEY } from './lib/store-instance.js';
 import { orderBetween, compareCards } from './lib/card-store.js';
 import { readKanbanttConfig, hasMcpTarget } from './lib/spine-config.js';
+import { snapBackCards, failureTruth } from './lib/spine-snapback.js';
 import { createdAtLabel, isOverdue } from './lib/date-chip.js';
 
 /* global __APP_VERSION__, __GIT_COMMIT__ */
@@ -5836,6 +5837,9 @@ export default function App() {
         ? `That card was deleted on the spine — your ${verb} was reverted.`
         : `Card changed on the spine — your ${verb} was reverted. Try again.`;
     }
+    if (e?.code === 'not_found') {
+      return `That card no longer exists on the spine — your ${verb} was dropped.`;
+    }
     return `Couldn't ${verb} — reverted. (${e?.message || e?.code || 'error'})`;
   };
   // Mint the destination column + LexoRank from the drop neighbors, reading from
@@ -5883,8 +5887,12 @@ export default function App() {
   // (preserving the read-only build's split-brain guard). Shape, every one:
   // CAPTURE prior state (incl. the spec-required version) → OPTIMISTIC apply →
   // call the provider → on SUCCESS reconcile with the returned Card (merge) and
-  // nudge a backstop poll → on FAILURE snap the prior state back SYNCHRONOUSLY
-  // (not waiting for the 5s poll) and surface a persistent error banner.
+  // nudge a backstop poll → on FAILURE reconcile SYNCHRONOUSLY (not waiting for
+  // the 5s poll) and surface a persistent error banner. The two STRUCTURAL writes
+  // (move/delete) reconcile failure through the uniform snap-back core
+  // (spine-snapback.js: adopt a live meta.current / drop a gone card / restore
+  // prior on unproven truth); the field writes keep the same three-way branch
+  // inline pending the same consolidation.
   const moveTaskMcp = async (draggedId, target) => {
     const provider = spineProvider();
     const model = spineModel;
@@ -5894,7 +5902,7 @@ export default function App() {
     const computed = computeDropOrder(model, draggedId, target);
     if (!computed) return;
     const { columnId, order } = computed;
-    const prior = { column_id: dragged.column_id, order: dragged.order }; // CAPTURE
+    const prior = dragged; // CAPTURE the full pre-optimistic card (snap-back's restore/re-insert source)
     const expected_version = dragged.version;
     setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
       c.id === draggedId ? { ...c, column_id: columnId, order } : c) } : m));
@@ -5904,17 +5912,15 @@ export default function App() {
         c.id === draggedId ? { ...c, ...card } : c) } : m));
       reconcileSpine();
     } catch (e) {
-      // SAME loud-revert path as saveTaskMcp: a `conflict` means the server already
-      // moved this card on (someone else dragged it, or a governed write retiered/
-      // archived it) and carries its fresh position under meta.current — restoring
-      // our captured `prior` would snap it back to a position the server no longer
-      // agrees with. Any other error (network/transport) means the write never
-      // landed → restore prior.
-      const fresh = e?.code === 'conflict' && e.meta?.current;
-      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // SNAP-BACK-or-REVERT (synchronous)
-        c.id === draggedId
-          ? (fresh ? { ...c, ...e.meta.current } : { ...c, column_id: prior.column_id, order: prior.order })
-          : c) } : m));
+      // UNIFORM SNAP-BACK (spine-snapback.js) — converge on what the failure PROVES:
+      // conflict+live → adopt meta.current (the server already moved this card on;
+      // restoring our captured prior would snap it to a position the server no
+      // longer agrees with); conflict+tombstone or not_found → the card is gone,
+      // drop it (polls never carry tombstones, so removal IS convergence — and a
+      // ghost restore would only fail every later write); anything else → the write
+      // never landed, restore prior (version-guarded against a mid-flight poll).
+      setSpineModel((m) => (m ? { ...m, cards: snapBackCards(m.cards, { id: draggedId, error: e, prior }) } : m)); // SNAP-BACK (synchronous)
+      if (failureTruth(e) !== 'unknown') reconcileSpine(); // known-truth convergence gets the success path's backstop poll
       surface(writeError('move', e));
     }
   };
@@ -6249,25 +6255,16 @@ export default function App() {
       await provider.cardDelete(id, { expected_version });
       reconcileSpine(); // confirm removal against the authoritative card_list
     } catch (e) {
-      // SAME loud-revert path as saveTaskMcp, with a delete-specific nuance: a
-      // `conflict` whose meta.current is ALREADY deleted_at means the card is
-      // genuinely gone server-side — the delete effectively already succeeded, so
-      // resurrecting it locally would be wrong; leave it removed. A `conflict`
-      // whose meta.current is NOT deleted (something else changed first, e.g. a
-      // version bump from an unrelated edit) means the card is still alive server-
-      // side → re-insert the server's fresh state, not our stale captured one. Any
-      // other error (network/transport) means the write never landed → restore the
-      // captured prior card (unless a poll already re-added it).
-      const fresh = e?.code === 'conflict' && e.meta?.current;
-      if (fresh && e.meta.current.deleted_at) {
-        // already deleted server-side — nothing to restore
-      } else {
-        setSpineModel((m) => { // SNAP-BACK-or-REVERT: restore (unless a poll re-added it)
-          if (!m) return m;
-          if (m.cards.some((c) => c.id === id)) return m;
-          return { ...m, cards: [...m.cards, fresh ? { ...priorCard, ...e.meta.current } : priorCard] };
-        });
-      }
+      // UNIFORM SNAP-BACK (spine-snapback.js) — the SAME core as moveTaskMcp; the
+      // delete nuances fall out of the truth classes: conflict+tombstone or
+      // not_found → already gone server-side, the delete effectively succeeded —
+      // leave it removed, never resurrect; conflict+live (something else changed
+      // first, e.g. a version bump from an unrelated edit) → the card still lives,
+      // re-insert the server's fresh state over the captured prior, not our stale
+      // copy; anything else → the write never landed, restore the captured prior
+      // (version-guarded: a poll that already re-added it fresher is left standing).
+      setSpineModel((m) => (m ? { ...m, cards: snapBackCards(m.cards, { id, error: e, prior: priorCard }) } : m)); // SNAP-BACK (synchronous)
+      if (failureTruth(e) !== 'unknown') reconcileSpine(); // known-truth convergence gets the success path's backstop poll
       surface(writeError('delete', e));
     }
   };
