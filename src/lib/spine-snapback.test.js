@@ -8,7 +8,7 @@
  *     the three truth classes plus the version guard and the poll races.
  *   - PROVIDER-DRIVEN tests: the REAL MCPProvider against the conforming
  *     in-process harness (spine-mcp-test-server.js), proving the classes AS
- *     THROWN by the provider (conflict meta.card → meta.current remap included)
+ *     THROWN by the provider (conflict meta.current normalization included)
  *     feed snapBackCards to convergence with the server's own store.
  *
  * Run:  node --test src/lib/spine-snapback.test.js
@@ -265,6 +265,27 @@ test('provider delete/gone: unknown id ⇒ not_found; snap-back leaves it remove
     assert.equal(e.code, 'not_found');
     assert.equal(failureTruth(e), 'gone');
     assert.deepEqual(snapBackCards([], { id: 'ghost', error: e, prior: ghost }), [], 'stays removed');
+  }
+  await provider.disconnect();
+  await harness.close();
+});
+
+test('provider tolerates meta.card from another conforming server — fallback still lands on meta.current', async () => {
+  // The spec never pins the conflict meta key; the real spine emits meta.current
+  // and the provider reads it first, with meta.card tolerated so a server built
+  // against the older reading still converges instead of degrading to blind revert.
+  const { provider, harness } = await connected({
+    seed: seedCard,
+    errorOn: { card_move: { code: 'conflict', message: 'legacy envelope', meta: { card: { id: 'c1', title: 'From legacy key', version: 'v9', tags: [] } } } },
+  });
+  const cur = harness.store.get('c1');
+  try {
+    await provider.cardMove('c1', 'doing', { order: 'x', expected_version: cur.version });
+    assert.fail('forced conflict must throw');
+  } catch (e) {
+    assert.equal(e.code, 'conflict');
+    assert.equal(e.meta.current.title, 'From legacy key', 'meta.card fell back onto meta.current');
+    assert.equal(failureTruth(e), 'stale');
   }
   await provider.disconnect();
   await harness.close();

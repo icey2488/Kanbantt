@@ -6,7 +6,8 @@
  * it closes the exact gaps the rewrite introduced:
  *   - which payload SHAPE the server emits (structuredContent vs a JSON text
  *     block) — the provider reads both; these tests prove it against each;
- *   - the conflict → meta.current remap (spec meta.card → board parity);
+ *   - the conflict meta.current pass-through (the real spine's key; meta.card
+ *     tolerated from other conforming servers);
  *   - capability gating off advertised tool names;
  *   - LocalProvider parity (get(missing) → null, version-conflict shape).
  *
@@ -691,6 +692,21 @@ test('WIRE card_retier new_tier null → SCHEMA-layer reject (no structuredConte
   assert.ok((h2.store.get('c1').tags || []).includes('tier:2'), 'tier unchanged via the provider path');
   await provider.disconnect();
   await h2.close();
+});
+
+test('WIRE conflict envelope: the current card rides meta.current — the REAL spine\'s key (parity)', async () => {
+  // Pinned by the snap-back e2e catch: the real spine's _conflict_result emits
+  // {"current": <card>}; the mock used to invent meta.card, so the provider read a
+  // key the real wire never carries and conflict snap-back silently degraded to a
+  // blind revert against the live spine. The KEY is the contract now.
+  const { callRaw, close } = await rawWire({ seed: tieredCard }); // version 1
+  const r = await callRaw('card_update', { id: 'c1', patch: { title: 'x' }, expected_version: 999 });
+  assert.equal(r.isError, true);
+  const p = payloadOf(r);
+  assert.equal(p.code, 'conflict');
+  assert.ok(p.meta.current && p.meta.current.id === 'c1', 'meta.current carries the freshly-read card');
+  assert.equal(p.meta.card, undefined, 'no meta.card — the mock-invented key is gone');
+  await close();
 });
 
 /* ================================================================== */

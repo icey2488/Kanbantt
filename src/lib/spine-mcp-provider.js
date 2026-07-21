@@ -22,9 +22,11 @@
  * network (the test seam that replaces the old makeInProcessTransport).
  *
  * FLAGGED DIVERGENCES / BOUNDARY ADAPTATIONS (declared, not silent):
- *  - Spec domain-error payload uses `meta.card`; the board's conflict contract
- *    (card-store StoreError) uses `meta.current`. We remap at this boundary so
- *    the board sees one shape. `meta.retry_after` is preserved on every code.
+ *  - The spec's conflict envelope "carries the current card" without pinning the
+ *    meta key. The real spine emits `meta.current`; `meta.card` is tolerated as
+ *    a fallback for other conforming servers. Either lands on the board's
+ *    conflict contract key, `meta.current` (the card-store StoreError shape).
+ *    `meta.retry_after` is preserved on every code.
  *  - LocalProvider's `list({ since, includeDeleted })` param names are kept at
  *    THIS interface; they map to the wire arg names `updated_since` /
  *    `include_deleted` inside card_list. Callers stay provider-agnostic.
@@ -114,11 +116,12 @@ function mapDomainError(payload) {
   const meta = (payload && payload.meta) || {};
   const out = { retry_after: meta.retry_after };
   if (code === 'conflict') {
-    // spec meta.card → board-parity meta.current. Normalize tier to internal
+    // Wire meta.current (the real spine's key; meta.card tolerated) → board-parity
+    // meta.current. Normalize tier to internal
     // (hyphen) form like every other Card crossing this boundary — the board's
     // conflict snap-back reconciles directly to this card, so it must not carry a
     // colon tier back into the internal model.
-    return new MCPProviderError('conflict', message, { ...out, current: toInternalCard(meta.card) });
+    return new MCPProviderError('conflict', message, { ...out, current: toInternalCard(meta.current ?? meta.card) });
   }
   return new MCPProviderError(code, message, { ...out, ...meta });
 }
