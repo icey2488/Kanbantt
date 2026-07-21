@@ -664,19 +664,33 @@ test('WIRE card_retier new_tier "tier:0" → validation_failed RANGE message; no
   await close();
 });
 
-test('WIRE card_retier new_tier null → REJECTED, no audit row, tier unchanged (spine-parity invariant) (parity)', async () => {
+test('WIRE card_retier new_tier null → SCHEMA-layer reject (no structuredContent); provider classifies request_failed (parity)', async () => {
   // Parity invariant: a null new_tier is REJECTED (no mutation, no audit row) — exactly what
-  // the spine does. ENVELOPE NUANCE: the real spine types new_tier as a REQUIRED string, so it
-  // rejects null at FastMCP's schema layer (isError, no domain code/message). The mock's
-  // permissive {type:object} schema admits null, so it surfaces a clean validation_failed via
-  // the SAME _patch_tier_to_int malformed path. Both reject; the reject-and-don't-audit
-  // invariant is what parity requires here.
+  // the spine does. ENVELOPE parity too: the real spine types new_tier as a REQUIRED string,
+  // so null dies at FastMCP's schema layer — isError carrying the failure as PLAIN TEXT, with
+  // NO structuredContent and no domain {code,message,meta} envelope. The mock's schemaError
+  // emits that same SHAPE (the verbatim pydantic text is not the contract).
   const { harness, callRaw, close } = await rawWire({ seed: tieredCard });
   const r = await callRaw('card_retier', { id: 'c1', new_tier: null, expected_version: 1, reason: 'probe' });
   assert.equal(r.isError, true, 'null new_tier is rejected (matches the spine: never applied)');
+  assert.equal(r.structuredContent, undefined, 'schema-layer reject carries NO structuredContent');
   assert.equal(harness.tierAudit().length, 0, 'no audit row on the rejected retier');
   assert.ok((harness.store.get('c1').tags || []).includes('tier:2'), 'tier unchanged');
   await close();
+
+  // PROVIDER classification: cardRetier forwards a null new_tier verbatim (tierInternalToWire
+  // passes non-strings through), hits the same schema-layer reject, and — finding no parseable
+  // domain envelope — surfaces it as MCPProviderError 'request_failed' (errorPayload's
+  // no-JSON fallback), never a silent success and never a spurious conflict.
+  const { provider, harness: h2 } = await connected({ seed: tieredCard });
+  await assert.rejects(
+    () => provider.cardRetier('c1', null, 1, 'probe'),
+    (e) => e instanceof MCPProviderError && e.code === 'request_failed',
+  );
+  assert.equal(h2.tierAudit().length, 0, 'no audit row via the provider path either');
+  assert.ok((h2.store.get('c1').tags || []).includes('tier:2'), 'tier unchanged via the provider path');
+  await provider.disconnect();
+  await h2.close();
 });
 
 /* ================================================================== */

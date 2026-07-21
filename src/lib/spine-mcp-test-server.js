@@ -241,6 +241,12 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
     : { structuredContent: obj, content: [{ type: 'text', text: JSON.stringify(obj) }] });
   const ok = (obj) => wrap(obj);
   const domainError = (code, message, meta = {}) => ({ isError: true, ...wrap({ code, message, meta }) });
+  /** A SCHEMA-LAYER rejection — the envelope the real spine emits when arguments
+   *  fail a tool's declared input schema BEFORE the tool body runs (FastMCP's
+   *  pydantic layer): isError carrying the failure as PLAIN TEXT, with NO
+   *  structuredContent and no domain {code,message,meta} envelope. The provider,
+   *  finding no parseable payload, classifies it request_failed. */
+  const schemaError = (text) => ({ isError: true, content: [{ type: 'text', text }] });
 
   /** Map a card-store StoreError onto a spec domain-error payload (conflict carries
    *  the current card under meta.card — the provider remaps it to meta.current). */
@@ -379,18 +385,20 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
           // card_retier path. The spine parses new_tier with _patch_tier_to_int in the TOOL
           // layer BEFORE the store gate (so a MALFORMED new_tier is validation_failed even on
           // a not_found/tombstoned card), then Spine.retier_task runs gate → untiered → 1..4
-          // RANGE → no-op → reason. So the order here is: malformed → gate(not_found /
-          // tombstone / version; NO force) → untiered → range → no-op → reason. On success:
+          // RANGE → no-op → reason. So the order here is: schema(null) → malformed →
+          // gate(not_found / tombstone / version; NO force) → untiered → range → no-op →
+          // reason. On success:
           // rewrite the tier tag (every OTHER tag untouched) + append ONE audit row. NO
           // rejection branch writes a row.
+          // The real spine types new_tier as a REQUIRED string, so a literal null (or an
+          // omitted new_tier) dies at FastMCP's schema layer before the tool body runs —
+          // schemaError envelope, no mutation, no audit row.
+          if (a.new_tier == null) {
+            return schemaError('1 validation error for card_retier\nnew_tier\n  Input should be a valid string [type=string_type, input_value=None, input_type=NoneType]');
+          }
           const newTier = patchTierToInt(a.new_tier);
           if (newTier === null) {
-            // MALFORMED (incl. a literal null), classified BEFORE the gate as the spine does.
-            // NOTE: the real spine types new_tier as a REQUIRED string, so on the wire a literal
-            // null is rejected at FastMCP's schema layer (isError, NO domain envelope) and never
-            // reaches _patch_tier_to_int; the mock's permissive {type:object} schema lets null
-            // through, so it lands here as a clean validation_failed. Both REJECT (no mutation,
-            // no audit row) — the parity invariant — differing only in the error envelope.
+            // MALFORMED, classified BEFORE the gate as the spine does.
             return domainError('validation_failed', malformedTierMsg(a.new_tier), { id: a.id });
           }
           const gate = gateMutable(a.id, { expected_version: a.expected_version }); // NO force
