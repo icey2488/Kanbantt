@@ -98,10 +98,11 @@ function tierFoldPatch(patch, current) {
 
 /** Emit-side projection parity: the real spine's Card lens (projection.to_card, and
  *  tombstone_card which reuses it) ALWAYS emits a `tags` ARRAY — [] when untiered
- *  (projection._tags_for) — on EVERY card that crosses the wire, conflict meta.card
- *  included. The store, by contrast, preserves client fields verbatim, so a tagless
- *  create stores no `tags` key at all. Normalize at the wire boundary, never in the
- *  store (LocalProvider shares card-store and its cards are not wire Cards). */
+ *  (projection._tags_for) — on EVERY card that crosses the wire, conflict
+ *  meta.current included. The store, by contrast, preserves client fields verbatim,
+ *  so a tagless create stores no `tags` key at all. Normalize at the wire boundary,
+ *  never in the store (LocalProvider shares card-store and its cards are not wire
+ *  Cards). */
 const emitCard = (c) => (c && typeof c === 'object' && !Array.isArray(c.tags) ? { ...c, tags: [] } : c);
 
 /* ---- tier as an INTEGER (re-tier governance: range, no-op, write-once checks) ----
@@ -249,9 +250,10 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
   const schemaError = (text) => ({ isError: true, content: [{ type: 'text', text }] });
 
   /** Map a card-store StoreError onto a spec domain-error payload (conflict carries
-   *  the current card under meta.card — the provider remaps it to meta.current). */
+   *  the current card under meta.current — the REAL spine's key, which the provider
+   *  passes through to the board's conflict contract verbatim). */
   function fromStoreError(e) {
-    if (e && e.code === 'conflict') return domainError('conflict', e.message, { card: emitCard(e.meta && e.meta.current) });
+    if (e && e.code === 'conflict') return domainError('conflict', e.message, { current: emitCard(e.meta && e.meta.current) });
     if (e && e.code) return domainError(e.code, e.message, e.meta || {});
     return domainError('request_failed', (e && e.message) || 'error');
   }
@@ -267,8 +269,8 @@ export function createMcpTestServer({ seed, name = 'Claunker', omitTools = [], p
     const card = store.get(id); // get() returns a clone, tombstones included, or null
     if (!card) return { error: domainError('not_found', `no card ${id}`, { id }) };
     // A tombstone is immutable — even force cannot resurrect it (checked before version).
-    if (card.deleted_at) return { error: domainError('conflict', 'version conflict', { card: emitCard(card) }) };
-    if (!force && expected_version !== card.version) return { error: domainError('conflict', 'version conflict', { card: emitCard(card) }) };
+    if (card.deleted_at) return { error: domainError('conflict', 'version conflict', { current: emitCard(card) }) };
+    if (!force && expected_version !== card.version) return { error: domainError('conflict', 'version conflict', { current: emitCard(card) }) };
     return { card };
   }
 
