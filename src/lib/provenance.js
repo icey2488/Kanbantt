@@ -11,14 +11,28 @@
  *
  *   - absent / null                         → null   (most cards)
  *   - a bare string actor (LocalProvider)   → null   (identity only, no provenance)
- *   - { type, id }        (spine identity)  → null   (human or plain agent, no provenance)
- *   - { type, id, model?, effort?, job_id? }→ the provenance (agent mint)
+ *   - { type: 'human', ... }                → null   (human mint — NEVER provenance,
+ *                                              even if stray model/effort keys ride along)
+ *   - { type: 'agent', id }                 → null   (agent identity, no provenance)
+ *   - { type: 'agent', id, model?, effort? }→ the provenance (agent mint)
  *   - unknown foreign keys                  → ignored, never an error (MCP interop:
  *                                              extra keys must not break our read path)
  *
- * Provenance is considered PRESENT iff at least one of `model` / `effort` is a
- * non-empty string — those are the chip's content. `actor` (the created_by `id`) and
- * `job_id` enrich the dialog block but do NOT, alone, surface a chip.
+ * THE TYPE IS THE GATE (spec v0.7.0). Provenance renders ONLY for an agent-typed
+ * identity: `created_by.type === 'agent'`. This is deliberate. The spine re-stamps
+ * identity from the authenticated credential and only MERGES the client's descriptive
+ * sub-keys onto it, so a wire mint carrying `{type:'agent', model:'x'}` from a caller
+ * authenticated as the human operator is stored as `{type:'human', id:'operator',
+ * model:'x'}` — a card stamped human-minted that happens to carry a model. That is an
+ * INCOHERENT audit record (a human mint has no reasoning model), and rendering a
+ * dispatch chip on it would launder a human write as an agent dispatch. So presence of
+ * `model`/`effort` is NECESSARY but NOT SUFFICIENT: the identity discriminator decides,
+ * and a human-typed created_by renders NOTHING (no chip on the face, no dialog block)
+ * regardless of what stray keys it carries.
+ *
+ * Given an agent-typed identity, provenance is considered PRESENT iff at least one of
+ * `model` / `effort` is a non-empty string — those are the chip's content. `actor` (the
+ * created_by `id`) and `job_id` enrich the dialog block but do NOT, alone, surface a chip.
  */
 
 function nonEmptyString(v) {
@@ -33,6 +47,10 @@ function nonEmptyString(v) {
  */
 export function readProvenance(createdBy) {
   if (!createdBy || typeof createdBy !== 'object' || Array.isArray(createdBy)) return null;
+  // TYPE IS THE GATE: provenance renders ONLY for an agent-typed identity. A human-typed
+  // (or type-less) created_by carrying stray model/effort keys is not valid provenance —
+  // render nothing. See the header note on cyborg cards for why presence alone is unsafe.
+  if (createdBy.type !== 'agent') return null;
   const model = nonEmptyString(createdBy.model);
   const effort = nonEmptyString(createdBy.effort);
   if (!model && !effort) return null; // identity-only / foreign object with no dispatch provenance
