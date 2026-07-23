@@ -587,13 +587,16 @@ export function createMCPProvider({
       });
       return toInternalCard(out.card);
     },
-    async cardUpdate(id, { title, acceptance_criteria, tier, effort, impact, due, depends_on, expected_version } = {}) {
+    async cardUpdate(id, { title, description, acceptance_criteria, tier, effort, impact, due, depends_on, expected_version } = {}) {
       requireCapability('canWrite');
       // Field-scoped patch: only the keys actually supplied, so an unset field is
       // never clobbered with `undefined`. column_id/order are NOT update fields — a
       // reposition is cardMove (update never repositions, mirroring card-store).
       const patch = {};
       if (title !== undefined) patch.title = title;
+      // description: the narrative body (spec v0.8.0). Forwarded verbatim including null
+      // (RFC 7386 key-presence: null clears the body on the spine, same as effort/impact/due).
+      if (description !== undefined) patch.description = description;
       if (acceptance_criteria !== undefined) patch.acceptance_criteria = acceptance_criteria;
       // Tier crosses the wire in COLON form; the board edits it in internal HYPHEN
       // form. Map internal → wire HERE so the spine's strict validator accepts it.
