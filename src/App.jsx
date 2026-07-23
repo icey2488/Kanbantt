@@ -38,7 +38,7 @@ import { readKanbanttConfig, hasMcpTarget } from './lib/spine-config.js';
 import { snapBackCards, failureTruth } from './lib/spine-snapback.js';
 import { createdAtLabel, isOverdue } from './lib/date-chip.js';
 import { readProvenance } from './lib/provenance.js';
-import { formatModelLabel } from './lib/model-label.js';
+import { formatModelLabel, provenanceChipTreatment } from './lib/model-label.js';
 
 /* global __APP_VERSION__, __GIT_COMMIT__ */
 // Injected by Vite's define() as string literals (see vite.config.js). In dev the
@@ -1094,6 +1094,16 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
   // pill, never "unknown"). Lives inside created_by, so it can't collide with the card's
   // own effort/impact Matrix axes. Read-only — the mint stamp is immutable.
   const provenance = readProvenance(task.created_by);
+  // Vendor-keyed chip color (design: orange = this stack minted it, slate = a
+  // foreign/unrecognized MCP caller did — see CHIP_COLORS and provenanceChipTreatment).
+  // Both tokens are opaque per-theme hues already computed to clear 4.5:1 against
+  // C.surface (see the CHIP_COLORS block comment); effort-only provenance (no model
+  // to key a vendor off of) keeps the prior neutral C.textDim treatment unchanged.
+  const cc = CHIP_COLORS[C.name] || CHIP_COLORS.Dark;
+  const provenanceTreatment = provenance ? provenanceChipTreatment(provenance.model) : null;
+  const provenanceColor = provenanceTreatment === 'anthropic' ? cc.orange.text
+    : provenanceTreatment === 'foreign' ? cc.slate.text
+    : C.textDim;
 
   const priorityColor = C[PRIORITY[task.priority].key];
   const taskTags = (task.tags || []).map((id) => tags.find((t) => t.id === id)).filter(Boolean);
@@ -1293,14 +1303,16 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
               </div>
             )}
             {provenance && (
-              // Quiet dispatch-provenance chip: icon + short label, in the SAME flat
-              // mono/textDim idiom as the checklist and depends-on chips below (no
-              // border/pill/background — that bordered-pill look was the layout bug,
-              // not a style to preserve). Model is the primary face signal; effort
-              // only appears here as a fallback when a mint carries no model, so a
-              // present-but-content-light provenance still renders SOMETHING rather
-              // than an empty chip. Full model/effort/actor/job_id ride the tooltip
-              // and the read-only dialog block.
+              // Dispatch-provenance chip: icon + short label, flat (no border/pill/
+              // background — that bordered-pill look was the layout bug, not a style to
+              // preserve), same as the checklist/depends-on chips below. Its COLOR is
+              // now vendor-keyed (provenanceColor, above) rather than flat textDim: this
+              // stack's own Anthropic mints read as orange, any other MCP caller's model
+              // string reads as slate — a glance tells you which stack minted the card.
+              // Model is the primary face signal; effort only appears here as a fallback
+              // when a mint carries no model, so a present-but-content-light provenance
+              // still renders SOMETHING rather than an empty chip. Full model/effort/
+              // actor/job_id ride the tooltip and the read-only dialog block.
               <div
                 title={[
                   provenance.actor && `minted by ${provenance.actor}`,
@@ -1310,7 +1322,7 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
                 ].filter(Boolean).join(' · ')}
                 style={{
                   display: 'inline-flex', alignItems: 'center', gap: 3,
-                  fontFamily: F.mono, fontSize: 10, color: C.textDim,
+                  fontFamily: F.mono, fontSize: 10, color: provenanceColor,
                   letterSpacing: '0.04em', whiteSpace: 'nowrap',
                   maxWidth: 96, overflow: 'hidden',
                 }}>

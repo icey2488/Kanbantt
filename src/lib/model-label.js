@@ -33,6 +33,20 @@ function titleCase(word) {
 }
 
 /**
+ * Vendor-keyed treatment for the provenance chip's color (see App.jsx's CHIP_COLORS
+ * orange/slate tokens): `'anthropic'` for a recognized VENDOR_PREFIXES match (this
+ * stack minted the card), `'foreign'` for any OTHER non-empty model string — the MCP
+ * spec lets any caller stamp any model id, so an unrecognized string is a real signal
+ * ("not this stack"), not an error. Returns `null` when there is no model to key off
+ * (effort-only provenance keeps the existing neutral chip treatment).
+ */
+export function provenanceChipTreatment(model) {
+  if (typeof model !== 'string' || !model.trim()) return null;
+  const lower = model.trim().toLowerCase();
+  return VENDOR_PREFIXES.some((p) => lower.startsWith(p)) ? 'anthropic' : 'foreign';
+}
+
+/**
  * Maps a dispatch-provenance model ID to a short display label, or null for an empty
  * input. Never returns a mid-word truncation — see module header for the two rules.
  */

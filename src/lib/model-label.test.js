@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatModelLabel } from './model-label.js';
+import { formatModelLabel, provenanceChipTreatment } from './model-label.js';
 
 /* ------------------------------------------------------------------ */
 /* known Anthropic IDs → "<Family> <version>"                         */
@@ -69,4 +69,33 @@ test('null / undefined / empty / whitespace-only → null', () => {
 test('non-string input → null (never throws)', () => {
   assert.equal(formatModelLabel(123), null);
   assert.equal(formatModelLabel({ id: 'x' }), null);
+});
+
+/* ------------------------------------------------------------------ */
+/* provenanceChipTreatment — vendor→color-key mapping for the chip    */
+/* ------------------------------------------------------------------ */
+
+test('an Anthropic-vendor ID gets the "anthropic" treatment', () => {
+  assert.equal(provenanceChipTreatment('claude-sonnet-5'), 'anthropic');
+  assert.equal(provenanceChipTreatment('claude-haiku-4-5-20251001'), 'anthropic');
+  assert.equal(provenanceChipTreatment('anthropic.claude-3-5-sonnet'), 'anthropic');
+  assert.equal(provenanceChipTreatment('anthropic/claude-3-5-sonnet'), 'anthropic');
+});
+
+test('an unrecognized/foreign vendor ID gets the "foreign" treatment', () => {
+  assert.equal(provenanceChipTreatment('gpt-4-turbo'), 'foreign');
+  assert.equal(provenanceChipTreatment('gemini-2.0-pro'), 'foreign');
+  assert.equal(provenanceChipTreatment('some-unknown-caller-model'), 'foreign');
+});
+
+test('a missing model → null (no vendor to key a color off, no chip color decision made)', () => {
+  assert.equal(provenanceChipTreatment(null), null);
+  assert.equal(provenanceChipTreatment(undefined), null);
+  assert.equal(provenanceChipTreatment(''), null);
+  assert.equal(provenanceChipTreatment('   '), null);
+});
+
+test('non-string input → null (never throws)', () => {
+  assert.equal(provenanceChipTreatment(123), null);
+  assert.equal(provenanceChipTreatment({ id: 'x' }), null);
 });
