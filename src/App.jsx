@@ -38,6 +38,7 @@ import { readKanbanttConfig, hasMcpTarget } from './lib/spine-config.js';
 import { snapBackCards, failureTruth } from './lib/spine-snapback.js';
 import { createdAtLabel, isOverdue } from './lib/date-chip.js';
 import { readProvenance } from './lib/provenance.js';
+import { formatModelLabel } from './lib/model-label.js';
 
 /* global __APP_VERSION__, __GIT_COMMIT__ */
 // Injected by Vite's define() as string literals (see vite.config.js). In dev the
@@ -1271,24 +1272,35 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
                 fontFamily: F.mono, fontSize: 10.5,
                 color: overdue ? C.coral : C.textDim,
                 letterSpacing: '0.05em', textTransform: 'uppercase',
-                fontWeight: overdue ? 600 : 400,
+                fontWeight: overdue ? 600 : 400, whiteSpace: 'nowrap',
               }}>
                 {overdue ? '◆ ' : ''}{dueLabel}
               </div>
             )}
             {createdLabel && (
+              // whiteSpace: nowrap matters here — "TODAY HH:MM" has a space, and a
+              // flex item's automatic min-width is its min-content size, which for
+              // wrappable text is the widest WORD, not the full string. In a narrow
+              // column that let the row shrink this item down to one word per line
+              // ("TODAY" / "03:12"). nowrap fixes the min-content size at the full
+              // label so the row clips or crowds instead of ever breaking it in two.
               <div style={{
                 fontFamily: F.mono, fontSize: 10.5,
                 color: C.ice, letterSpacing: '0.05em', textTransform: 'uppercase',
+                whiteSpace: 'nowrap',
               }}>
                 {createdLabel}
               </div>
             )}
             {provenance && (
-              // Quiet dispatch-provenance chip: a Cpu glyph + compact model + effort,
-              // in the same mono/textDim key as the date chips (never a loud badge — it
-              // must not compete with the escalation pill or the tier tag). Full detail
-              // rides in the tooltip; the read-only block in the dialog carries the rest.
+              // Quiet dispatch-provenance chip: icon + short label, in the SAME flat
+              // mono/textDim idiom as the checklist and depends-on chips below (no
+              // border/pill/background — that bordered-pill look was the layout bug,
+              // not a style to preserve). Model is the primary face signal; effort
+              // only appears here as a fallback when a mint carries no model, so a
+              // present-but-content-light provenance still renders SOMETHING rather
+              // than an empty chip. Full model/effort/actor/job_id ride the tooltip
+              // and the read-only dialog block.
               <div
                 title={[
                   provenance.actor && `minted by ${provenance.actor}`,
@@ -1298,15 +1310,14 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
                 ].filter(Boolean).join(' · ')}
                 style={{
                   display: 'inline-flex', alignItems: 'center', gap: 3,
-                  padding: '1px 5px', borderRadius: 5,
-                  border: `1px solid ${C.border}`,
-                  fontFamily: F.mono, fontSize: 9.5, color: C.textDim,
-                  letterSpacing: '0.03em', maxWidth: 150, overflow: 'hidden',
+                  fontFamily: F.mono, fontSize: 10, color: C.textDim,
+                  letterSpacing: '0.04em', whiteSpace: 'nowrap',
+                  maxWidth: 96, overflow: 'hidden',
                 }}>
-                <Cpu size={9} strokeWidth={2} style={{ flexShrink: 0, opacity: 0.8 }} />
-                <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {[provenance.model && provenance.model.replace(/^claude-/, ''), provenance.effort]
-                    .filter(Boolean).join(' · ')}
+                <Cpu size={10} strokeWidth={1.75} style={{ flexShrink: 0, opacity: 0.75 }} />
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {formatModelLabel(provenance.model)
+                    || (provenance.effort ? provenance.effort.charAt(0).toUpperCase() + provenance.effort.slice(1) : '')}
                 </span>
               </div>
             )}
