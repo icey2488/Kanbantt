@@ -20,7 +20,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 import { createMcpTestServer } from './spine-mcp-test-server.js';
-import { createMCPProvider, MCPProviderError, classifyFatal } from './spine-mcp-provider.js';
+import { createMCPProvider, MCPProviderError, classifyFatal, toInternalCard } from './spine-mcp-provider.js';
 
 /** Connect a provider to a fresh harness; returns { provider, harness }. */
 async function connected(opts = {}) {
@@ -927,4 +927,39 @@ test('cardCreate is unsupported when the card_* write set is incomplete (canWrit
   await assert.rejects(() => provider.cardCreate({ title: 'x' }), (e) => e instanceof MCPProviderError && e.code === 'unsupported_capability');
   await provider.disconnect();
   await harness.close();
+});
+
+/* ================================================================== */
+/* dispatch provenance: the read path tolerates it (absent/present/  */
+/* unknown keys) and never strips it — created_by rides through      */
+/* toInternalCard, the one wire→internal projection.                 */
+/* ================================================================== */
+
+test('toInternalCard preserves created_by dispatch provenance (model/effort/job_id)', () => {
+  const wire = {
+    id: 'c1', title: 'x', column_id: 'todo', tags: [],
+    created_by: { type: 'agent', id: 'claude-code', model: 'claude-sonnet-5', effort: 'medium', job_id: 'job-7' },
+  };
+  const internal = toInternalCard(wire);
+  assert.deepEqual(internal.created_by, wire.created_by); // whole stamp survives verbatim
+});
+
+test('toInternalCard tolerates UNKNOWN keys inside created_by (foreign server dialect)', () => {
+  const wire = {
+    id: 'c1', title: 'x', tags: ['tier:2'],
+    created_by: { type: 'agent', id: 'other', model: 'their-model', vendor_trace: { span: 'abc' }, cost_cents: 3 },
+  };
+  const internal = toInternalCard(wire);
+  // Tier is still derived from tags; created_by (incl. unknown keys) is untouched.
+  assert.equal(internal.tier, 'tier-2');
+  assert.deepEqual(internal.created_by, wire.created_by);
+});
+
+test('toInternalCard tolerates ABSENT created_by (human/local card renders no provenance)', () => {
+  const noStamp = toInternalCard({ id: 'c1', title: 'x', tags: [] });
+  assert.equal('created_by' in noStamp ? noStamp.created_by : undefined, undefined);
+  // A bare-string created_by (LocalProvider legacy) also survives untouched — the UI
+  // reader is what decides it carries no provenance, the provider never coerces it.
+  const strStamp = toInternalCard({ id: 'c2', title: 'y', tags: [], created_by: 'tester' });
+  assert.equal(strStamp.created_by, 'tester');
 });
