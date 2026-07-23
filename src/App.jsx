@@ -28,6 +28,7 @@ import {
   Palette,
   Archive,
   ArchiveRestore,
+  Cpu,
 } from 'lucide-react';
 import { initAuth, signIn, signOut, isGisReady } from './lib/auth.js';
 import { driveSync } from './lib/sync-instance.js';
@@ -36,6 +37,7 @@ import { orderBetween, compareCards } from './lib/card-store.js';
 import { readKanbanttConfig, hasMcpTarget } from './lib/spine-config.js';
 import { snapBackCards, failureTruth } from './lib/spine-snapback.js';
 import { createdAtLabel, isOverdue } from './lib/date-chip.js';
+import { readProvenance } from './lib/provenance.js';
 
 /* global __APP_VERSION__, __GIT_COMMIT__ */
 // Injected by Vite's define() as string literals (see vite.config.js). In dev the
@@ -1086,6 +1088,11 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
     else if (daysOut === -1) dueLabel = 'Yesterday';
   }
   const createdLabel = task.created_at ? createdAtLabel(task.created_at) : null;
+  // Dispatch provenance (spec v0.7.0): a QUIET model+effort chip rendered ONLY when the
+  // card carries it (agent mints). Human/local cards → null → no chip (never an empty
+  // pill, never "unknown"). Lives inside created_by, so it can't collide with the card's
+  // own effort/impact Matrix axes. Read-only — the mint stamp is immutable.
+  const provenance = readProvenance(task.created_by);
 
   const priorityColor = C[PRIORITY[task.priority].key];
   const taskTags = (task.tags || []).map((id) => tags.find((t) => t.id === id)).filter(Boolean);
@@ -1275,6 +1282,32 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
                 color: C.ice, letterSpacing: '0.05em', textTransform: 'uppercase',
               }}>
                 {createdLabel}
+              </div>
+            )}
+            {provenance && (
+              // Quiet dispatch-provenance chip: a Cpu glyph + compact model + effort,
+              // in the same mono/textDim key as the date chips (never a loud badge — it
+              // must not compete with the escalation pill or the tier tag). Full detail
+              // rides in the tooltip; the read-only block in the dialog carries the rest.
+              <div
+                title={[
+                  provenance.actor && `minted by ${provenance.actor}`,
+                  provenance.model && `model ${provenance.model}`,
+                  provenance.effort && `effort ${provenance.effort}`,
+                  provenance.job_id && `job ${provenance.job_id}`,
+                ].filter(Boolean).join(' · ')}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 3,
+                  padding: '1px 5px', borderRadius: 5,
+                  border: `1px solid ${C.border}`,
+                  fontFamily: F.mono, fontSize: 9.5, color: C.textDim,
+                  letterSpacing: '0.03em', maxWidth: 150, overflow: 'hidden',
+                }}>
+                <Cpu size={9} strokeWidth={2} style={{ flexShrink: 0, opacity: 0.8 }} />
+                <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {[provenance.model && provenance.model.replace(/^claude-/, ''), provenance.effort]
+                    .filter(Boolean).join(' · ')}
+                </span>
               </div>
             )}
             {hasChecklist && (
@@ -2838,6 +2871,11 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
   const [resolveError, setResolveError] = useState(null);
   const [resolvedLocally, setResolvedLocally] = useState(null); // null | { resolution, resolution_rationale }
 
+  // Dispatch provenance (spec v0.7.0), read-only: present only for agent-minted cards.
+  // NOT editable — no input, no select; the mint stamp is immutable (write-once), and
+  // this block is display-only. Absent entirely for human/local cards.
+  const provenance = readProvenance(task.created_by);
+
   const rawBadge = task.badge && task.badge.kind === 'escalation' ? task.badge : null;
   const badge = resolvedLocally
     ? (resolvedLocally.resolution === 'approve'
@@ -3152,6 +3190,44 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
                 </button>
               </div>
             )}
+          </div>
+        )}
+
+        {/* Dispatch provenance (spec v0.7.0) — READ-ONLY. How this card was MINTED
+            (reasoning model, effort budget, minting actor, originating job). Shown ONLY
+            for agent-minted cards (human/local cards render nothing). Deliberately OUTSIDE
+            the form fieldset and carrying NO input/select: mint provenance is write-once
+            and immutable — the board reports it, never edits it. */}
+        {provenance && (
+          <div style={{
+            marginBottom: 22, padding: 14,
+            background: `${C.textDim}0d`,
+            border: `1px solid ${C.border}`,
+            borderRadius: 10,
+          }}>
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 7, marginBottom: 12,
+              fontFamily: F.mono, fontSize: 10, color: C.textMuted, fontWeight: 700,
+              letterSpacing: '0.12em', textTransform: 'uppercase',
+            }}>
+              <Cpu size={13} strokeWidth={2} />
+              Dispatch provenance
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px 24px' }}>
+              {[
+                ['Model', provenance.model],
+                ['Effort', provenance.effort],
+                ['Actor', provenance.actor],
+                ['Job', provenance.job_id],
+              ].filter(([, v]) => v).map(([label, value]) => (
+                <div key={label}>
+                  <div style={fieldLabel}>{label}</div>
+                  <div style={{
+                    fontFamily: F.mono, fontSize: 12, color: C.text, wordBreak: 'break-all',
+                  }}>{value}</div>
+                </div>
+              ))}
+            </div>
           </div>
         )}
 

@@ -254,7 +254,7 @@ function tierFromTags(tags) {
  *  already equals the derived value (idempotent: a re-projected card is
  *  unchanged; a fresh wire card with no `tier` field is cloned once to carry the
  *  derived value, including the explicit null that drives tierLock). */
-function toInternalCard(card) {
+export function toInternalCard(card) {
   if (!card || typeof card !== 'object') return card;
   const tier = tierFromTags(card.tags);
   return card.tier === tier ? card : { ...card, tier };
