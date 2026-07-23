@@ -92,3 +92,30 @@ test('non-string / empty model+effort → null (never a blank chip)', () => {
   assert.equal(readProvenance({ type: 'agent', id: 'a', model: 123, effort: '' }), null);
   assert.equal(readProvenance({ type: 'agent', id: 'a', model: '   ' }), null);
 });
+
+// ── INTEROP: structured (non-string) unknown values from a foreign server ──────
+// The spine relaxed its write-admission rule (spec v0.7.0): unknown keys may now carry
+// ANY JSON value — a nested object, an array, a number, a bool, null — up to a depth cap.
+// So a card can now reach the board with a structured value under an unknown key. The
+// read path must IGNORE those values (it only reads type/model/effort/id/job_id) and
+// render the real provenance exactly as if they were absent — never throw on the nesting.
+test('card with nested/array/number unknown values still renders correctly (does not crash read path)', () => {
+  const fromForeignServer = {
+    type: 'agent', id: 'claude-code',
+    model: 'claude-sonnet-5', effort: 'high', job_id: 'job-42',
+    vendor_trace: { span: 'abc', duration: 12 }, // nested object (spine depth 2)
+    retries: [1, 2, 3], cost_cents: 3, cached: true, note: null,
+  };
+  // Renders the genuine provenance, unknown structured values ignored, no throw.
+  assert.deepEqual(readProvenance(fromForeignServer), {
+    model: 'claude-sonnet-5', effort: 'high', actor: 'claude-code', job_id: 'job-42',
+  });
+  assert.equal(hasProvenance(fromForeignServer), true);
+});
+
+test('nested unknown value with NO modeled provenance → null (no blank chip, no throw)', () => {
+  // An agent identity carrying only a structured foreign key and no model/effort renders
+  // nothing — the nested value must not be mistaken for chip content or crash the reader.
+  assert.equal(readProvenance({ type: 'agent', id: 'a', vendor_trace: { span: 'x', nested: { deep: 1 } } }), null);
+  assert.equal(hasProvenance({ type: 'agent', id: 'a', vendor_trace: { span: 'x' } }), false);
+});
