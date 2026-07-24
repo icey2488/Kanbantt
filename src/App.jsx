@@ -6109,7 +6109,7 @@ export default function App() {
     const patch = {};
     if ('effort' in update) patch.effort = update.effort ?? null;
     if ('impact' in update) patch.impact = update.impact ?? null;
-    const prior = { effort: cur.effort, impact: cur.impact }; // CAPTURE
+    const prior = cur; // CAPTURE the full pre-optimistic card (snap-back's restore/re-insert source)
     const expected_version = cur.version;
     setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
       c.id === taskId ? { ...c, ...patch } : c) } : m));
@@ -6119,12 +6119,13 @@ export default function App() {
         c.id === taskId ? { ...c, ...card } : c) } : m));
       reconcileSpine();
     } catch (e) {
-      const fresh = e?.code === 'conflict' && e.meta?.current;
-      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // SNAP-BACK-or-REVERT (synchronous)
-        c.id === taskId
-          ? (fresh ? { ...c, ...e.meta.current } : { ...c, effort: prior.effort, impact: prior.impact })
-          : c) } : m));
-      surface(writeError('classify', e));
+      // UNIFORM SNAP-BACK (spine-snapback.js) — the SAME core as saveTaskMcp/moveTaskMcp:
+      // conflict+live → adopt meta.current (someone else's write already landed); conflict+
+      // tombstone or not_found → the card is gone, drop it; anything else → the write never
+      // landed, restore prior.
+      setSpineModel((m) => (m ? { ...m, cards: snapBackCards(m.cards, { id: taskId, error: e, prior }) } : m)); // SNAP-BACK (synchronous)
+      if (failureTruth(e) !== 'unknown') reconcileSpine(); // known-truth convergence gets the success path's backstop poll
+      surface(mutationNotice('classify', e));
     }
   };
 
@@ -6254,23 +6255,23 @@ export default function App() {
     if (!provider || !model) { surface('No live spine connection — unarchive not sent.'); return undefined; }
     const cur = model.cards.find((c) => c.id === id && !c.deleted_at);
     if (!cur) { surface('That card was deleted'); return undefined; }
-    const prior = { archived_at: cur.archived_at ?? null }; // CAPTURE
+    const prior = cur; // CAPTURE the full pre-optimistic card
     const expected_version = cur.version;
     setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
       c.id === id ? { ...c, archived_at: null } : c) } : m));
     try {
       const card = await provider.cardUnarchive(id, expected_version);
-      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // RECONCILE
+      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // RECONCILE (merge fresh flag + version)
         c.id === id ? { ...c, ...card } : c) } : m));
       reconcileSpine();
       return card;
     } catch (e) {
-      const fresh = e?.code === 'conflict' && e.meta?.current;
-      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // SNAP-BACK-or-REVERT
-        c.id === id
-          ? (fresh ? { ...c, ...e.meta.current } : { ...c, archived_at: prior.archived_at })
-          : c) } : m));
-      surface(writeError('unarchive', e));
+      // UNIFORM SNAP-BACK (spine-snapback.js) — the SAME core as archiveTaskMcp: conflict+
+      // live snaps to the server's truth; conflict+tombstone or not_found drops the card;
+      // anything else restores the captured prior.
+      setSpineModel((m) => (m ? { ...m, cards: snapBackCards(m.cards, { id, error: e, prior }) } : m));
+      if (failureTruth(e) !== 'unknown') reconcileSpine();
+      surface(mutationNotice('unarchive', e));
       throw e;
     }
   };
