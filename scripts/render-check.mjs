@@ -13,9 +13,17 @@
  *     (b) every column header sits above its first card's box
  *     (c) the rightmost column is reachable — either it's already inside the
  *         panel/viewport bound, or there's a genuine working scrollbar to it
+ *     (f) after scrolling to reach it, the panel's border box AND its
+ *         background-bearing child still extend under the reached column
+ *         (both scroll with the document, so re-measured post-scroll, not
+ *         reused from the pre-scroll rects)
  *   All four views (board/calendar/gantt/matrix):
  *     (d) no unintended horizontal viewport overflow
  *     (e) no content rendering past the app background container's own box
+ *     (g) whenever the panel isn't legitimately wider than the viewport (the
+ *         only legitimate case is (c)/(f)'s Board column-floor overflow), it
+ *         fills the viewport minus its own CSS clamp margins instead of
+ *         shrink-wrapping to its content
  *
  * This bug class (header/first-card overlap, right-edge clipping, and later
  * the #root scaffold-width cap letting columns spill past the visual panel
@@ -138,6 +146,37 @@ const OVERFLOW_SNIPPET = `
   }
 `;
 
+// I2 measurement (shared by every view): the panel legitimately exceeds the
+// viewport only when its own content forces it wider — currently just
+// Board's documented column-floor overflow (App.jsx). In every other case
+// #root's width:auto + min-width:max-content (src/index.css) must still fill
+// the viewport minus the CSS clamp margins, not shrink-wrap to its content.
+// Read the margins back from computed style rather than re-deriving the
+// clamp() math here, so this stays correct if the clamp's numbers ever change.
+const FILLS_VIEWPORT_SNIPPET = `
+  const rootStyle = panel ? getComputedStyle(panel) : null;
+  const marginLeft = rootStyle ? parseFloat(rootStyle.marginLeft) : null;
+  const marginRight = rootStyle ? parseFloat(rootStyle.marginRight) : null;
+  // Layout width, NOT window.innerWidth: innerWidth includes the vertical
+  // scrollbar's reserved gutter (~15-17px) when one is present, but the CSS
+  // layout viewport #root actually fills is scrollingEl.clientWidth (already
+  // measured above as docOverflow.clientWidth) — using innerWidth here would
+  // flag a false "doesn't fill viewport" on any view tall enough to scroll.
+  const availableWidth = docOverflow.clientWidth;
+  const panelExceedsViewport = panelRect ? panelRect.width > availableWidth + EPS : false;
+  const expectedLeft = marginLeft;
+  const expectedRight = marginRight !== null ? availableWidth - marginRight : null;
+  const fillsViewport = (panelRect && !panelExceedsViewport)
+    ? Math.abs(panelRect.left - expectedLeft) <= EPS && Math.abs(panelRect.right - expectedRight) <= EPS
+    : null;
+`;
+
+const FILLS_VIEWPORT_ENFORCE = `
+  if (panelRect && !panelExceedsViewport && !fillsViewport) {
+    failures.push(\`panel does not fill viewport minus its clamp margins: panelRect.left=\${panelRect.left.toFixed(1)} (expected \${expectedLeft.toFixed(1)}), panelRect.right=\${panelRect.right.toFixed(1)} (expected \${expectedRight.toFixed(1)})\`);
+  }
+`;
+
 // Turns the OVERFLOW_SNIPPET measurements into a hard failure. Applied
 // UNCONDITIONALLY only where there is no legitimate reason for the document
 // to be wider than the viewport (Calendar/Timeline/Matrix, and BASIC_ASSERTION_SRC
@@ -220,6 +259,8 @@ const ASSERTION_SRC = `
   const panelRect = panel ? rectOf(panel.getBoundingClientRect()) : null;
   const panelScroll = panel ? { scrollWidth: panel.scrollWidth, clientWidth: panel.clientWidth } : null;
   ${OVERFLOW_SNIPPET}
+  ${FILLS_VIEWPORT_SNIPPET}
+  ${FILLS_VIEWPORT_ENFORCE}
 
   for (const label of LABELS) {
     const span = findLabelSpan(label);
@@ -287,6 +328,30 @@ const ASSERTION_SRC = `
         };
         if (!afterScroll.headerFullyVisible) failures.push(\`\${last.label}: header still off-screen after scrolling scrollLeft to max (scrollWidth=\${scrollEl.scrollWidth}, clientWidth=\${scrollEl.clientWidth})\`);
         if (cRect && !afterScroll.cardFullyVisible) failures.push(\`\${last.label}: first card still clipped after scrolling (right=\${cRect.right.toFixed(1)}, viewportWidth=\${viewport.width})\`);
+
+        // I1/I3 post-scroll: #root and its background-bearing child scroll
+        // WITH the document (native window scroll, not a clipping container),
+        // so their getBoundingClientRect() shifts along with the last column's
+        // — re-measure both after scrollLeft is applied rather than reusing
+        // the pre-scroll panelRect/bgRect, and confirm the panel's border box
+        // AND its background still extend under the last column, not just
+        // that the column is somewhere within the window's viewport bounds.
+        const panelRectAfter = panel ? rectOf(panel.getBoundingClientRect()) : null;
+        const bgDivAfter = panel ? panel.firstElementChild : null;
+        const bgRectAfter = bgDivAfter ? rectOf(bgDivAfter.getBoundingClientRect()) : null;
+        const rectsAfter = [hRect, cRect].filter(Boolean);
+        afterScroll.insidePanelAfter = panelRectAfter
+          ? rectsAfter.every((r) => r.left >= panelRectAfter.left - EPS && r.right <= panelRectAfter.right + EPS)
+          : null;
+        afterScroll.underBgAfter = bgRectAfter
+          ? rectsAfter.every((r) => r.left >= bgRectAfter.left - EPS && r.right <= bgRectAfter.right + EPS)
+          : null;
+        if (afterScroll.insidePanelAfter === false) {
+          failures.push(\`\${last.label}: after scrolling, box sits outside the panel border box (panel left=\${panelRectAfter.left.toFixed(1)}, right=\${panelRectAfter.right.toFixed(1)})\`);
+        }
+        if (afterScroll.underBgAfter === false) {
+          failures.push(\`\${last.label}: after scrolling, box sits outside the panel background (bg left=\${bgRectAfter.left.toFixed(1)}, right=\${bgRectAfter.right.toFixed(1)})\`);
+        }
       } else {
         failures.push(\`\${last.label}: header off-screen (right=\${last.headerRect.right.toFixed(1)}, viewportWidth=\${viewport.width}) and NO scrollable ancestor found to reach it\`);
       }
@@ -295,6 +360,7 @@ const ASSERTION_SRC = `
 
   return {
     viewport, panelRect, panelScroll, docOverflow, bgRect, columns, beforeScroll, afterScroll, scrollContainerTag,
+    panelExceedsViewport, fillsViewport,
     pass: failures.length === 0,
     failures,
   };
@@ -311,8 +377,10 @@ const BASIC_ASSERTION_SRC = `
   const panelRect = panel ? rectOf(panel.getBoundingClientRect()) : null;
   ${OVERFLOW_SNIPPET}
   ${ENFORCE_OVERFLOW_SNIPPET}
+  ${FILLS_VIEWPORT_SNIPPET}
+  ${FILLS_VIEWPORT_ENFORCE}
   const viewport = { width: window.innerWidth, height: window.innerHeight };
-  return { viewport, panelRect, docOverflow, bgRect, pass: failures.length === 0, failures };
+  return { viewport, panelRect, docOverflow, bgRect, panelExceedsViewport, fillsViewport, pass: failures.length === 0, failures };
 })();
 `;
 
@@ -477,7 +545,7 @@ async function main() {
       }
     }
     if (r.panelRect) {
-      console.log(`  panelRect left=${r.panelRect.left.toFixed(1)} right=${r.panelRect.right.toFixed(1)}${r.panelScroll ? ` panel.scrollWidth=${r.panelScroll.scrollWidth} panel.clientWidth=${r.panelScroll.clientWidth}` : ''}`);
+      console.log(`  panelRect left=${r.panelRect.left.toFixed(1)} right=${r.panelRect.right.toFixed(1)}${r.panelScroll ? ` panel.scrollWidth=${r.panelScroll.scrollWidth} panel.clientWidth=${r.panelScroll.clientWidth}` : ''} panelExceedsViewport=${r.panelExceedsViewport} fillsViewport=${r.fillsViewport}`);
     }
     if (r.docOverflow) {
       console.log(`  doc.scrollWidth=${r.docOverflow.scrollWidth} doc.clientWidth=${r.docOverflow.clientWidth}`);
@@ -486,7 +554,7 @@ async function main() {
       console.log(`  rightmost header right=${r.beforeScroll.headerRight.toFixed(1)} viewportWidth=${r.viewport.width} fullyVisibleAtRest=${r.beforeScroll.fullyVisible}`);
     }
     if (r.afterScroll) {
-      console.log(`  after scroll (${r.scrollContainerTag}): headerFullyVisible=${r.afterScroll.headerFullyVisible} cardFullyVisible=${r.afterScroll.cardFullyVisible}`);
+      console.log(`  after scroll (${r.scrollContainerTag}): headerFullyVisible=${r.afterScroll.headerFullyVisible} cardFullyVisible=${r.afterScroll.cardFullyVisible} insidePanelAfter=${r.afterScroll.insidePanelAfter} underBgAfter=${r.afterScroll.underBgAfter}`);
     }
     if (r.failures.length) {
       console.log('  Failures:');
