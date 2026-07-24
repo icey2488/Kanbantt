@@ -3276,6 +3276,17 @@ function TaskModal({ task, tags, columns, onSave, onDelete, onClose, isNew, onCr
                 onChange={(e) => setDraft({ ...draft, title: e.target.value })} style={input} />
             </div>
             <div>
+              {/* Description — the spec-conformant narrative BODY (spec v0.8.0). This is the
+                  SAME `description` field the local editor's Notes textarea edits (reconciled,
+                  not a parallel field); it is DISTINCT from Acceptance criteria below (the
+                  Claunker extension the judge / SG-1 framing pass read). */}
+              <label style={fieldLabel}>Description — the card's narrative body (markdown)</label>
+              <textarea value={draft.description || ''}
+                onChange={(e) => setDraft({ ...draft, description: e.target.value })}
+                placeholder="What is this card about / what is it for?"
+                style={{ ...input, minHeight: 80, resize: 'vertical', fontFamily: F.body, fontSize: 13 }} />
+            </div>
+            <div>
               <label style={fieldLabel}>Acceptance criteria</label>
               <textarea value={draft.acceptance_criteria || ''}
                 onChange={(e) => setDraft({ ...draft, acceptance_criteria: e.target.value })}
@@ -6069,6 +6080,9 @@ export default function App() {
     // changed. A column change is a move, not an update — it never travels here.
     const patch = {};
     if (task.title !== cur.title) patch.title = task.title;
+    // description: the narrative body (spec v0.8.0). Diffed against the current card so an
+    // unchanged body is never re-sent; '' means an empty body (not "unchanged").
+    if ((task.description || '') !== (cur.description || '')) patch.description = task.description || '';
     if ((task.acceptance_criteria || '') !== (cur.acceptance_criteria || '')) patch.acceptance_criteria = task.acceptance_criteria || '';
     if ((task.tier ?? null) !== (cur.tier ?? null)) patch.tier = task.tier ?? null;
     if ((task.effort ?? null) !== (cur.effort ?? null)) patch.effort = task.effort ?? null;
@@ -6080,7 +6094,7 @@ export default function App() {
     if (taskDepsKey !== curDepsKey) patch.depends_on = task.depends_on || [];
     setEditing(null); // close immediately; the edit shows optimistically behind it
     if (Object.keys(patch).length === 0) return; // nothing changed → no write
-    const prior = { title: cur.title, acceptance_criteria: cur.acceptance_criteria, tier: cur.tier, effort: cur.effort, impact: cur.impact, due: cur.due ?? null, depends_on: cur.depends_on || [] }; // CAPTURE
+    const prior = { title: cur.title, description: cur.description, acceptance_criteria: cur.acceptance_criteria, tier: cur.tier, effort: cur.effort, impact: cur.impact, due: cur.due ?? null, depends_on: cur.depends_on || [] }; // CAPTURE
     const expected_version = cur.version;
     setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
       c.id === task.id ? { ...c, ...patch } : c) } : m));
@@ -6099,7 +6113,7 @@ export default function App() {
         c.id === task.id
           ? (fresh
             ? { ...c, ...e.meta.current } // SNAP-BACK to server truth
-            : { ...c, title: prior.title, acceptance_criteria: prior.acceptance_criteria, tier: prior.tier, effort: prior.effort, impact: prior.impact, due: prior.due, depends_on: prior.depends_on }) // REVERT prior
+            : { ...c, title: prior.title, description: prior.description, acceptance_criteria: prior.acceptance_criteria, tier: prior.tier, effort: prior.effort, impact: prior.impact, due: prior.due, depends_on: prior.depends_on }) // REVERT prior
           : c) } : m));
       surface(writeError('save', e));
     }

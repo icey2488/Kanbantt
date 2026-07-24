@@ -248,6 +248,19 @@ test('cardUpdate sends a field-scoped patch + expected_version; returns the proj
   await harness.close();
 });
 
+test('cardUpdate sends description in the patch; the narrative body round-trips (spec v0.8.0)', async () => {
+  const { provider, harness } = await connected({ seed: oneCard });
+  const body = '# Goal\n\nMake it **fast**.';
+  const updated = await provider.cardUpdate('c1', { description: body, expected_version: 1 });
+  assert.equal(updated.description, body, 'description round-trips in the Card');
+  assert.equal(updated.version, 2, 'server bumps the version');
+  // A null description clears the body (RFC 7386 key-presence, like effort/impact/due).
+  const cleared = await provider.cardUpdate('c1', { description: null, expected_version: 2 });
+  assert.equal(cleared.description, null, 'null description clears the body');
+  await provider.disconnect();
+  await harness.close();
+});
+
 test('cardMove sends column_id + order + expected_version; returns the repositioned Card (Pass 2b)', async () => {
   const { provider, harness } = await connected({ seed: oneCard });
   const moved = await provider.cardMove('c1', 'in_progress', { order: 'm', expected_version: 1 });
