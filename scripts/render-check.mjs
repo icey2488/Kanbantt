@@ -1,19 +1,35 @@
 #!/usr/bin/env node
 /**
- * Board render smoke check — headless-Chrome/CDP.
+ * App-shell render smoke check — headless-Chrome/CDP.
  *
  * Seeds a 6-column board straight into localStorage (bypassing Drive auth,
  * which the app doesn't require — see src/lib/store-instance.js) and asserts,
  * at each viewport:
- *   (a) every column header's box sits fully above its first card's box
- *   (b) all six headers are visible in-panel/in-viewport, or reachable via a
- *       working horizontal scrollbar on whichever container scrolls by design
- *   (c) the rightmost column's cards land inside the panel's content box,
- *       not clipped past it
+ *   Board view (all three themes):
+ *     (a) every column header's box, and every column's first-card box, sits
+ *         fully inside the ACTUAL visual panel (#root — the bordered,
+ *         backgrounded element the user sees as "the app surface"), not just
+ *         "visible somewhere in the viewport"
+ *     (b) every column header sits above its first card's box
+ *     (c) the rightmost column is reachable — either it's already inside the
+ *         panel/viewport bound, or there's a genuine working scrollbar to it
+ *     (f) after scrolling to reach it, the panel's border box AND its
+ *         background-bearing child still extend under the reached column
+ *         (both scroll with the document, so re-measured post-scroll, not
+ *         reused from the pre-scroll rects)
+ *   All four views (board/calendar/gantt/matrix):
+ *     (d) no unintended horizontal viewport overflow
+ *     (e) no content rendering past the app background container's own box
+ *     (g) whenever the panel isn't legitimately wider than the viewport (the
+ *         only legitimate case is (c)/(f)'s Board column-floor overflow), it
+ *         fills the viewport minus its own CSS clamp margins instead of
+ *         shrink-wrapping to its content
  *
- * This bug class (header/first-card overlap, right-edge clipping with a
- * non-functional scrollbar) had no assertion anywhere in the suite before —
- * this script is the standing regression guard for board grid/overflow CSS.
+ * This bug class (header/first-card overlap, right-edge clipping, and later
+ * the #root scaffold-width cap letting columns spill past the visual panel
+ * while a viewport-relative check stayed green) had no assertion anywhere in
+ * the suite before — this script is the standing regression guard for
+ * app-shell/board grid/overflow CSS.
  *
  * Usage: node scripts/render-check.mjs --url http://localhost:5183
  */
@@ -94,17 +110,96 @@ function seedBlob() {
   };
 }
 
-const SEED_SCRIPT = `
+const THEMES = ['dark', 'light', 'mist'];
+const VIEWS = ['board', 'calendar', 'gantt', 'matrix'];
+
+function seedScriptFor(view, theme) {
+  return `
 (() => {
   try {
     localStorage.setItem('kanbantt_data_v1', ${JSON.stringify(JSON.stringify(seedBlob()))});
+    localStorage.setItem('kanbantt:view:v1', JSON.stringify(${JSON.stringify(view)}));
+    localStorage.setItem('kanbantt:theme:v1', JSON.stringify(${JSON.stringify(theme)}));
   } catch (e) { console.error('seed failed', e); }
 })();
 `;
+}
 
 /* ------------------------------------------------------------------------ */
 /* In-page assertion — returns a structured report, no throws               */
 /* ------------------------------------------------------------------------ */
+
+// Runs on every view (board included): computes doc-level horizontal-overflow
+// and app-background-container metrics, WITHOUT judging them — measurement
+// only, no failures.push here. Kept as a single source string so both
+// ASSERTION_SRC (board) and BASIC_ASSERTION_SRC (the other three views)
+// share the identical measurement.
+const OVERFLOW_SNIPPET = `
+  const scrollingEl = document.scrollingElement || document.documentElement;
+  const docOverflow = { scrollWidth: scrollingEl.scrollWidth, clientWidth: scrollingEl.clientWidth };
+  const bgDiv = panel ? panel.firstElementChild : null;
+  let bgRect = null;
+  if (bgDiv) {
+    bgRect = rectOf(bgDiv.getBoundingClientRect());
+  } else {
+    failures.push('app background container (#root > firstElementChild) not found');
+  }
+`;
+
+// I2 measurement (shared by every view): the panel legitimately exceeds the
+// viewport only when its own content forces it wider — currently just
+// Board's documented column-floor overflow (App.jsx). In every other case
+// #root's width:auto + min-width:max-content (src/index.css) must still fill
+// the viewport minus the CSS clamp margins, not shrink-wrap to its content.
+// Read the margins back from computed style rather than re-deriving the
+// clamp() math here, so this stays correct if the clamp's numbers ever change.
+const FILLS_VIEWPORT_SNIPPET = `
+  const rootStyle = panel ? getComputedStyle(panel) : null;
+  const marginLeft = rootStyle ? parseFloat(rootStyle.marginLeft) : null;
+  const marginRight = rootStyle ? parseFloat(rootStyle.marginRight) : null;
+  // Layout width, NOT window.innerWidth: innerWidth includes the vertical
+  // scrollbar's reserved gutter (~15-17px) when one is present, but the CSS
+  // layout viewport #root actually fills is scrollingEl.clientWidth (already
+  // measured above as docOverflow.clientWidth) — using innerWidth here would
+  // flag a false "doesn't fill viewport" on any view tall enough to scroll.
+  const availableWidth = docOverflow.clientWidth;
+  const panelExceedsViewport = panelRect ? panelRect.width > availableWidth + EPS : false;
+  const expectedLeft = marginLeft;
+  const expectedRight = marginRight !== null ? availableWidth - marginRight : null;
+  const fillsViewport = (panelRect && !panelExceedsViewport)
+    ? Math.abs(panelRect.left - expectedLeft) <= EPS && Math.abs(panelRect.right - expectedRight) <= EPS
+    : null;
+`;
+
+const FILLS_VIEWPORT_ENFORCE = `
+  if (panelRect && !panelExceedsViewport && !fillsViewport) {
+    failures.push(\`panel does not fill viewport minus its clamp margins: panelRect.left=\${panelRect.left.toFixed(1)} (expected \${expectedLeft.toFixed(1)}), panelRect.right=\${panelRect.right.toFixed(1)} (expected \${expectedRight.toFixed(1)})\`);
+  }
+`;
+
+// Turns the OVERFLOW_SNIPPET measurements into a hard failure. Applied
+// UNCONDITIONALLY only where there is no legitimate reason for the document
+// to be wider than the viewport (Calendar/Timeline/Matrix, and BASIC_ASSERTION_SRC
+// in general). The Board view deliberately excludes this: its grid comment
+// (see the column-track definition in App.jsx) documents that once
+// column-count * 220px exceeds the viewport, the grid intentionally overflows
+// onto the WINDOW's native horizontal scrollbar rather than clipping — the
+// board's own beforeScroll/afterScroll reachability check (further down in
+// ASSERTION_SRC) already judges that case correctly (fails only if the last
+// column is NOT reachable by scrolling), so re-flagging the same measurement
+// here as an unconditional failure would flag documented, reachable-by-design
+// behavior as a bug.
+const ENFORCE_OVERFLOW_SNIPPET = `
+  if (docOverflow.scrollWidth > docOverflow.clientWidth + EPS) {
+    failures.push(\`unintended horizontal viewport overflow: document.scrollWidth=\${docOverflow.scrollWidth} > clientWidth=\${docOverflow.clientWidth}\`);
+  }
+  if (bgDiv) {
+    const bgEscapes = bgRect.right > window.innerWidth + EPS || bgRect.left < -EPS || bgDiv.scrollWidth > bgDiv.clientWidth + EPS;
+    if (bgEscapes) {
+      failures.push(\`content escapes the app background container: bgRect.right=\${bgRect.right.toFixed(1)} innerWidth=\${window.innerWidth} bg.scrollWidth=\${bgDiv.scrollWidth} bg.clientWidth=\${bgDiv.clientWidth}\`);
+    }
+  }
+`;
 
 const ASSERTION_SRC = `
 (() => {
@@ -147,9 +242,25 @@ const ASSERTION_SRC = `
     return root.scrollWidth > root.clientWidth + EPS ? root : null;
   }
 
+  function rectOf(r) { return { top: r.top, left: r.left, right: r.right, bottom: r.bottom, width: r.width, height: r.height }; }
+
   const failures = [];
   const columns = [];
-  let panel = null;
+  // The ACTUAL visual panel is #root itself: it's the element carrying the
+  // bordered/backgrounded "app surface" look (border-inline + matching
+  // background, see src/index.css), not some incidental DOM ancestor of the
+  // column wrappers. A prior version of this script used
+  // "column-header's-parent's-parent" as a stand-in for "the panel", which
+  // just happened to be the grid container (no background/border of its own)
+  // — that let cards render past the real visual panel edge while the check
+  // stayed green, because it wasn't measuring against anything visible.
+  const panel = document.getElementById('root');
+  if (!panel) failures.push('visual panel (#root) not found');
+  const panelRect = panel ? rectOf(panel.getBoundingClientRect()) : null;
+  const panelScroll = panel ? { scrollWidth: panel.scrollWidth, clientWidth: panel.clientWidth } : null;
+  ${OVERFLOW_SNIPPET}
+  ${FILLS_VIEWPORT_SNIPPET}
+  ${FILLS_VIEWPORT_ENFORCE}
 
   for (const label of LABELS) {
     const span = findLabelSpan(label);
@@ -158,10 +269,7 @@ const ASSERTION_SRC = `
     if (!header) { failures.push(\`no sticky ancestor found for header: \${label}\`); continue; }
     const cardsList = header.nextElementSibling;
     const firstCard = cardsList ? cardsList.firstElementChild : null;
-    const colWrapper = header.parentElement;
-    const thisPanel = colWrapper ? colWrapper.parentElement : null;
-    if (!panel) panel = thisPanel;
-    else if (panel !== thisPanel) failures.push(\`column \${label} does not share the common panel ancestor\`);
+    if (panel && !panel.contains(header)) failures.push(\`\${label}: header is not inside the visual panel (#root)\`);
 
     const headerRect = header.getBoundingClientRect();
     const cardRect = firstCard ? firstCard.getBoundingClientRect() : null;
@@ -169,25 +277,31 @@ const ASSERTION_SRC = `
     if (cardRect && !headerAboveCard) {
       failures.push(\`\${label}: header (bottom=\${headerRect.bottom.toFixed(1)}) overlaps/renders below first card (top=\${cardRect.top.toFixed(1)})\`);
     }
-    columns.push({ label, headerRect: rectOf(headerRect), cardRect: cardRect && rectOf(cardRect), headerAboveCard });
+
+    // Containment against the real visual panel box — checked for EVERY
+    // column, unconditionally (not gated on the panel's CSS overflow-x,
+    // which is 'visible' by design: the board scrolls on the WINDOW, not a
+    // clipping ancestor — see the grid container's own comment in App.jsx).
+    // A column rendering past the panel's border/background is a visible bug
+    // regardless of whether CSS happens to clip it.
+    let insidePanel = null;
+    if (panel && panelRect) {
+      const rects = [headerRect, cardRect].filter(Boolean);
+      insidePanel = rects.every((r) => r.left >= panelRect.left - EPS && r.right <= panelRect.right + EPS);
+      if (!insidePanel) {
+        failures.push(\`\${label}: box (header right=\${headerRect.right.toFixed(1)}\${cardRect ? \`, card right=\${cardRect.right.toFixed(1)}\` : ''}) sits outside the visual panel box (panel left=\${panelRect.left.toFixed(1)}, right=\${panelRect.right.toFixed(1)})\`);
+      }
+    }
+
+    columns.push({ label, headerRect: rectOf(headerRect), cardRect: cardRect && rectOf(cardRect), headerAboveCard, insidePanel });
   }
 
-  function rectOf(r) { return { top: r.top, left: r.left, right: r.right, bottom: r.bottom, width: r.width, height: r.height }; }
-
   const viewport = { width: window.innerWidth, height: window.innerHeight };
-  const panelRect = panel ? rectOf(panel.getBoundingClientRect()) : null;
-  const panelOverflowX = panel ? getComputedStyle(panel).overflowX : null;
-  const panelClips = panelOverflowX === 'hidden' || panelOverflowX === 'auto' || panelOverflowX === 'scroll';
-  const panelScroll = panel ? { scrollWidth: panel.scrollWidth, clientWidth: panel.clientWidth } : null;
-
   const last = columns[columns.length - 1];
   let beforeScroll = null, afterScroll = null, scrollContainerTag = null;
 
   if (last) {
-    // Only fold the panel's own right edge into the bound when the panel
-    // actually clips (overflow-x != visible) — otherwise its border-box edge
-    // is not where content stops rendering, and it's not the real constraint.
-    const rightBound = Math.min(viewport.width, panelClips && panelRect ? panelRect.right : Infinity);
+    const rightBound = Math.min(viewport.width, panelRect ? panelRect.right : Infinity);
     beforeScroll = {
       headerRight: last.headerRect.right,
       fullyVisible: last.headerRect.right <= rightBound + EPS,
@@ -214,24 +328,59 @@ const ASSERTION_SRC = `
         };
         if (!afterScroll.headerFullyVisible) failures.push(\`\${last.label}: header still off-screen after scrolling scrollLeft to max (scrollWidth=\${scrollEl.scrollWidth}, clientWidth=\${scrollEl.clientWidth})\`);
         if (cRect && !afterScroll.cardFullyVisible) failures.push(\`\${last.label}: first card still clipped after scrolling (right=\${cRect.right.toFixed(1)}, viewportWidth=\${viewport.width})\`);
+
+        // I1/I3 post-scroll: #root and its background-bearing child scroll
+        // WITH the document (native window scroll, not a clipping container),
+        // so their getBoundingClientRect() shifts along with the last column's
+        // — re-measure both after scrollLeft is applied rather than reusing
+        // the pre-scroll panelRect/bgRect, and confirm the panel's border box
+        // AND its background still extend under the last column, not just
+        // that the column is somewhere within the window's viewport bounds.
+        const panelRectAfter = panel ? rectOf(panel.getBoundingClientRect()) : null;
+        const bgDivAfter = panel ? panel.firstElementChild : null;
+        const bgRectAfter = bgDivAfter ? rectOf(bgDivAfter.getBoundingClientRect()) : null;
+        const rectsAfter = [hRect, cRect].filter(Boolean);
+        afterScroll.insidePanelAfter = panelRectAfter
+          ? rectsAfter.every((r) => r.left >= panelRectAfter.left - EPS && r.right <= panelRectAfter.right + EPS)
+          : null;
+        afterScroll.underBgAfter = bgRectAfter
+          ? rectsAfter.every((r) => r.left >= bgRectAfter.left - EPS && r.right <= bgRectAfter.right + EPS)
+          : null;
+        if (afterScroll.insidePanelAfter === false) {
+          failures.push(\`\${last.label}: after scrolling, box sits outside the panel border box (panel left=\${panelRectAfter.left.toFixed(1)}, right=\${panelRectAfter.right.toFixed(1)})\`);
+        }
+        if (afterScroll.underBgAfter === false) {
+          failures.push(\`\${last.label}: after scrolling, box sits outside the panel background (bg left=\${bgRectAfter.left.toFixed(1)}, right=\${bgRectAfter.right.toFixed(1)})\`);
+        }
       } else {
         failures.push(\`\${last.label}: header off-screen (right=\${last.headerRect.right.toFixed(1)}, viewportWidth=\${viewport.width}) and NO scrollable ancestor found to reach it\`);
-      }
-    } else if (panelClips) {
-      // Even if "visible" per viewport, it must also sit inside the panel's own
-      // content box (not just accidentally within window bounds) — only a
-      // meaningful check when the panel is the thing actually clipping.
-      if (panelRect && last.cardRect && last.cardRect.right > panelRect.right + EPS) {
-        failures.push(\`\${last.label}: card (right=\${last.cardRect.right.toFixed(1)}) sits outside panel content box (panel right=\${panelRect.right.toFixed(1)})\`);
       }
     }
   }
 
   return {
-    viewport, panelRect, panelScroll, columns, beforeScroll, afterScroll, scrollContainerTag,
+    viewport, panelRect, panelScroll, docOverflow, bgRect, columns, beforeScroll, afterScroll, scrollContainerTag,
+    panelExceedsViewport, fillsViewport,
     pass: failures.length === 0,
     failures,
   };
+})();
+`;
+
+const BASIC_ASSERTION_SRC = `
+(() => {
+  const EPS = 2;
+  function rectOf(r) { return { top: r.top, left: r.left, right: r.right, bottom: r.bottom, width: r.width, height: r.height }; }
+  const failures = [];
+  const panel = document.getElementById('root');
+  if (!panel) failures.push('visual panel (#root) not found');
+  const panelRect = panel ? rectOf(panel.getBoundingClientRect()) : null;
+  ${OVERFLOW_SNIPPET}
+  ${ENFORCE_OVERFLOW_SNIPPET}
+  ${FILLS_VIEWPORT_SNIPPET}
+  ${FILLS_VIEWPORT_ENFORCE}
+  const viewport = { width: window.innerWidth, height: window.innerHeight };
+  return { viewport, panelRect, docOverflow, bgRect, panelExceedsViewport, fillsViewport, pass: failures.length === 0, failures };
 })();
 `;
 
@@ -302,7 +451,7 @@ async function waitForDevToolsActivePort(userDataDir, timeoutMs = 15000) {
 // --window-size is what actually resizes the render surface CSS layout runs
 // against, so a per-viewport process (rather than one process reused across
 // viewports) is what makes the two runs genuinely independent.
-async function runViewport(chromePath, vp) {
+async function runVariant(chromePath, vp, { view, theme, assertionSrc }) {
   const userDataDir = mkdtempSync(join(tmpdir(), 'render-check-'));
   const chrome = spawn(chromePath, [
     '--headless=new',
@@ -328,7 +477,7 @@ async function runViewport(chromePath, vp) {
 
     await cdp.send('Page.enable', {}, sessionId);
     await cdp.send('Runtime.enable', {}, sessionId);
-    await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: SEED_SCRIPT }, sessionId);
+    await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: seedScriptFor(view, theme) }, sessionId);
     await cdp.send('Emulation.setDeviceMetricsOverride', {
       width: vp.width, height: vp.height, deviceScaleFactor: 1, mobile: false,
     }, sessionId);
@@ -340,7 +489,7 @@ async function runViewport(chromePath, vp) {
     await new Promise((r) => setTimeout(r, 500));
 
     const evalResult = await cdp.send('Runtime.evaluate', {
-      expression: ASSERTION_SRC,
+      expression: assertionSrc,
       returnByValue: true,
       awaitPromise: true,
     }, sessionId);
@@ -350,6 +499,8 @@ async function runViewport(chromePath, vp) {
     }
     const report = evalResult.result.value;
     report.viewportLabel = `${vp.width}x${vp.height}`;
+    report.view = view;
+    report.theme = theme;
     return report;
   } finally {
     chrome.kill();
@@ -362,25 +513,48 @@ async function main() {
   const results = [];
   let overallPass = true;
 
+  // Board view: full containment/header assertion, across every viewport x
+  // theme combo — this is what proves (a) column boxes stay inside the real
+  // visual panel and (c) the panel's background spans all six columns under
+  // every theme, not just the default.
   for (const vp of VIEWPORTS) {
-    const report = await runViewport(chromePath, vp);
-    results.push(report);
-    if (!report.pass) overallPass = false;
+    for (const theme of THEMES) {
+      const report = await runVariant(chromePath, vp, { view: 'board', theme, assertionSrc: ASSERTION_SRC });
+      results.push(report);
+      if (!report.pass) overallPass = false;
+    }
+  }
+
+  // Calendar / Timeline / Matrix: no six-column header structure to walk, so
+  // just the shared overflow/escape assertion, at both viewports (dark theme
+  // — theme doesn't affect layout width, only colors).
+  for (const vp of VIEWPORTS) {
+    for (const view of VIEWS.filter((v) => v !== 'board')) {
+      const report = await runVariant(chromePath, vp, { view, theme: 'dark', assertionSrc: BASIC_ASSERTION_SRC });
+      results.push(report);
+      if (!report.pass) overallPass = false;
+    }
   }
 
   for (const r of results) {
-    console.log(`\n=== ${r.viewportLabel} — ${r.pass ? 'PASS' : 'FAIL'} ===`);
-    for (const col of r.columns) {
-      console.log(`  ${col.headerAboveCard === false ? 'FAIL' : 'ok  '} ${col.label}: header.bottom=${col.headerRect.bottom.toFixed(1)} firstCard.top=${col.cardRect ? col.cardRect.top.toFixed(1) : 'n/a'}`);
+    console.log(`\n=== ${r.view}/${r.theme} @ ${r.viewportLabel} — ${r.pass ? 'PASS' : 'FAIL'} ===`);
+    if (r.columns) {
+      for (const col of r.columns) {
+        const status = col.headerAboveCard === false || col.insidePanel === false ? 'FAIL' : 'ok  ';
+        console.log(`  ${status} ${col.label}: header.bottom=${col.headerRect.bottom.toFixed(1)} firstCard.top=${col.cardRect ? col.cardRect.top.toFixed(1) : 'n/a'} insidePanel=${col.insidePanel}`);
+      }
     }
     if (r.panelRect) {
-      console.log(`  panelRect right=${r.panelRect.right.toFixed(1)} panel.scrollWidth=${r.panelScroll.scrollWidth} panel.clientWidth=${r.panelScroll.clientWidth}`);
+      console.log(`  panelRect left=${r.panelRect.left.toFixed(1)} right=${r.panelRect.right.toFixed(1)}${r.panelScroll ? ` panel.scrollWidth=${r.panelScroll.scrollWidth} panel.clientWidth=${r.panelScroll.clientWidth}` : ''} panelExceedsViewport=${r.panelExceedsViewport} fillsViewport=${r.fillsViewport}`);
+    }
+    if (r.docOverflow) {
+      console.log(`  doc.scrollWidth=${r.docOverflow.scrollWidth} doc.clientWidth=${r.docOverflow.clientWidth}`);
     }
     if (r.beforeScroll) {
       console.log(`  rightmost header right=${r.beforeScroll.headerRight.toFixed(1)} viewportWidth=${r.viewport.width} fullyVisibleAtRest=${r.beforeScroll.fullyVisible}`);
     }
     if (r.afterScroll) {
-      console.log(`  after scroll (${r.scrollContainerTag}): headerFullyVisible=${r.afterScroll.headerFullyVisible} cardFullyVisible=${r.afterScroll.cardFullyVisible}`);
+      console.log(`  after scroll (${r.scrollContainerTag}): headerFullyVisible=${r.afterScroll.headerFullyVisible} cardFullyVisible=${r.afterScroll.cardFullyVisible} insidePanelAfter=${r.afterScroll.insidePanelAfter} underBgAfter=${r.afterScroll.underBgAfter}`);
     }
     if (r.failures.length) {
       console.log('  Failures:');

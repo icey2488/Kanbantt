@@ -1007,6 +1007,12 @@ function FilterBar({ tags, filters, setFilters, showArchived, onToggleShowArchiv
         <div style={{
           display: 'flex', gap: 5, flexWrap: 'nowrap', overflowX: 'auto',
           flex: 1, alignItems: 'center',
+          // Same rationale as Timeline's day-grid pane: with enough tags this row's
+          // nowrap chips can need more width than the bar has, and overflowX:auto
+          // is what makes that scroll internally instead of widening the page.
+          // contain:inline-size keeps that intrinsic width from counting toward
+          // #root's min-width:max-content (src/index.css).
+          contain: 'inline-size',
         }}>
           <Hash size={12} strokeWidth={1.75} color={C.textDim} style={{ flexShrink: 0 }} />
           {tags.map((tag) => (
@@ -2555,6 +2561,16 @@ function GanttView({ tasks, events, columns, onTaskClick }) {
         // (C.bgGrain) and corner (C.surface) backgrounds are solid, so body rows
         // don't bleed through when pinned. Desktop: no height — unchanged.
         ...(narrow && { flex: 1, minHeight: 0 }),
+        // The day-grid inside routinely needs 1700px+ (labelW + numDays*dayW) and
+        // is meant to scroll horizontally WITHIN this bordered pane, not blow out
+        // the page — this box's own overflow:auto is what makes that internal
+        // scrollbar happen. contain:inline-size stops that intrinsic width from
+        // counting toward #root's min-width:max-content (src/index.css), so #root
+        // only grows for content that's genuinely meant to spill onto the
+        // window's scrollbar (Board's grid), not for panes that already scroll
+        // themselves. Doesn't change this box's own rendered width — that still
+        // comes from its parent's available space exactly as before.
+        contain: 'inline-size',
       }}>
         <div style={{ minWidth: labelW + numDays * dayW }}>
           <div style={{

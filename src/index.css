@@ -55,12 +55,30 @@ body {
 }
 
 #root {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
+  margin-inline: clamp(0px, 2vw, 24px);
   border-inline: 1px solid var(--border);
   min-height: 100svh;
+  /* width stays auto (fills the viewport minus the margins above, satisfying
+     I2) but min-width stops the box from silently letting wider content (e.g.
+     Board once column-count * 220px exceeds the viewport) overflow past its
+     own border/background — min-width always wins over a smaller auto width
+     per CSS2.1 10.4, so the panel itself grows to contain its content instead
+     (I1), pushing the overflow onto the window's native horizontal scrollbar
+     (I3) rather than clipping or spilling.
+     min-content, NOT max-content: max-content assumes no text ever wraps
+     (that's its definition), so it would size #root to fit every card title
+     on one unbroken line — max-content on #root was tried and blew Board's
+     panel out to ~3000px on ordinary wrapping titles alone. min-content only
+     asks for each box's explicit floor (the grid's own minmax(220px, 1fr)
+     tracks, an explicit 220px per column — see the grid's own comment in
+     App.jsx) and each word's width, not whole unwrapped strings, so normal
+     titles keep wrapping and only the genuine 220px-floor overflow grows the
+     panel. Elements with their own EXPLICIT pixel floor that's meant to
+     scroll internally (Timeline's day-grid) or nowrap text with no width cap
+     (a filter tag row) still contribute their own min-content in full either
+     way — those are firewalled individually with contain:inline-size where
+     they occur (see their own comments), not fixed by this min vs max choice. */
+  min-width: min-content;
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
