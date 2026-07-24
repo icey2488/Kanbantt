@@ -75,6 +75,11 @@ const THEMES = {
     eventText: '#6d28d9',
     shadow: '0 4px 16px -4px rgba(15, 23, 42, 0.1)',
     modalBackdrop: 'rgba(15, 23, 42, 0.4)',
+    // Matrix quadrant fills (light only): the shared QUADRANT_DEFS.tintAlpha values
+    // read as near-white on this theme's near-white bg — too faint to separate the
+    // four quadrants from the page or each other. Bumped here (not in QUADRANT_DEFS,
+    // which stays the dark-theme default) so hue semantics are untouched.
+    quadrantTintAlpha: { avoid: '30', plan: '28', deprioritize: '38', do: '30' },
   },
   mist: {
     name: 'Mist', isLight: true,
@@ -87,6 +92,10 @@ const THEMES = {
     eventText: '#5b21b6',
     shadow: '0 6px 20px -6px rgba(26, 31, 46, 0.25)',
     modalBackdrop: 'rgba(26, 31, 46, 0.5)',
+    // Matrix quadrant fills (mist only): see light theme's quadrantTintAlpha note —
+    // same faintness against mist's mid-gray bg, bumped a bit further since the
+    // page itself is more saturated than light's near-white.
+    quadrantTintAlpha: { avoid: '3d', plan: '33', deprioritize: '47', do: '3d' },
   },
 };
 
@@ -3992,6 +4001,7 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly, allTasks }
     const isDrop = dropTarget === type;
     const Icon = def.Icon;
     const cards = groups[type];
+    const tintAlpha = C.quadrantTintAlpha?.[type] ?? def.tintAlpha;
     return (
       <div
         onDragOver={(e) => handleDragOver(e, type)}
@@ -4096,6 +4106,7 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly, allTasks }
     const tile = (k) => {
       const def = QUADRANT_DEFS[k];
       const accent = C[def.accentKey];
+      const tintAlpha = C.quadrantTintAlpha?.[k] ?? def.tintAlpha;
       const Icon = def.Icon;
       const active = selectedQuadrant === k;
       return (
