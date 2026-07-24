@@ -1,0 +1,15 @@
+{
+  "timestamp": "2026-07-24T17:00:14.539Z",
+  "spine_sha": "ae6159c60df8e769b16fcde7139447c0a27ed6bd",
+  "spine_dirty": true,
+  "board_sha": "3234568c59ad5ac840e873a0023605a0929273ff",
+  "board_dirty": true,
+  "result": "green",
+  "watched_paths": [
+    "spine-mcp-test-server.js",
+    "card-store.js",
+    "spine-mcp-provider.js",
+    "mcp-connection.js"
+  ],
+  "watched_path_digest": "099265137d592944a81c2cf8d6995fb4cd4a2d99b2d358476ad4f474a937af4c"
+}

@@ -9,7 +9,8 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "spike:server": "node spike/mcp-server.mjs",
-    "test": "node --test \"src/lib/*.test.js\""
+    "test": "node --test \"src/lib/*.test.js\"",
+    "probe": "node src/lib/parity-receipt-write.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
