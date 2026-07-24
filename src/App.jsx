@@ -1199,7 +1199,7 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
         style={{
           background: C.surface,
           border: `${overdue ? '1.5px' : '1px'} solid ${overdue ? C.coral : C.border}`,
-          borderRadius: 10, padding: 14, cursor: readOnly ? 'pointer' : 'grab',
+          borderRadius: 10, padding: '10px 12px', cursor: readOnly ? 'pointer' : 'grab',
           transition: 'all 140ms ease',
           opacity: isDragging ? 0.35 : 1,
           boxShadow: overdue ? `0 0 0 1px ${C.coral}20, 0 4px 12px -4px ${C.coral}30` : 'none',
@@ -1213,7 +1213,7 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
           e.currentTarget.style.transform = 'translateY(0)';
         }}
       >
-        <div style={{ marginBottom: 8 }}>
+        <div style={{ marginBottom: 6 }}>
           {escalated && (
             // Escalation badge (display-only). Unresolved → amber "Escalated" (an
             // active block that needs a human); denied → RED "Denied" (theme coral,
@@ -1244,7 +1244,11 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
               width: 6, height: 6, borderRadius: '50%',
               background: priorityColor, marginTop: 7, flexShrink: 0,
             }} />
-            <div style={{ fontSize: 14, fontWeight: 500, color: C.text, lineHeight: 1.4 }}>
+            <div style={{
+              fontSize: 14, fontWeight: 500, color: C.text, lineHeight: 1.4,
+              textAlign: 'left', display: '-webkit-box', WebkitLineClamp: 2,
+              WebkitBoxOrient: 'vertical', overflow: 'hidden',
+            }}>
               {task.title}
             </div>
           </div>
@@ -1252,7 +1256,7 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
         {task.description && (
           <div style={{
             fontSize: 12, color: C.textMuted, lineHeight: 1.5,
-            marginBottom: 10, marginLeft: 14,
+            marginBottom: 8, marginLeft: 14,
             display: '-webkit-box', WebkitLineClamp: 2,
             WebkitBoxOrient: 'vertical', overflow: 'hidden',
           }}>
@@ -1260,7 +1264,7 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
           </div>
         )}
         {taskTags.length > 0 && (
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginLeft: 14, marginBottom: 8 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginLeft: 14, marginBottom: 6 }}>
             {taskTags.slice(0, 3).map((tag) => (
               <TagChip key={tag.id} tag={tag} size="sm" />
             ))}
@@ -1671,7 +1675,7 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, read
                 </span>
               </div>
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
               {colTasks.map((t) => (
                 <TaskCard key={t.id} task={t} tags={tags} onClick={onTaskClick}
                   onDragStart={handleDragStart} onDragOver={handleDragOverCard}
@@ -3988,7 +3992,7 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly, allTasks }
         }}
         onDrop={(e) => handleDrop(e, type)}
         style={{
-          background: isDrop ? `${accent}28` : `${accent}${def.tintAlpha}`,
+          background: isDrop ? `${accent}28` : `${accent}${tintAlpha}`,
           border: `1px solid ${isDrop ? accent : C.border}`,
           borderRadius: 12,
           padding: 16,
@@ -4091,7 +4095,7 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly, allTasks }
           onClick={() => setSelectedQuadrant(k)}
           style={{
             textAlign: 'left', cursor: 'pointer',
-            background: active ? `${accent}28` : `${accent}${def.tintAlpha}`,
+            background: active ? `${accent}28` : `${accent}${tintAlpha}`,
             border: `1px solid ${active ? accent : C.border}`,
             boxShadow: active ? `inset 0 0 0 1.5px ${accent}` : 'none',
             borderRadius: 12, padding: 12, minHeight: 76,
