@@ -17,10 +17,17 @@ import { MASK_INVENTORY } from './parity-mask.js';
 import { spawnRealSpine, createMockTarget, stopMockTarget } from './parity-lifecycle.js';
 import { sendWireStep, closeSession } from './parity-wire-step.js';
 import { identityBlock } from './parity-identity.js';
+import { PARITY_REGISTER, getStaleEntries, printRegisterReport } from './parity-register.js';
 
 const VALID_ID = '11111111-1111-4111-8111-111111111111';
 const VALID_VERSION = '3:abcdef0123456789';
 const step = (status, contentType, body) => ({ status, contentType, body });
+const withoutEntry = (id) => PARITY_REGISTER.filter((e) => e.id !== id);
+
+// REPORTING: every probe run prints the register contents (KNOWN_DEBT loudly,
+// with its finding card id) — `node --test` loading this file IS a probe run
+// in this codebase's current shape (no separate report CLI exists yet).
+printRegisterReport();
 
 /* ── T1: MOCK-SIDE MUTANTS — the three historical drift shapes reintroduced.
  * These prove the DIFF ENGINE only (not forward coverage): each is a synthetic
@@ -105,6 +112,19 @@ test('T4: mask inventory is pinned to exactly 8 entries with these formats', () 
   ].sort());
 });
 
+/* ── T4b: PARITY REGISTER PIN — exact entry count + exact disposition per
+ * entry. Adding or reclassifying an entry is a visible, deliberate edit to
+ * THIS test, never a quiet one-line change. ── */
+
+test('T4b: the parity register is pinned to exactly 2 entries with these dispositions', () => {
+  assert.equal(PARITY_REGISTER.length, 2);
+  const shape = PARITY_REGISTER.map((e) => `${e.id}:${e.disposition}`).sort();
+  assert.deepEqual(shape, [
+    'content-type-json-vs-sse:KNOWN_DEBT',
+    'timestamp-ms-z-vs-us-offset:RATIFIED_EQUIVALENT',
+  ].sort());
+});
+
 /* ── T5: SELF-CONSISTENCY CONTRAST — a shared bug (both targets silently
  * mutate a stored write) stays parity-GREEN while self-consistency REDs. This
  * is the proof D4 does real work and is not a tautology. ── */
@@ -126,16 +146,64 @@ test('T6a: a charset-only content-type difference does not red', () => {
   assert.equal(diffStepResults('board_get', a, b).ok, true);
 });
 
-test('T6b: the JSON/SSE transport-encoding equivalence class does not red', () => {
+test('T6b: JSON/SSE reds UNLESS the register\'s content-type entry permits it', () => {
   const a = step(200, 'application/json', { ok: true });
   const b = step(200, 'text/event-stream', { ok: true });
+  // With the default (ratified) register, entry "content-type-json-vs-sse"
+  // (KNOWN_DEBT) is what permits this — never inherent differ correctness.
   assert.equal(diffStepResults('board_get', a, b).ok, true);
 });
 
-test('T6c: a genuinely different media-type reds', () => {
+test('T6b-proof: with entry 2 removed, the SAME json-vs-SSE step REDs', () => {
+  const a = step(200, 'application/json', { ok: true });
+  const b = step(200, 'text/event-stream', { ok: true });
+  const { ok, violations } = diffStepResults('board_get', a, b, {
+    register: withoutEntry('content-type-json-vs-sse'),
+  });
+  assert.equal(ok, false);
+  assert.ok(violations.some((v) => v.kind === 'media-type'));
+});
+
+test('T6c: a genuinely different media-type reds regardless of the register', () => {
   const a = step(200, 'application/json', { ok: true });
   const b = step(200, 'text/plain', { ok: true });
   assert.equal(diffStepResults('board_get', a, b).ok, false);
+});
+
+/* ── T9: TIMESTAMP INSTANT-EQUIVALENCE — the register's entry 1, proven the
+ * same way as entry 2: the tolerance is the register's doing, not the
+ * differ's, and it never widens past "same instant". ── */
+
+test('T9a: mock ms+Z vs real µs+offset at the SAME instant does not red', () => {
+  const a = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789Z' } });
+  const b = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789012+00:00' } });
+  assert.equal(diffStepResults('card_get', a, b).ok, true);
+});
+
+test('T9a-proof: with entry 1 removed, that SAME cross-format pair REDs', () => {
+  const a = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789Z' } });
+  const b = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789012+00:00' } });
+  const { ok, violations } = diffStepResults('card_get', a, b, {
+    register: withoutEntry('timestamp-ms-z-vs-us-offset'),
+  });
+  assert.equal(ok, false);
+  assert.ok(violations.some((v) => v.kind === 'timestamp-instant'));
+});
+
+test('T9b: two ms+Z timestamps at DIFFERENT instants still red, entry 1 present', () => {
+  const a = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789Z' } });
+  const b = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:57.000Z' } });
+  const { ok, violations } = diffStepResults('card_get', a, b);
+  assert.equal(ok, false);
+  assert.ok(violations.some((v) => v.kind === 'timestamp-instant'));
+});
+
+test('T9c: two µs+offset timestamps at DIFFERENT instants still red, entry 1 present', () => {
+  const a = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.000001+00:00' } });
+  const b = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.999999+00:00' } });
+  const { ok, violations } = diffStepResults('card_get', a, b);
+  assert.equal(ok, false);
+  assert.ok(violations.some((v) => v.kind === 'timestamp-instant'));
 });
 
 /* ── harness-lifecycle smoke: the minimum viable single real wire call,
@@ -171,4 +239,14 @@ test('identityBlock reports a sha + dirty flag for both repos', () => {
   assert.match(block.spine.sha, /^[0-9a-f]{40}$/);
   assert.equal(typeof block.board.dirty, 'boolean');
   assert.equal(typeof block.spine.dirty, 'boolean');
+});
+
+/* ── STALENESS: any register entry matching zero observed divergences across
+ * this run is dead weight, never silently carried. Runs LAST so every prior
+ * test (T6b, T9a) has had its chance to exercise both entries via the
+ * default register. ── */
+
+test('register hygiene: no entry is stale after this run', () => {
+  const stale = getStaleEntries();
+  assert.deepEqual(stale.map((e) => e.id), []);
 });
