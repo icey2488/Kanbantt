@@ -15,12 +15,12 @@
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const VERSION_TOKEN_RE = /^\d+:[0-9a-f]{16}$/;
-// Generic ISO-8601 (date + time + optional fraction + Z-or-offset). Deliberately
-// loose on fractional-second digit count and zone spelling: FINDING — the mock
-// mints millisecond+Z (`Date#toISOString()`), the real spine mints
-// microsecond+offset (`datetime.now(timezone.utc).isoformat()`). Both are valid
-// ISO-8601; this mask treats them as the same opaque-timestamp format class
-// rather than silently "fixing" either side (see build report).
+// Generic ISO-8601 (date + time + optional fraction + Z-or-offset) — FORMAT
+// validity only. Whether two differently-formatted-but-both-valid timestamps
+// are tolerated as equivalent is NOT this mask's call: that is the parity
+// register's job (parity-register.js), consulted by the differ via
+// findTimestampDivergences below. This mask never silently treats two
+// differing raw values as identical.
 const ISO8601_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 
 const MASK_TOKEN = (format) => `‹MASKED:${format}›`;
@@ -70,4 +70,44 @@ export function applyMask(value, violations = [], path = '$') {
     return out;
   }
   return value;
+}
+
+const isTimestampFormat = (format) => format === 'iso8601' || format === 'iso8601_or_null';
+
+/** Walk TWO raw (pre-mask) bodies in parallel looking for timestamp-class
+ * keys present on BOTH sides, format-valid on BOTH sides, whose raw string
+ * values differ. `applyMask` alone cannot surface this: it masks each side
+ * INDEPENDENTLY, so any two format-valid timestamps collapse to the same
+ * opaque token regardless of value. This is the paired half that the
+ * differ feeds to the register (parity-register.js) to decide whether the
+ * observed divergence is a ratified equivalence or a real red — the mask
+ * itself renders no equivalence verdict. */
+export function findTimestampDivergences(a, b, path = '$') {
+  const out = [];
+  if (Array.isArray(a) && Array.isArray(b)) {
+    const len = Math.min(a.length, b.length);
+    for (let i = 0; i < len; i++) out.push(...findTimestampDivergences(a[i], b[i], `${path}[${i}]`));
+    return out;
+  }
+  if (a !== null && typeof a === 'object' && b !== null && typeof b === 'object'
+      && !Array.isArray(a) && !Array.isArray(b)) {
+    for (const key of Object.keys(a)) {
+      if (!Object.prototype.hasOwnProperty.call(b, key)) continue;
+      const entry = BY_KEY.get(key);
+      const childPath = `${path}.${key}`;
+      const rawA = a[key];
+      const rawB = b[key];
+      if (entry && isTimestampFormat(entry.format)) {
+        if (
+          typeof rawA === 'string' && typeof rawB === 'string' && rawA !== rawB
+          && ISO8601_RE.test(rawA) && ISO8601_RE.test(rawB)
+        ) {
+          out.push({ path: childPath, key, a: rawA, b: rawB });
+        }
+      } else if (rawA !== null && typeof rawA === 'object' && rawB !== null && typeof rawB === 'object') {
+        out.push(...findTimestampDivergences(rawA, rawB, childPath));
+      }
+    }
+  }
+  return out;
 }
