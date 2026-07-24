@@ -75,6 +75,11 @@ const THEMES = {
     eventText: '#6d28d9',
     shadow: '0 4px 16px -4px rgba(15, 23, 42, 0.1)',
     modalBackdrop: 'rgba(15, 23, 42, 0.4)',
+    // Matrix quadrant fills (light only): the shared QUADRANT_DEFS.tintAlpha values
+    // read as near-white on this theme's near-white bg — too faint to separate the
+    // four quadrants from the page or each other. Bumped here (not in QUADRANT_DEFS,
+    // which stays the dark-theme default) so hue semantics are untouched.
+    quadrantTintAlpha: { avoid: '30', plan: '28', deprioritize: '38', do: '30' },
   },
   mist: {
     name: 'Mist', isLight: true,
@@ -87,6 +92,10 @@ const THEMES = {
     eventText: '#5b21b6',
     shadow: '0 6px 20px -6px rgba(26, 31, 46, 0.25)',
     modalBackdrop: 'rgba(26, 31, 46, 0.5)',
+    // Matrix quadrant fills (mist only): see light theme's quadrantTintAlpha note —
+    // same faintness against mist's mid-gray bg, bumped a bit further since the
+    // page itself is more saturated than light's near-white.
+    quadrantTintAlpha: { avoid: '3d', plan: '33', deprioritize: '47', do: '3d' },
   },
 };
 
@@ -1199,7 +1208,7 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
         style={{
           background: C.surface,
           border: `${overdue ? '1.5px' : '1px'} solid ${overdue ? C.coral : C.border}`,
-          borderRadius: 10, padding: 14, cursor: readOnly ? 'pointer' : 'grab',
+          borderRadius: 10, padding: '10px 12px', cursor: readOnly ? 'pointer' : 'grab',
           transition: 'all 140ms ease',
           opacity: isDragging ? 0.35 : 1,
           boxShadow: overdue ? `0 0 0 1px ${C.coral}20, 0 4px 12px -4px ${C.coral}30` : 'none',
@@ -1213,7 +1222,7 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
           e.currentTarget.style.transform = 'translateY(0)';
         }}
       >
-        <div style={{ marginBottom: 8 }}>
+        <div style={{ marginBottom: 6 }}>
           {escalated && (
             // Escalation badge (display-only). Unresolved → amber "Escalated" (an
             // active block that needs a human); denied → RED "Denied" (theme coral,
@@ -1244,7 +1253,11 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
               width: 6, height: 6, borderRadius: '50%',
               background: priorityColor, marginTop: 7, flexShrink: 0,
             }} />
-            <div style={{ fontSize: 14, fontWeight: 500, color: C.text, lineHeight: 1.4 }}>
+            <div style={{
+              fontSize: 14, fontWeight: 500, color: C.text, lineHeight: 1.4,
+              textAlign: 'left', display: '-webkit-box', WebkitLineClamp: 2,
+              WebkitBoxOrient: 'vertical', overflow: 'hidden',
+            }}>
               {task.title}
             </div>
           </div>
@@ -1252,7 +1265,7 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
         {task.description && (
           <div style={{
             fontSize: 12, color: C.textMuted, lineHeight: 1.5,
-            marginBottom: 10, marginLeft: 14,
+            marginBottom: 8, marginLeft: 14,
             display: '-webkit-box', WebkitLineClamp: 2,
             WebkitBoxOrient: 'vertical', overflow: 'hidden',
           }}>
@@ -1260,7 +1273,7 @@ function TaskCard({ task, tags, onClick, onDragStart, onDragOver, onDrop, onDrag
           </div>
         )}
         {taskTags.length > 0 && (
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginLeft: 14, marginBottom: 8 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginLeft: 14, marginBottom: 6 }}>
             {taskTags.slice(0, 3).map((tag) => (
               <TagChip key={tag.id} tag={tag} size="sm" />
             ))}
@@ -1605,7 +1618,16 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, read
       minHeight: 'calc(100vh - 67px - 53px)',
     } : {
       padding: '24px 28px',
-      display: 'grid', gridTemplateColumns: `repeat(${columns.length}, 1fr)`, gap: 18,
+      display: 'grid',
+      // Explicit minmax (not bare `1fr`, which the grid spec expands to
+      // `minmax(auto, 1fr)`) — auto's minimum is the track's max-content, so a
+      // card's nowrap metadata chips could blow the track past its 1fr share and
+      // push later columns (e.g. FAILED) past the panel's right edge with no
+      // scrollbar. minmax(220px, 1fr) fixes the floor explicitly and lets
+      // overflowX take over (rather than silently clipping) once column count *
+      // 220px exceeds the viewport — covers a future 7th column too.
+      gridTemplateColumns: `repeat(${columns.length}, minmax(220px, 1fr))`,
+      gap: 18, overflowX: 'auto',
       minHeight: 'calc(100vh - 67px - 53px)',
     }}>
       {columns.map((col) => {
@@ -1671,7 +1693,7 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, read
                 </span>
               </div>
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
               {colTasks.map((t) => (
                 <TaskCard key={t.id} task={t} tags={tags} onClick={onTaskClick}
                   onDragStart={handleDragStart} onDragOver={handleDragOverCard}
@@ -3979,6 +4001,7 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly, allTasks }
     const isDrop = dropTarget === type;
     const Icon = def.Icon;
     const cards = groups[type];
+    const tintAlpha = C.quadrantTintAlpha?.[type] ?? def.tintAlpha;
     return (
       <div
         onDragOver={(e) => handleDragOver(e, type)}
@@ -3988,7 +4011,7 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly, allTasks }
         }}
         onDrop={(e) => handleDrop(e, type)}
         style={{
-          background: isDrop ? `${accent}28` : `${accent}${def.tintAlpha}`,
+          background: isDrop ? `${accent}28` : `${accent}${tintAlpha}`,
           border: `1px solid ${isDrop ? accent : C.border}`,
           borderRadius: 12,
           padding: 16,
@@ -4083,6 +4106,7 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly, allTasks }
     const tile = (k) => {
       const def = QUADRANT_DEFS[k];
       const accent = C[def.accentKey];
+      const tintAlpha = C.quadrantTintAlpha?.[k] ?? def.tintAlpha;
       const Icon = def.Icon;
       const active = selectedQuadrant === k;
       return (
@@ -4091,7 +4115,7 @@ function MatrixView({ tasks, tags, onTaskClick, onClassify, readOnly, allTasks }
           onClick={() => setSelectedQuadrant(k)}
           style={{
             textAlign: 'left', cursor: 'pointer',
-            background: active ? `${accent}28` : `${accent}${def.tintAlpha}`,
+            background: active ? `${accent}28` : `${accent}${tintAlpha}`,
             border: `1px solid ${active ? accent : C.border}`,
             boxShadow: active ? `inset 0 0 0 1.5px ${accent}` : 'none',
             borderRadius: 12, padding: 12, minHeight: 76,
