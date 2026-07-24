@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 
 import { diffStepResults } from './parity-differ.js';
 import { assertParity, assertSelfConsistent } from './parity-assertions.js';
-import { MASK_INVENTORY } from './parity-mask.js';
+import { MASK_INVENTORY, SERVER_MINTED_TIMESTAMP_KEYS } from './parity-mask.js';
 import { spawnRealSpine, createMockTarget, stopMockTarget } from './parity-lifecycle.js';
 import { sendWireStep, closeSession } from './parity-wire-step.js';
 import { identityBlock } from './parity-identity.js';
@@ -172,17 +172,26 @@ test('T6c: a genuinely different media-type reds regardless of the register', ()
 
 /* ── T9: TIMESTAMP INSTANT-EQUIVALENCE — the register's entry 1, proven the
  * same way as entry 2: the tolerance is the register's doing, not the
- * differ's, and it never widens past "same instant". ── */
+ * differ's, and it never widens past "same instant". Re-polarized in build 2
+ * per the operator ruling on seam-audit card 9aeca184: `created_at` is
+ * SERVER-MINTED (two independent servers mint it at genuinely different
+ * wall-clock moments in live operation — proven empirically during build 2's
+ * survey), so it is EXEMPT from this paired check entirely (parity-mask.js's
+ * SERVER_MINTED_TIMESTAMP_KEYS) — comparing its instant cross-target was the
+ * conflated-category defect build 1 flagged. `due` is CLIENT-ECHOED (the
+ * probe itself supplies it, so a genuine cross-target value divergence IS
+ * meaningful) and is the field these fixtures now exercise; the pass/fail
+ * shape of every T9 case is unchanged from build 1, only the field name is. ── */
 
-test('T9a: mock ms+Z vs real µs+offset at the SAME instant does not red', () => {
-  const a = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789Z' } });
-  const b = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789012+00:00' } });
+test('T9a: mock ms+Z vs real µs+offset at the SAME instant does not red (due — client-echoed)', () => {
+  const a = step(200, 'application/json', { card: { due: '2026-07-24T12:34:56.789Z' } });
+  const b = step(200, 'application/json', { card: { due: '2026-07-24T12:34:56.789012+00:00' } });
   assert.equal(diffStepResults('card_get', a, b).ok, true);
 });
 
 test('T9a-proof: with entry 1 removed, that SAME cross-format pair REDs', () => {
-  const a = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789Z' } });
-  const b = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789012+00:00' } });
+  const a = step(200, 'application/json', { card: { due: '2026-07-24T12:34:56.789Z' } });
+  const b = step(200, 'application/json', { card: { due: '2026-07-24T12:34:56.789012+00:00' } });
   const { ok, violations } = diffStepResults('card_get', a, b, {
     register: withoutEntry('timestamp-ms-z-vs-us-offset'),
   });
@@ -190,20 +199,57 @@ test('T9a-proof: with entry 1 removed, that SAME cross-format pair REDs', () => 
   assert.ok(violations.some((v) => v.kind === 'timestamp-instant'));
 });
 
-test('T9b: two ms+Z timestamps at DIFFERENT instants still red, entry 1 present', () => {
-  const a = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789Z' } });
-  const b = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:57.000Z' } });
+test('T9b: two ms+Z timestamps at DIFFERENT instants still red, entry 1 present (due — client-echoed)', () => {
+  const a = step(200, 'application/json', { card: { due: '2026-07-24T12:34:56.789Z' } });
+  const b = step(200, 'application/json', { card: { due: '2026-07-24T12:34:57.000Z' } });
   const { ok, violations } = diffStepResults('card_get', a, b);
   assert.equal(ok, false);
   assert.ok(violations.some((v) => v.kind === 'timestamp-instant'));
 });
 
-test('T9c: two µs+offset timestamps at DIFFERENT instants still red, entry 1 present', () => {
-  const a = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.000001+00:00' } });
-  const b = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.999999+00:00' } });
+test('T9c: two µs+offset timestamps at DIFFERENT instants still red, entry 1 present (due — client-echoed)', () => {
+  const a = step(200, 'application/json', { card: { due: '2026-07-24T12:34:56.000001+00:00' } });
+  const b = step(200, 'application/json', { card: { due: '2026-07-24T12:34:56.999999+00:00' } });
   const { ok, violations } = diffStepResults('card_get', a, b);
   assert.equal(ok, false);
   assert.ok(violations.some((v) => v.kind === 'timestamp-instant'));
+});
+
+/* ── T10: SERVER-MINTED EXEMPTION (build 2 — the ruling's actual fix). A
+ * DIFFERENT-instant pair on a server-minted key must NEVER red, cross-format
+ * or same-format, because two independent servers minting their OWN
+ * timestamp at genuinely different wall-clock moments is not a divergence at
+ * all — it is guaranteed, every live run. This is the failure mode build 1's
+ * T9b/T9c (pre-repolarization) would have wrongly flagged had they targeted
+ * `created_at`: a live board_get/card_create against a real spine + mock
+ * spawned moments apart would red on timing alone, forever, on every run. ── */
+
+test('T10a: different-instant SAME-format created_at (SERVER-MINTED) does not red', () => {
+  const a = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789Z' } });
+  const b = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:59.123Z' } });
+  assert.equal(diffStepResults('card_get', a, b).ok, true);
+});
+
+test('T10b: different-instant CROSS-format created_at (SERVER-MINTED) does not red', () => {
+  const a = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789Z' } });
+  const b = step(200, 'application/json', { card: { created_at: '2026-07-24T12:35:10.000001+00:00' } });
+  assert.equal(diffStepResults('card_get', a, b).ok, true);
+});
+
+test('T10c: every SERVER_MINTED_TIMESTAMP_KEYS entry is exempt, not just created_at', () => {
+  for (const key of SERVER_MINTED_TIMESTAMP_KEYS) {
+    const a = step(200, 'application/json', { card: { [key]: '2026-07-24T12:34:56.789Z' } });
+    const b = step(200, 'application/json', { card: { [key]: '2027-01-01T00:00:00.000Z' } });
+    assert.equal(diffStepResults('card_get', a, b).ok, true, `${key} must be exempt`);
+  }
+});
+
+test('T10d: a genuine mask-format violation on a server-minted key still reds — exemption is instant-only, not a free pass', () => {
+  const a = step(200, 'application/json', { card: { created_at: 'not-a-timestamp' } });
+  const b = step(200, 'application/json', { card: { created_at: '2026-07-24T12:34:56.789Z' } });
+  const { ok, violations } = diffStepResults('card_get', a, b);
+  assert.equal(ok, false);
+  assert.ok(violations.some((v) => v.kind === 'mask-format' && v.key === 'created_at'));
 });
 
 /* ── harness-lifecycle smoke: the minimum viable single real wire call,
