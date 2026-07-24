@@ -1609,7 +1609,16 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, read
       minHeight: 'calc(100vh - 67px - 53px)',
     } : {
       padding: '24px 28px',
-      display: 'grid', gridTemplateColumns: `repeat(${columns.length}, 1fr)`, gap: 18,
+      display: 'grid',
+      // Explicit minmax (not bare `1fr`, which the grid spec expands to
+      // `minmax(auto, 1fr)`) — auto's minimum is the track's max-content, so a
+      // card's nowrap metadata chips could blow the track past its 1fr share and
+      // push later columns (e.g. FAILED) past the panel's right edge with no
+      // scrollbar. minmax(220px, 1fr) fixes the floor explicitly and lets
+      // overflowX take over (rather than silently clipping) once column count *
+      // 220px exceeds the viewport — covers a future 7th column too.
+      gridTemplateColumns: `repeat(${columns.length}, minmax(220px, 1fr))`,
+      gap: 18, overflowX: 'auto',
       minHeight: 'calc(100vh - 67px - 53px)',
     }}>
       {columns.map((col) => {
