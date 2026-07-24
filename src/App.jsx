@@ -5952,6 +5952,17 @@ export default function App() {
     }
     return `Couldn't ${verb} — reverted. (${e?.message || e?.code || 'error'})`;
   };
+  // Field-write notice (save/retier/archive convergence): failureTruth's classification
+  // drives the wording — 'stale' (the card is still live; someone else changed it first,
+  // so OUR write was undone) vs 'gone' (tombstoned or not_found; someone deleted it, so
+  // our action never applied to anything). 'unknown' (transport/unproven) has no server
+  // truth to report, so it falls back to the generic writeError() text.
+  const mutationNotice = (action, e) => {
+    const truth = failureTruth(e);
+    if (truth === 'stale') return `This card changed elsewhere; your ${action} was undone.`;
+    if (truth === 'gone') return `This card was deleted elsewhere; your ${action} was cancelled.`;
+    return writeError(action === 'retier' ? 're-tier' : action, e);
+  };
   // Mint the destination column + LexoRank from the drop neighbors, reading from
   // the given cards source ({ cards }). SHARED by the local-store and MCP-writable
   // drag paths — the only thing that differs between them is the destination (store
@@ -6094,7 +6105,7 @@ export default function App() {
     if (taskDepsKey !== curDepsKey) patch.depends_on = task.depends_on || [];
     setEditing(null); // close immediately; the edit shows optimistically behind it
     if (Object.keys(patch).length === 0) return; // nothing changed → no write
-    const prior = { title: cur.title, description: cur.description, acceptance_criteria: cur.acceptance_criteria, tier: cur.tier, effort: cur.effort, impact: cur.impact, due: cur.due ?? null, depends_on: cur.depends_on || [] }; // CAPTURE
+    const prior = cur; // CAPTURE the full pre-optimistic card (snap-back's restore/re-insert source)
     const expected_version = cur.version;
     setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
       c.id === task.id ? { ...c, ...patch } : c) } : m));
@@ -6104,18 +6115,13 @@ export default function App() {
         c.id === task.id ? { ...c, ...card } : c) } : m));
       reconcileSpine();
     } catch (e) {
-      // CONFLICT vs TRANSPORT divergence. A `conflict` snaps the card TO the
-      // server's truth (fresh values + version, so the next edit retries with the
-      // right expected_version). Any other error (network/transport) means the write
-      // never landed → restore prior.
-      const fresh = e?.code === 'conflict' && e.meta?.current;
-      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // RECONCILE-or-REVERT (synchronous)
-        c.id === task.id
-          ? (fresh
-            ? { ...c, ...e.meta.current } // SNAP-BACK to server truth
-            : { ...c, title: prior.title, description: prior.description, acceptance_criteria: prior.acceptance_criteria, tier: prior.tier, effort: prior.effort, impact: prior.impact, due: prior.due, depends_on: prior.depends_on }) // REVERT prior
-          : c) } : m));
-      surface(writeError('save', e));
+      // UNIFORM SNAP-BACK (spine-snapback.js) — the SAME core as moveTaskMcp/deleteTaskMcp:
+      // conflict+live → adopt meta.current (someone else's write already landed; restoring
+      // our captured prior would undo THEIR change too); conflict+tombstone or not_found →
+      // the card is gone, drop it; anything else → the write never landed, restore prior.
+      setSpineModel((m) => (m ? { ...m, cards: snapBackCards(m.cards, { id: task.id, error: e, prior }) } : m)); // SNAP-BACK (synchronous)
+      if (failureTruth(e) !== 'unknown') reconcileSpine(); // known-truth convergence gets the success path's backstop poll
+      surface(mutationNotice('save', e));
     }
   };
 
@@ -6135,7 +6141,7 @@ export default function App() {
     if (!provider || !model) { surface('No live spine connection — re-tier not sent.'); return; }
     const cur = model.cards.find((c) => c.id === taskId && !c.deleted_at);
     if (!cur) { surface('That card was deleted'); return; }
-    const prior = { tier: cur.tier };       // CAPTURE
+    const prior = cur;                       // CAPTURE the full pre-optimistic card
     const expected_version = cur.version;    // the card's opaque version token
     setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC
       c.id === taskId ? { ...c, tier: newTier } : c) } : m));
@@ -6146,17 +6152,14 @@ export default function App() {
       reconcileSpine();
       return card; // hand the fresh Card back so the modal re-locks at the new tier
     } catch (e) {
-      // SAME loud-revert path as saveTaskMcp: a `conflict` snaps the card TO the
-      // server's truth (fresh tier + version, so a retry uses the right
-      // expected_version); any other error restores the captured prior tier. Either
-      // way the persistent error banner fires — a re-tier conflict surfaces loudly
-      // exactly like the other governed writes.
-      const fresh = e?.code === 'conflict' && e.meta?.current;
-      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // SNAP-BACK-or-REVERT (synchronous)
-        c.id === taskId
-          ? (fresh ? { ...c, ...e.meta.current } : { ...c, tier: prior.tier })
-          : c) } : m));
-      surface(writeError('re-tier', e));
+      // UNIFORM SNAP-BACK (spine-snapback.js) — the SAME core as saveTaskMcp: conflict+live
+      // snaps to the server's truth (fresh tier + version, so a retry uses the right
+      // expected_version); conflict+tombstone or not_found drops the card; anything else
+      // restores the captured prior tier. Either way the persistent error banner fires — a
+      // re-tier conflict surfaces loudly exactly like the other governed writes.
+      setSpineModel((m) => (m ? { ...m, cards: snapBackCards(m.cards, { id: taskId, error: e, prior }) } : m));
+      if (failureTruth(e) !== 'unknown') reconcileSpine();
+      surface(mutationNotice('retier', e));
       throw e; // let the modal close its sub-flow (the banner is the error surface)
     }
   };
@@ -6175,7 +6178,7 @@ export default function App() {
     if (!provider || !model) { surface('No live spine connection — archive not sent.'); return undefined; }
     const cur = model.cards.find((c) => c.id === id && !c.deleted_at);
     if (!cur) { surface('That card was deleted'); return undefined; }
-    const prior = { archived_at: cur.archived_at ?? null }; // CAPTURE
+    const prior = cur; // CAPTURE the full pre-optimistic card
     const expected_version = cur.version;
     setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // OPTIMISTIC (server stamp reconciles over this)
       c.id === id ? { ...c, archived_at: new Date().toISOString() } : c) } : m));
@@ -6186,12 +6189,14 @@ export default function App() {
       reconcileSpine();
       return card;
     } catch (e) {
-      const fresh = e?.code === 'conflict' && e.meta?.current;
-      setSpineModel((m) => (m ? { ...m, cards: m.cards.map((c) => // SNAP-BACK-or-REVERT (synchronous)
-        c.id === id
-          ? (fresh ? { ...c, ...e.meta.current } : { ...c, archived_at: prior.archived_at })
-          : c) } : m));
-      surface(writeError('archive', e));
+      // UNIFORM SNAP-BACK (spine-snapback.js) — the SAME core as retierTaskMcp. FLAGGED
+      // PARITY DECISION (see the work order): archive-on-tombstone is NOT special-cased
+      // to a success toast here — delete's own tombstone path has no distinct success
+      // shape to extend (it still fires the same persistent banner via writeError()), so
+      // archive-on-tombstone gets the same "cancelled" notice as every other gone target.
+      setSpineModel((m) => (m ? { ...m, cards: snapBackCards(m.cards, { id, error: e, prior }) } : m));
+      if (failureTruth(e) !== 'unknown') reconcileSpine();
+      surface(mutationNotice('archive', e));
       throw e;
     }
   };
