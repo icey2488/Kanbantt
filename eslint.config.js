@@ -21,4 +21,13 @@ export default defineConfig([
       'no-unused-vars': ['error', { ignoreRestSiblings: true }],
     },
   },
+  {
+    // The parity probe (seam-audit card 9aeca184) is Node-only harness code —
+    // spawns a subprocess, reads env vars, walks the filesystem — never loaded
+    // by the browser bundle, so it needs Node globals rather than browser ones.
+    files: ['src/lib/parity-*.js'],
+    languageOptions: {
+      globals: globals.node,
+    },
+  },
 ])
