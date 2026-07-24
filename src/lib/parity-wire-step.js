@@ -58,6 +58,17 @@ export async function sendWireStep(target, toolName, args = {}) {
   };
 }
 
+/** C1 — the manifest half: MCP `tools/list` against `target`, over the wire,
+ * via the SAME session `sendWireStep` uses (never a second, divergent
+ * connection). Returns the bare sorted tool-name array; the caller (parity-
+ * manifest.js) owns everything downstream of "what names did this target
+ * advertise". */
+export async function listTools(target) {
+  const { client } = await openSession(target);
+  const { tools } = await client.listTools();
+  return tools.map((t) => t.name).sort();
+}
+
 export async function closeSession(target) {
   const session = sessions.get(target);
   if (session) {
