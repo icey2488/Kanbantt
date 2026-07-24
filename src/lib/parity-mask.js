@@ -74,14 +74,31 @@ export function applyMask(value, violations = [], path = '$') {
 
 const isTimestampFormat = (format) => format === 'iso8601' || format === 'iso8601_or_null';
 
-/** Walk TWO raw (pre-mask) bodies in parallel looking for timestamp-class
- * keys present on BOTH sides, format-valid on BOTH sides, whose raw string
- * values differ. `applyMask` alone cannot surface this: it masks each side
- * INDEPENDENTLY, so any two format-valid timestamps collapse to the same
- * opaque token regardless of value. This is the paired half that the
- * differ feeds to the register (parity-register.js) to decide whether the
- * observed divergence is a ratified equivalence or a real red — the mask
- * itself renders no equivalence verdict. */
+/** PROVENANCE SPLIT (build-2 ruling, seam-audit card 9aeca184 — carried forward
+ * from build 1's flagged defect): a timestamp-format key is either
+ * SERVER-MINTED (the target itself stamps it — created_at, updated_at,
+ * archived_at, deleted_at, resolved_at) or CLIENT-ECHOED (a value the PROBE
+ * sent, which the target only stores/echoes — due, the sole example today).
+ * Two independent servers mint a SERVER-MINTED field at genuinely different
+ * wall-clock moments — that is not a bug, and no tolerance WINDOW is the
+ * fix (a tuned delta is a fudge factor that would silently absorb a real
+ * one), so a server-minted key is format-asserted-and-masked ONLY and NEVER
+ * instant-compared cross-target, here or via the register. A CLIENT-ECHOED
+ * key is genuinely comparable — both targets observed the SAME source value
+ * — so it keeps going through this paired check. */
+export const SERVER_MINTED_TIMESTAMP_KEYS = new Set([
+  'created_at', 'updated_at', 'archived_at', 'deleted_at', 'resolved_at',
+]);
+
+/** Walk TWO raw (pre-mask) bodies in parallel looking for CLIENT-ECHOED
+ * timestamp-class keys (see the provenance split above — a SERVER-MINTED key
+ * never reaches this check) present on BOTH sides, format-valid on BOTH
+ * sides, whose raw string values differ. `applyMask` alone cannot surface
+ * this: it masks each side INDEPENDENTLY, so any two format-valid timestamps
+ * collapse to the same opaque token regardless of value. This is the paired
+ * half that the differ feeds to the register (parity-register.js) to decide
+ * whether the observed divergence is a ratified equivalence or a real red —
+ * the mask itself renders no equivalence verdict. */
 export function findTimestampDivergences(a, b, path = '$') {
   const out = [];
   if (Array.isArray(a) && Array.isArray(b)) {
@@ -97,7 +114,7 @@ export function findTimestampDivergences(a, b, path = '$') {
       const childPath = `${path}.${key}`;
       const rawA = a[key];
       const rawB = b[key];
-      if (entry && isTimestampFormat(entry.format)) {
+      if (entry && isTimestampFormat(entry.format) && !SERVER_MINTED_TIMESTAMP_KEYS.has(key)) {
         if (
           typeof rawA === 'string' && typeof rawB === 'string' && rawA !== rawB
           && ISO8601_RE.test(rawA) && ISO8601_RE.test(rawB)
