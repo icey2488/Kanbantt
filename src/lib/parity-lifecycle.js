@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import net from 'node:net';
 import { createMcpTestServer } from './spine-mcp-test-server.js';
 
@@ -47,16 +47,49 @@ function waitForPort(host, port, timeoutMs) {
   });
 }
 
+/** FIXTURE ARRANGEMENT, not a wire step (D1's own category boundary): the real
+ * spine advertises NO tool that creates a Project — `project_list` is
+ * read-only, and `card_create` REQUIRES a live `project_id` it enumerates.
+ * There is no MCP route to a project, so build-2 coverage seeds one directly
+ * against the temp DB file, exactly the way the spine's OWN test suite does
+ * (tests/spine_server/_util.py's `seed()`: `Spine(Store(path)).create_project`)
+ * — before the server process starts, so there is no concurrent writer. This
+ * mirrors the mock's existing `opts.projects` fixture option; it does not
+ * touch, call, or diff a wire step and is never itself a diffed StepResult. */
+function seedRealSpineProjects(pythonPath, hermesRepoPath, dbPath, names) {
+  const script = [
+    'import json, sys',
+    'from spine import Spine, Store',
+    'spine = Spine(Store(sys.argv[1]))',
+    'out = []',
+    'try:',
+    '    for name in json.loads(sys.argv[2]):',
+    '        p = spine.create_project(name)',
+    '        out.append({"id": p.id, "name": p.name})',
+    'finally:',
+    '    spine.store.close()',
+    'print(json.dumps(out))',
+  ].join('\n');
+  const stdout = execFileSync(pythonPath, ['-c', script, dbPath, JSON.stringify(names)], {
+    cwd: hermesRepoPath,
+    encoding: 'utf8',
+  });
+  return JSON.parse(stdout);
+}
+
 /** Spawn a freshly-provisioned real spine: temp DB, ephemeral port, a
  * throwaway Bearer token (never logged, never persisted, never the token of
  * any already-running spine — this never touches an existing process or its
  * default db). D6 — SPAWN DISCIPLINE: any failure (bad python path, process
  * exits before its port opens, port never opens) throws an explicit
- * spine-unavailable Error. There is no skip state. */
+ * spine-unavailable Error. There is no skip state. `seedProjects` (optional,
+ * default none) is a list of project names to seed before the server starts —
+ * see `seedRealSpineProjects` above for why this exists at all. */
 export async function spawnRealSpine({
   hermesRepoPath,
   pythonPath,
   readyTimeoutMs = 10_000,
+  seedProjects = [],
 } = {}) {
   if (!hermesRepoPath) throw new Error('spine-unavailable: hermesRepoPath is required');
   const resolvedPython = pythonPath || join(hermesRepoPath, '.venv', 'Scripts', 'python.exe');
@@ -64,6 +97,16 @@ export async function spawnRealSpine({
   const dbPath = join(dbDir, 'spine.db');
   const token = randomUUID();
   const host = '127.0.0.1';
+
+  let seededProjects = [];
+  if (seedProjects.length) {
+    try {
+      seededProjects = seedRealSpineProjects(resolvedPython, hermesRepoPath, dbPath, seedProjects);
+    } catch (e) {
+      rmSync(dbDir, { recursive: true, force: true });
+      throw new Error(`spine-unavailable: could not seed a fixture project: ${e.message}`, { cause: e });
+    }
+  }
 
   let port;
   try {
@@ -114,6 +157,7 @@ export async function spawnRealSpine({
     kind: 'real',
     url: `http://${host}:${port}/mcp`,
     token,
+    seededProjects,
     async stop() {
       if (exited === null) {
         child.kill();
