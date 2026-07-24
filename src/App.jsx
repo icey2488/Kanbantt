@@ -1623,11 +1623,19 @@ function BoardView({ tasks, tags, columns, onTaskClick, onMove, onQuickAdd, read
       // `minmax(auto, 1fr)`) — auto's minimum is the track's max-content, so a
       // card's nowrap metadata chips could blow the track past its 1fr share and
       // push later columns (e.g. FAILED) past the panel's right edge with no
-      // scrollbar. minmax(220px, 1fr) fixes the floor explicitly and lets
-      // overflowX take over (rather than silently clipping) once column count *
-      // 220px exceeds the viewport — covers a future 7th column too.
+      // scrollbar. minmax(220px, 1fr) fixes the floor explicitly, so once column
+      // count * 220px exceeds the viewport the grid overflows its box instead —
+      // covers a future 7th column too. NOT paired with overflowX here: any
+      // overflow value on this element (or an ancestor of it) other than
+      // `visible` becomes the containing scrollport for the column headers'
+      // `position: sticky` below, which stick relative to the WINDOW by design
+      // (see the header's own comment) — that scrollport hijack is what pushed
+      // headers below their first card. Leaving overflow visible lets the
+      // overflow fall through to the window's native horizontal scrollbar,
+      // which any ancestor already permits (no overflow:hidden between here
+      // and <body>) and never touches sticky positioning.
       gridTemplateColumns: `repeat(${columns.length}, minmax(220px, 1fr))`,
-      gap: 18, overflowX: 'auto',
+      gap: 18,
       minHeight: 'calc(100vh - 67px - 53px)',
     }}>
       {columns.map((col) => {
